@@ -829,6 +829,7 @@ extern int precomposed_unicode;
 extern int protect_hfs;
 extern int protect_ntfs;
 extern const char *core_fsmonitor;
+extern int core_midx;
 
 /*
  * Include broken refs in all ref iterations, which will

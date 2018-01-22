@@ -10,6 +10,7 @@
 #include "dir.h"
 #include "sha1-array.h"
 #include "packfile.h"
+#include "midx.h"
 
 static int get_oid_oneline(const char *, struct object_id *, struct commit_list *);
 
@@ -190,11 +191,40 @@ static void unique_in_pack(struct packed_git *p,
 	}
 }
 
+static void unique_in_midx(struct midxed_git *m,
+			   struct disambiguate_state *ds)
+{
+	uint32_t num, i, first = 0;
+	const struct object_id *current = NULL;
+
+	if (!m->num_objects)
+		return;
+
+	num = m->num_objects;
+	bsearch_midx(m, ds->bin_pfx.hash, &first);
+
+	/*
+	 * At this point, "first" is the location of the lowest object
+	 * with an object name that could match "bin_pfx".  See if we have
+	 * 0, 1 or more objects that actually match(es).
+	 */
+	for (i = first; i < num && !ds->ambiguous; i++) {
+		struct object_id oid;
+		current = nth_midxed_object_oid(&oid, m, i);
+		if (!match_sha(ds->len, ds->bin_pfx.hash, current->hash))
+			break;
+		update_candidates(ds, current);
+	}
+}
+
 static void find_short_packed_object(struct disambiguate_state *ds)
 {
 	struct packed_git *p;
+	struct midxed_git *m;
 
-	prepare_packed_git();
+	prepare_packed_git_internal(1);
+	for (m = midxed_git; m && !ds->ambiguous; m = m->next)
+		unique_in_midx(m, ds);
 	for (p = packed_git; p && !ds->ambiguous; p = p->next)
 		unique_in_pack(p, ds);
 }
@@ -508,6 +538,39 @@ static int extend_abbrev_len(const struct object_id *oid, void *cb_data)
 	return 0;
 }
 
+static void find_abbrev_len_for_midx(struct midxed_git *m,
+				     struct min_abbrev_data *mad)
+{
+	int match = 0;
+	uint32_t first = 0;
+	struct object_id oid;
+
+	if (!m->num_objects)
+		return;
+
+	match = bsearch_midx(m, mad->hash, &first);
+
+	/*
+	 * first is now the position in the packfile where we would insert
+	 * mad->hash if it does not exist (or the position of mad->hash if
+	 * it does exist). Hence, we consider a maximum of three objects
+	 * nearby for the abbreviation length.
+	 */
+	mad->init_len = 0;
+	if (!match) {
+		nth_midxed_object_oid(&oid, m, first);
+		extend_abbrev_len(&oid, mad);
+	} else if (first < m->num_objects - 1) {
+		nth_midxed_object_oid(&oid, m, first + 1);
+		extend_abbrev_len(&oid, mad);
+	}
+	if (first > 0) {
+		nth_midxed_object_oid(&oid, m, first - 1);
+		extend_abbrev_len(&oid, mad);
+	}
+	mad->init_len = mad->cur_len;
+}
+
 static void find_abbrev_len_for_pack(struct packed_git *p,
 				     struct min_abbrev_data *mad)
 {
@@ -563,8 +626,11 @@ static void find_abbrev_len_for_pack(struct packed_git *p,
 static void find_abbrev_len_packed(struct min_abbrev_data *mad)
 {
 	struct packed_git *p;
+	struct midxed_git *m;
 
-	prepare_packed_git();
+	prepare_packed_git_internal(1);
+	for (m = midxed_git; m; m = m->next)
+		find_abbrev_len_for_midx(m, mad);
 	for (p = packed_git; p; p = p->next)
 		find_abbrev_len_for_pack(p, mad);
 }

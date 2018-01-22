@@ -78,6 +78,8 @@ int protect_hfs = PROTECT_HFS_DEFAULT;
 int protect_ntfs = PROTECT_NTFS_DEFAULT;
 const char *core_fsmonitor;
 
+int core_midx;
+
 /*
  * The character that begins a commented line in user-editable file
  * that is subject to stripspace.

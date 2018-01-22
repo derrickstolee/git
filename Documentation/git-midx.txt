@@ -1,0 +1,106 @@
+git-midx(1)
+============
+
+NAME
+----
+git-midx - Write and verify multi-pack-indexes (MIDX files).
+
+
+SYNOPSIS
+--------
+[verse]
+'git midx' [--write|--read|--clear] <options> [--pack-dir <pack_dir>]
+
+DESCRIPTION
+-----------
+Write a MIDX file.
+
+OPTIONS
+-------
+
+--pack-dir <pack_dir>::
+	Use given directory for the location of packfiles, pack-indexes,
+	and MIDX files.
+
+--clear::
+	If specified, delete the midx file specified by midx-head, and
+	midx-head. (Cannot be combined with --write or --read.)
+
+--read::
+	If specified, read a midx file specified by the midx-head file
+	and output basic details about the midx file. (Cannot be combined
+	with --write.)
+
+--midx-id <oid>::
+	If specified with --read, use the given oid to read midx-[oid].midx
+	instead of using midx-head.
+--write::
+	If specified, write a new midx file to the pack directory using
+	the packfiles present. Outputs the hash of the result midx file.
+	(Cannot be combined with --read.)
+
+--update-head::
+	If specified with --write, update the midx-head file to point to
+	the written midx file.
+
+--delete-expired::
+	If specified with --write and --update-head, delete the midx file
+	previously pointed to by midx-head (if changed).
+
+EXAMPLES
+--------
+
+* Read the midx-head file and output the OID of the head MIDX file.
++
+------------------------------------------------
+$ git midx
+------------------------------------------------
+
+* Write a MIDX file for the packfiles in your local .git folder.
++
+------------------------------------------------
+$ git midx --write
+------------------------------------------------
+
+* Write a MIDX file for the packfiles in your local .git folder and
+* update the midx-head file.
++
+------------------------------------------------
+$ git midx --write --update-head
+------------------------------------------------
+
+* Write a MIDX file for the packfiles in a different folder
++
+---------------------------------------------------------
+$ git midx --write --pack-dir ../../alt/pack/
+---------------------------------------------------------
+
+* Read the current midx-head.
++
+-----------------------------------------------
+$ git midx --read
+-----------------------------------------------
+
+* Read a specific MIDX file in the local .git folder.
++
+--------------------------------------------------------------------
+$ git midx --read --midx-id 3e50d982a2257168c7fd0ff12ffe5cf6af38c74e
+--------------------------------------------------------------------
+
+* Delete the current midx-head and the file it references.
++
+-----------------------------------------------
+$ git midx --clear
+-----------------------------------------------
+
+CONFIGURATION
+-------------
+
+core.midx::
+	The midx command will fail if core.midx is false.
+	Also, the written MIDX files will be ignored by other commands
+	unless core.midx is true.
+
+GIT
+---
+Part of the linkgit:git[1] suite

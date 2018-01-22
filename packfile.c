@@ -8,6 +8,7 @@
 #include "list.h"
 #include "streaming.h"
 #include "sha1-lookup.h"
+#include "midx.h"
 
 char *odb_pack_name(struct strbuf *buf,
 		    const unsigned char *sha1,
@@ -299,7 +300,7 @@ void close_pack_index(struct packed_git *p)
 	}
 }
 
-static void close_pack(struct packed_git *p)
+void close_pack(struct packed_git *p)
 {
 	close_pack_windows(p);
 	close_pack_fd(p);
@@ -309,10 +310,22 @@ static void close_pack(struct packed_git *p)
 void close_all_packs(void)
 {
 	struct packed_git *p;
+	struct midxed_git *m;
+
+	for (m = midxed_git; m; m = m->next) {
+		int i;
+		for (i = 0; i < m->num_packs; i++) {
+			p = m->packs[i];
+			if (p && p->do_not_close)
+				BUG("want to close pack marked 'do-not-close'");
+			else if (p)
+				close_pack(p);
+		}
+	}
 
 	for (p = packed_git; p; p = p->next)
 		if (p->do_not_close)
-			die("BUG: want to close pack marked 'do-not-close'");
+			BUG("want to close pack marked 'do-not-close'");
 		else
 			close_pack(p);
 }
@@ -748,6 +761,7 @@ static void prepare_packed_git_one(char *objdir, int local)
 	dirnamelen = path.len;
 	while ((de = readdir(dir)) != NULL) {
 		struct packed_git *p;
+		struct midxed_git *m;
 		size_t base_len;
 
 		if (is_dot_or_dotdot(de->d_name))
@@ -758,15 +772,23 @@ static void prepare_packed_git_one(char *objdir, int local)
 
 		base_len = path.len;
 		if (strip_suffix_mem(path.buf, &base_len, ".idx")) {
+			strbuf_setlen(&path, base_len + 1);
+			strbuf_add(&path, "pack", 4);
+
 			/* Don't reopen a pack we already have. */
+			for (m = midxed_git; m; m = m->next)
+				if (!memcmp(m->pack_dir, path.buf, dirnamelen - 1) &&
+				    contains_pack(m, path.buf + dirnamelen))
+					break;
 			for (p = packed_git; p; p = p->next) {
-				size_t len;
-				if (strip_suffix(p->pack_name, ".pack", &len) &&
-				    len == base_len &&
-				    !memcmp(p->pack_name, path.buf, len))
+				if (!strcmp(p->pack_name, path.buf))
 					break;
 			}
-			if (p == NULL &&
+
+			strbuf_setlen(&path, base_len + 1);
+			strbuf_add(&path, "idx", 3);
+
+			if (m == NULL && p == NULL &&
 			    /*
 			     * See if it really is a valid .idx file with
 			     * corresponding .pack file that we can map.
@@ -781,7 +803,8 @@ static void prepare_packed_git_one(char *objdir, int local)
 		if (ends_with(de->d_name, ".idx") ||
 		    ends_with(de->d_name, ".pack") ||
 		    ends_with(de->d_name, ".bitmap") ||
-		    ends_with(de->d_name, ".keep"))
+		    ends_with(de->d_name, ".keep") ||
+		    ends_with(de->d_name, ".midx"))
 			string_list_append(&garbage, path.buf);
 		else
 			report_garbage(PACKDIR_FILE_GARBAGE, path.buf);
@@ -806,9 +829,12 @@ unsigned long approximate_object_count(void)
 	static unsigned long count;
 	if (!approximate_object_count_valid) {
 		struct packed_git *p;
+		struct midxed_git *m;
 
-		prepare_packed_git();
+		prepare_packed_git_internal(1);
 		count = 0;
+		for (m = midxed_git; m; m = m->next)
+			count += m->num_objects;
 		for (p = packed_git; p; p = p->next) {
 			if (open_pack_index(p))
 				continue;
@@ -872,21 +898,45 @@ static void prepare_packed_git_mru(void)
 }
 
 static int prepare_packed_git_run_once = 0;
-void prepare_packed_git(void)
+static int prepare_midxed_git_run_once = 0;
+void prepare_packed_git_internal(int use_midx)
 {
 	struct alternate_object_database *alt;
+	char *obj_dir;
+
+	if (prepare_midxed_git_run_once) {
+		if (!use_midx) {
+			prepare_midxed_git_run_once = 0;
+			close_all_midx();
+			reprepare_packed_git();
+		}
+		return;
+	}
 
 	if (prepare_packed_git_run_once)
 		return;
-	prepare_packed_git_one(get_object_directory(), 1);
+
+	obj_dir = get_object_directory();
+
+	if (use_midx)
+		prepare_midxed_git_objdir(obj_dir, 1);
+	prepare_packed_git_one(obj_dir, 1);
 	prepare_alt_odb();
-	for (alt = alt_odb_list; alt; alt = alt->next)
+	for (alt = alt_odb_list; alt; alt = alt->next) {
+		if (use_midx)
+			prepare_midxed_git_objdir(alt->path, 0);
 		prepare_packed_git_one(alt->path, 0);
+	}
 	rearrange_packed_git();
 	prepare_packed_git_mru();
 	prepare_packed_git_run_once = 1;
+	prepare_midxed_git_run_once = use_midx;
 }
 
+void prepare_packed_git(void)
+{
+	prepare_packed_git_internal(0);
+}
 void reprepare_packed_git(void)
 {
 	approximate_object_count_valid = 0;
@@ -1833,7 +1883,10 @@ int find_pack_entry(const unsigned char *sha1, struct pack_entry *e)
 {
 	struct mru_entry *p;
 
-	prepare_packed_git();
+	prepare_packed_git_internal(1);
+	if (fill_pack_entry_midx(sha1, e))
+		return 1;
+
 	if (!packed_git)
 		return 0;
 
