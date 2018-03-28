@@ -296,6 +296,16 @@ void free_commit_buffer(struct commit *commit)
 	}
 }
 
+struct tree *get_commit_tree(const struct commit *commit)
+{
+	return commit->tree;
+}
+
+struct object_id *get_commit_tree_oid(const struct commit *commit)
+{
+	return &commit->tree->object.oid;
+}
+
 const void *detach_commit_buffer(struct commit *commit, unsigned long *sizep)
 {
 	struct commit_buffer *v = buffer_slab_peek(&buffer_slab, commit);
