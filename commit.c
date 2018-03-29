@@ -298,12 +298,18 @@ void free_commit_buffer(struct commit *commit)
 
 struct tree *get_commit_tree(const struct commit *commit)
 {
-	return commit->tree;
+	if (commit->tree || !commit->object.parsed)
+		return commit->tree;
+
+	if (commit->graph_pos == COMMIT_NOT_FROM_GRAPH)
+		BUG("commit has NULL tree, but was not loaded from commit-graph");
+
+	return get_commit_tree_in_graph(commit);
 }
 
 struct object_id *get_commit_tree_oid(const struct commit *commit)
 {
-	return &commit->tree->object.oid;
+	return &get_commit_tree(commit)->object.oid;
 }
 
 const void *detach_commit_buffer(struct commit *commit, unsigned long *sizep)
