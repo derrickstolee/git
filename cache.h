@@ -599,6 +599,7 @@ extern int read_index_unmerged(struct index_state *);
 
 /* For use with `write_locked_index()`. */
 #define COMMIT_LOCK		(1 << 0)
+#define SKIP_IF_UNCHANGED	(1 << 1)
 
 /*
  * Write the index while holding an already-taken lock. Close the lock,
@@ -615,6 +616,9 @@ extern int read_index_unmerged(struct index_state *);
  * With `COMMIT_LOCK`, the lock is always committed or rolled back.
  * Without it, the lock is closed, but neither committed nor rolled
  * back.
+ *
+ * If `SKIP_IF_UNCHANGED` is given and the index is unchanged, nothing
+ * is written (and the lock is rolled back if `COMMIT_LOCK` is given).
  */
 extern int write_locked_index(struct index_state *, struct lock_file *lock, unsigned flags);
 
@@ -801,6 +805,7 @@ extern char *git_replace_ref_base;
 
 extern int fsync_object_files;
 extern int core_preload_index;
+extern int core_commit_graph;
 extern int core_apply_sparse_checkout;
 extern int precomposed_unicode;
 extern int protect_hfs;

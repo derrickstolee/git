@@ -62,6 +62,7 @@ static void replace_index_entry(struct index_state *istate, int nr, struct cache
 	replace_index_entry_in_base(istate, old, ce);
 	remove_name_hash(istate, old);
 	free(old);
+	ce->ce_flags &= ~CE_HASHED;
 	set_index_entry(istate, nr, ce);
 	ce->ce_flags |= CE_UPDATE_IN_BASE;
 	mark_fsmonitor_invalid(istate, ce);
@@ -1324,7 +1325,8 @@ static struct cache_entry *refresh_cache_ent(struct index_state *istate,
 
 	size = ce_size(ce);
 	updated = xmalloc(size);
-	memcpy(updated, ce, size);
+	copy_cache_entry(updated, ce);
+	memcpy(updated->name, ce->name, ce->ce_namelen + 1);
 	fill_stat_cache_info(updated, &st);
 	/*
 	 * If ignore_valid is not set, we should leave CE_VALID bit
@@ -2108,13 +2110,15 @@ static int ce_write_entry(git_hash_ctx *c, int fd, struct cache_entry *ce,
 			  struct strbuf *previous_name, struct ondisk_cache_entry *ondisk)
 {
 	int size;
-	int saved_namelen = saved_namelen; /* compiler workaround */
 	int result;
+	unsigned int saved_namelen;
+	int stripped_name = 0;
 	static unsigned char padding[8] = { 0x00 };
 
 	if (ce->ce_flags & CE_STRIP_NAME) {
 		saved_namelen = ce_namelen(ce);
 		ce->ce_namelen = 0;
+		stripped_name = 1;
 	}
 
 	if (ce->ce_flags & CE_EXTENDED)
@@ -2154,7 +2158,7 @@ static int ce_write_entry(git_hash_ctx *c, int fd, struct cache_entry *ce,
 		strbuf_splice(previous_name, common, to_remove,
 			      ce->name + common, ce_namelen(ce) - common);
 	}
-	if (ce->ce_flags & CE_STRIP_NAME) {
+	if (stripped_name) {
 		ce->ce_namelen = saved_namelen;
 		ce->ce_flags &= ~CE_STRIP_NAME;
 	}
@@ -2537,6 +2541,12 @@ int write_locked_index(struct index_state *istate, struct lock_file *lock,
 {
 	int new_shared_index, ret;
 	struct split_index *si = istate->split_index;
+
+	if ((flags & SKIP_IF_UNCHANGED) && !istate->cache_changed) {
+		if (flags & COMMIT_LOCK)
+			rollback_lock_file(lock);
+		return 0;
+	}
 
 	if (istate->fsmonitor_last_update)
 		fill_fsmonitor_bitmap(istate);

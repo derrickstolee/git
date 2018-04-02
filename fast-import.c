@@ -1016,7 +1016,7 @@ static void end_packfile(void)
 		struct tag *t;
 
 		close_pack_windows(pack_data);
-		hashclose(pack_file, cur_pack_oid.hash, 0);
+		finalize_hashfile(pack_file, cur_pack_oid.hash, 0);
 		fixup_pack_header_footer(pack_data->pack_fd, pack_data->sha1,
 				    pack_data->pack_name, object_count,
 				    cur_pack_oid.hash, pack_size);
@@ -3005,7 +3005,7 @@ static void cat_blob(struct object_entry *oe, struct object_id *oid)
 
 static void parse_get_mark(const char *p)
 {
-	struct object_entry *oe = oe;
+	struct object_entry *oe;
 	char output[GIT_MAX_HEXSZ + 2];
 
 	/* get-mark SP <object> LF */
@@ -3022,7 +3022,7 @@ static void parse_get_mark(const char *p)
 
 static void parse_cat_blob(const char *p)
 {
-	struct object_entry *oe = oe;
+	struct object_entry *oe;
 	struct object_id oid;
 
 	/* cat-blob SP <object> LF */
