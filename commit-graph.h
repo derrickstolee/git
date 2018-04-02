@@ -17,6 +17,13 @@ char *get_commit_graph_filename(const char *obj_dir);
  */
 int parse_commit_in_graph(struct commit *item);
 
+/*
+ * For performance reasons, a commit loaded from the graph does not
+ * have a tree loaded until trying to consume it for the first time.
+ * Load that tree into the commit and return the object.
+ */
+struct tree *get_commit_tree_in_graph(const struct commit *c);
+
 struct commit_graph {
 	int graph_fd;
 
