@@ -245,6 +245,13 @@ static struct commit_list **insert_parent_or_die(struct commit_graph *g,
 	return &commit_list_insert(c, pptr)->next;
 }
 
+static void fill_commit_graph_info(struct commit *item, struct commit_graph *g, uint32_t pos)
+{
+	const unsigned char *commit_data = g->chunk_commit_data + GRAPH_DATA_WIDTH * pos;
+	item->graph_pos = pos;
+	item->generation = get_be32(commit_data + g->hash_len + 8) >> 2;
+}
+
 static int fill_commit_in_graph(struct commit *item, struct commit_graph *g, uint32_t pos)
 {
 	uint32_t edge_value;
@@ -261,6 +268,8 @@ static int fill_commit_in_graph(struct commit *item, struct commit_graph *g, uin
 	date_high = get_be32(commit_data + g->hash_len + 8) & 0x3;
 	date_low = get_be32(commit_data + g->hash_len + 12);
 	item->date = (timestamp_t)((date_high << 32) | date_low);
+
+	item->generation = get_be32(commit_data + g->hash_len + 8) >> 2;
 
 	pptr = &item->parents;
 
@@ -290,29 +299,38 @@ static int fill_commit_in_graph(struct commit *item, struct commit_graph *g, uin
 	return 1;
 }
 
+static int find_commit_in_graph(struct commit *item, struct commit_graph *g, uint32_t *pos)
+{
+	if (item->graph_pos != COMMIT_NOT_FROM_GRAPH) {
+		*pos = item->graph_pos;
+		return 1;
+	} else {
+		return bsearch_graph(g, &(item->object.oid), pos);
+	}
+}
+
 int parse_commit_in_graph(struct commit *item)
 {
+	uint32_t pos;
+
 	if (!core_commit_graph)
 		return 0;
 	if (item->object.parsed)
 		return 1;
-
 	prepare_commit_graph();
-	if (commit_graph) {
-		uint32_t pos;
-		int found;
-		if (item->graph_pos != COMMIT_NOT_FROM_GRAPH) {
-			pos = item->graph_pos;
-			found = 1;
-		} else {
-			found = bsearch_graph(commit_graph, &(item->object.oid), &pos);
-		}
-
-		if (found)
-			return fill_commit_in_graph(item, commit_graph, pos);
-	}
-
+	if (commit_graph && find_commit_in_graph(item, commit_graph, &pos))
+		return fill_commit_in_graph(item, commit_graph, pos);
 	return 0;
+}
+
+void load_commit_graph_info(struct commit *item)
+{
+	uint32_t pos;
+	if (!core_commit_graph)
+		return;
+	prepare_commit_graph();
+	if (commit_graph && find_commit_in_graph(item, commit_graph, &pos))
+		fill_commit_graph_info(item, commit_graph, pos);
 }
 
 static struct tree *load_tree_for_commit(struct commit_graph *g, struct commit *c)
@@ -436,6 +454,8 @@ static void write_graph_chunk_data(struct hashfile *f, int hash_len,
 			packedDate[0] = htonl(((*list)->date >> 32) & 0x3);
 		else
 			packedDate[0] = 0;
+
+		packedDate[0] |= htonl((*list)->generation << 2);
 
 		packedDate[1] = htonl((*list)->date);
 		hashwrite(f, packedDate, 8);
@@ -569,6 +589,45 @@ static void close_reachable(struct packed_oid_list *oids)
 	}
 }
 
+static void compute_generation_numbers(struct packed_commit_list* commits)
+{
+	int i;
+	struct commit_list *list = NULL;
+
+	for (i = 0; i < commits->nr; i++) {
+		if (commits->list[i]->generation != GENERATION_NUMBER_INFINITY &&
+		    commits->list[i]->generation != GENERATION_NUMBER_ZERO)
+			continue;
+
+		commit_list_insert(commits->list[i], &list);
+		while (list) {
+			struct commit *current = list->item;
+			struct commit_list *parent;
+			int all_parents_computed = 1;
+			uint32_t max_generation = 0;
+
+			for (parent = current->parents; parent; parent = parent->next) {
+				if (parent->item->generation == GENERATION_NUMBER_INFINITY ||
+				    parent->item->generation == GENERATION_NUMBER_ZERO) {
+					all_parents_computed = 0;
+					commit_list_insert(parent->item, &list);
+					break;
+				} else if (parent->item->generation > max_generation) {
+					max_generation = parent->item->generation;
+				}
+			}
+
+			if (all_parents_computed) {
+				current->generation = max_generation + 1;
+				pop_commit(&list);
+
+				if (current->generation > GENERATION_NUMBER_MAX)
+					current->generation = GENERATION_NUMBER_MAX;
+			}
+		}
+	}
+}
+
 void write_commit_graph(const char *obj_dir,
 			const char **pack_indexes,
 			int nr_packs,
@@ -691,6 +750,8 @@ void write_commit_graph(const char *obj_dir,
 
 	if (commits.nr >= GRAPH_PARENT_MISSING)
 		die(_("too many commits to write graph"));
+
+	compute_generation_numbers(&commits);
 
 	graph_name = get_commit_graph_filename(obj_dir);
 	fd = hold_lock_file_for_update(&lk, graph_name, 0);
