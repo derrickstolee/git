@@ -99,10 +99,9 @@ int compare_generations(struct generation *a, struct generation *b)
 			return 1;
 		return 0;
 
-	case 3:
-		ta = a->date + a->value1;
-		tb = b->date + b->value1;
-
+	case 3: /* V3: Corrected Commit Date */
+	case 5: /* V5: Strictly Monotonic Corrected Commit Date */
+		/* handle special cases, i.e. commits outside commit graph */
 		if (a->value1 == GENERATION_NUMBER_INFINITY) {
 			if (b->value1 == GENERATION_NUMBER_INFINITY)
 				return 0;
@@ -111,6 +110,10 @@ int compare_generations(struct generation *a, struct generation *b)
 		} else if (b->value1 == GENERATION_NUMBER_INFINITY) {
 			return -1;
 		}
+
+		/* corrected commit date = date + offset (correction) */
+		ta = a->date + a->value1;
+		tb = b->date + b->value1;
 
 		if (ta < tb)
 			return -1;
@@ -162,6 +165,7 @@ void get_generation_version_from_commit(const struct commit *c,
 
 		case 1:
 		case 3:
+		case 5:
 			gen->value1 = c->generation;
 			gen->date = c->date;
 			break;
@@ -212,9 +216,10 @@ void set_generation_below_commit(const struct commit *c, struct generation *g)
 			break;
 
 		case 3:
+		case 5: /* ??? */
 			if (g->value1 + g->date >= gc.value1 + gc.date) {
 				g->value1 = 0;
-				g->date = gc.value1 + gc.date;			
+				g->date = gc.value1 + gc.date;
 			}
 			break;
 
@@ -363,7 +368,7 @@ struct commit_graph *load_commit_graph_one(const char *graph_file)
 			else
 				graph->chunk_large_edges = data + chunk_offset;
 			break;
-		
+
 		case GRAPH_CHUNKID_FELINE:
 			if (graph->chunk_feline_gen)
 				chunk_repeated = 1;
@@ -971,27 +976,27 @@ static void compute_generation_numbers_3(struct packed_commit_list *commits)
 	int i;
 	struct commit_list *list = NULL;
 
-        for (i = 0; i < commits->nr; i++) {
-                if (commits->list[i]->generation != GENERATION_NUMBER_INFINITY &&
-                    commits->list[i]->generation != GENERATION_NUMBER_ZERO)
-                        continue;
+	for (i = 0; i < commits->nr; i++) {
+		if (commits->list[i]->generation != GENERATION_NUMBER_INFINITY &&
+			commits->list[i]->generation != GENERATION_NUMBER_ZERO)
+			continue;
 
-                commit_list_insert(commits->list[i], &list);
+		commit_list_insert(commits->list[i], &list);
 
-                while (list) {
-                        struct commit *current = list->item;
-                        struct commit_list *parent;
-                        int all_parents_computed = 1;
+		while (list) {
+			struct commit *current = list->item;
+			struct commit_list *parent;
+			int all_parents_computed = 1;
 
-                        timestamp_t max_timestamp = current->date;
+			timestamp_t max_timestamp = current->date;
 
-                        for (parent = current->parents; parent; parent = parent->next) {
-                                if (parent->item->generation == GENERATION_NUMBER_INFINITY ||
-                                    parent->item->generation == GENERATION_NUMBER_ZERO) {
-                                        all_parents_computed = 0;
-                                        commit_list_insert(parent->item, &list);
-                                        break;
-                                } else {
+			for (parent = current->parents; parent; parent = parent->next) {
+				if (parent->item->generation == GENERATION_NUMBER_INFINITY ||
+					parent->item->generation == GENERATION_NUMBER_ZERO) {
+					all_parents_computed = 0;
+					commit_list_insert(parent->item, &list);
+					break;
+				} else {
 					struct generation pg;
 					timestamp_t pt;
 					get_generation_version_from_commit(parent->item, 3, &pg);
@@ -1001,18 +1006,74 @@ static void compute_generation_numbers_3(struct packed_commit_list *commits)
 					if (pt > max_timestamp)
 						max_timestamp = pt + 1;
 				}
-                        }
+			}
 
-                        if (all_parents_computed) {
+			if (all_parents_computed) {
 				current->generation = (uint32_t)(max_timestamp - current->date) + 1;
-                                pop_commit(&list);
+				pop_commit(&list);
 
-                                if (current->generation > GENERATION_NUMBER_MAX)
-                                        die(_("generation number gap is too high!"));
-                        }
-                }
-        }
+				if (current->generation > GENERATION_NUMBER_MAX)
+					die(_("generation number gap is too high!"));
+			}
+		}
+	}
 }
+
+static void compute_generation_numbers_5(struct packed_commit_list *commits)
+{
+	int i;
+	struct commit_list *list = NULL;
+
+	for (i = 0; i < commits->nr; i++) {
+		/* skip already computed generation numbers */
+		if (commits->list[i]->generation != GENERATION_NUMBER_INFINITY &&
+			commits->list[i]->generation != GENERATION_NUMBER_ZERO)
+			continue;
+
+		commit_list_insert(commits->list[i], &list);
+
+		while (list) {
+			struct commit *current = list->item;
+			struct commit_list *parent;
+			int all_parents_computed = 1;
+
+			timestamp_t max_timestamp = current->date;
+			uint32_t max_generation = 0;
+
+			for (parent = current->parents; parent; parent = parent->next) {
+				if (parent->item->generation == GENERATION_NUMBER_INFINITY ||
+				    parent->item->generation == GENERATION_NUMBER_ZERO) {
+					all_parents_computed = 0;
+					commit_list_insert(parent->item, &list);
+					break;
+
+				} else {
+					struct generation pg;
+					timestamp_t pt;
+					get_generation_version_from_commit(parent->item, 5, &pg);
+
+					pt = pg.value1 + pg.date;
+
+					if (pt > max_timestamp)
+						max_timestamp = pt + 1;
+					if (pg.value1 > max_generation)
+						max_generation = pg.value1;
+				}
+			}
+
+			if (all_parents_computed) {
+				current->generation = (uint32_t)(max_timestamp - current->date) + 1;
+				if (current->generation < max_generation + 1)
+					current->generation = max_generation + 1;
+				pop_commit(&list);
+
+				if (current->generation > GENERATION_NUMBER_MAX)
+					die(_("generation number gap is too high!"));
+			}
+		}
+	}
+}
+
 
 static void compute_generation_numbers(struct packed_commit_list *commits,
 				       int generation_version)
@@ -1037,6 +1098,9 @@ static void compute_generation_numbers(struct packed_commit_list *commits,
 		return;
 	case 4:
 		/* compute at write time */
+		return;
+	case 5:
+		compute_generation_numbers_5(commits);
 		return;
 	}
 }
