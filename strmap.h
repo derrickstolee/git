@@ -3,8 +3,10 @@
 
 #include "hashmap.h"
 
+struct mempool;
 struct strmap {
 	struct hashmap map;
+	struct mem_pool *pool;
 	unsigned int strdup_strings:1;
 };
 
@@ -41,9 +43,10 @@ void strmap_init(struct strmap *map);
 
 /*
  * Same as strmap_init, but for those who want to control the memory management
- * carefully instead of using the default of strdup_strings=1.
+ * carefully instead of using the default of strdup_strings=1 and pool=NULL.
  */
 void strmap_init_with_options(struct strmap *map,
+			      struct mem_pool *pool,
 			      int strdup_strings);
 
 /*
@@ -144,9 +147,10 @@ static inline void strintmap_init(struct strintmap *map, int default_value)
 
 static inline void strintmap_init_with_options(struct strintmap *map,
 					       int default_value,
+					       struct mem_pool *pool,
 					       int strdup_strings)
 {
-	strmap_init_with_options(&map->map, strdup_strings);
+	strmap_init_with_options(&map->map, pool, strdup_strings);
 	map->default_value = default_value;
 }
 
@@ -228,9 +232,10 @@ static inline void strset_init(struct strset *set)
 }
 
 static inline void strset_init_with_options(struct strset *set,
+					    struct mem_pool *pool,
 					    int strdup_strings)
 {
-	strmap_init_with_options(&set->map, strdup_strings);
+	strmap_init_with_options(&set->map, pool, strdup_strings);
 }
 
 static inline void strset_clear(struct strset *set)
