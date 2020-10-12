@@ -134,3 +134,11 @@ void strintmap_incr(struct strintmap *map, const char *str, intptr_t amt)
 	else
 		strintmap_set(map, str, map->default_value + amt);
 }
+
+int strset_check_and_add(struct strset *set, const char *str)
+{
+	if (strset_contains(set, str))
+		return 1;
+	strset_add(set, str);
+	return 0;
+}

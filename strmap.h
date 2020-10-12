@@ -28,6 +28,10 @@ int cmp_strmap_entry(const void *hashmap_cmp_fn_data,
 			.map.strdup_strings = 1,                          \
 			.default_value = 0,                               \
 		    }
+#define STRSET_INIT { \
+			.map.map = HASHMAP_INIT(cmp_strmap_entry, NULL),  \
+			.map.strdup_strings = 1,                          \
+		    }
 
 /*
  * Initialize the members of the strmap.  Any keys added to the strmap will
@@ -199,5 +203,72 @@ static inline void strintmap_set(struct strintmap *map, const char *str,
  * set its value to default_value + amt.
  */
 void strintmap_incr(struct strintmap *map, const char *str, intptr_t amt);
+
+/*
+ * strset:
+ *    A set of strings.
+ *
+ * Primary differences with strmap:
+ *    1) The value is always NULL, and ignored.  As there is no value to free,
+ *       there is one fewer argument to strset_clear
+ *    2) No strset_get() because there is no value.
+ *    3) No strset_put(); use strset_add() instead.
+ */
+
+struct strset {
+	struct strmap map;
+};
+
+#define strset_for_each_entry(mystrset, iter, var)	\
+	strmap_for_each_entry(&(mystrset)->map, iter, var)
+
+static inline void strset_init(struct strset *set)
+{
+	strmap_init(&set->map);
+}
+
+static inline void strset_init_with_options(struct strset *set,
+					    int strdup_strings)
+{
+	strmap_init_with_options(&set->map, strdup_strings);
+}
+
+static inline void strset_clear(struct strset *set)
+{
+	strmap_clear(&set->map, 0);
+}
+
+static inline void strset_partial_clear(struct strset *set)
+{
+	strmap_partial_clear(&set->map, 0);
+}
+
+static inline int strset_contains(struct strset *set, const char *str)
+{
+	return strmap_contains(&set->map, str);
+}
+
+static inline void strset_remove(struct strset *set, const char *str)
+{
+	return strmap_remove(&set->map, str, 0);
+}
+
+static inline int strset_empty(struct strset *set)
+{
+	return strmap_empty(&set->map);
+}
+
+static inline unsigned int strset_get_size(struct strset *set)
+{
+	return strmap_get_size(&set->map);
+}
+
+static inline void strset_add(struct strset *set, const char *str)
+{
+	strmap_put(&set->map, str, NULL);
+}
+
+/* Returns 1 if str already in set.  Otherwise adds str to set and returns 0 */
+int strset_check_and_add(struct strset *set, const char *str);
 
 #endif /* STRMAP_H */
