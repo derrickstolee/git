@@ -315,7 +315,9 @@ static int collect_merge_info(struct merge_options *opt,
 	init_tree_desc(t+1, side1->buffer, side1->size);
 	init_tree_desc(t+2, side2->buffer, side2->size);
 
+	trace2_region_enter("merge", "traverse_trees", opt->repo);
 	ret = traverse_trees(NULL, 3, t, &info);
+	trace2_region_leave("merge", "traverse_trees", opt->repo);
 
 	return ret;
 }
@@ -615,31 +617,40 @@ static void process_entries(struct merge_options *opt,
 	struct string_list_item *entry;
 	struct directory_versions dir_metadata;
 
+	trace2_region_enter("merge", "process_entries setup", opt->repo);
 	if (strmap_empty(&opt->priv->paths)) {
 		oidcpy(result_oid, opt->repo->hash_algo->empty_tree);
 		return;
 	}
 
 	/* Hack to pre-allocate plist to the desired size */
+	trace2_region_enter("merge", "plist grow", opt->repo);
 	ALLOC_GROW(plist.items, strmap_get_size(&opt->priv->paths), plist.alloc);
+	trace2_region_leave("merge", "plist grow", opt->repo);
 
 	/* Put every entry from paths into plist, then sort */
+	trace2_region_enter("merge", "plist copy", opt->repo);
 	strmap_for_each_entry(&opt->priv->paths, &iter, e) {
 		string_list_append(&plist, e->key)->util = e->value;
 	}
+	trace2_region_leave("merge", "plist copy", opt->repo);
+
+	trace2_region_enter("merge", "plist sort", opt->repo);
 	plist.cmp = string_list_df_name_compare;
 	string_list_sort(&plist);
+	trace2_region_leave("merge", "plist special sort", opt->repo);
 
-	/* other setup */
 	string_list_init(&dir_metadata.versions, 0);
 	string_list_init(&dir_metadata.offsets, 0);
 	dir_metadata.last_directory = NULL;
 	dir_metadata.last_directory_len = 0;
+	trace2_region_leave("merge", "process_entries setup", opt->repo);
 
 	/*
 	 * Iterate over the items in reverse order, so we can handle paths
 	 * below a directory before needing to handle the directory itself.
 	 */
+	trace2_region_enter("merge", "processing", opt->repo);
 	for (entry = &plist.items[plist.nr-1]; entry >= plist.items; --entry) {
 		char *path = entry->string;
 		/*
@@ -655,7 +666,9 @@ static void process_entries(struct merge_options *opt,
 		else
 			process_entry(opt, path, ci, &dir_metadata);
 	}
+	trace2_region_leave("merge", "processing", opt->repo);
 
+	trace2_region_enter("merge", "finalize", opt->repo);
 	if (dir_metadata.offsets.nr != 1 ||
 	    (uintptr_t)dir_metadata.offsets.items[0].util != 0) {
 		printf("dir_metadata.offsets.nr = %d (should be 1)\n",
@@ -669,6 +682,7 @@ static void process_entries(struct merge_options *opt,
 	string_list_clear(&plist, 0);
 	string_list_clear(&dir_metadata.versions, 0);
 	string_list_clear(&dir_metadata.offsets, 0);
+	trace2_region_leave("merge", "finalize", opt->repo);
 }
 
 static int checkout(struct merge_options *opt,
@@ -824,12 +838,15 @@ void merge_switch_to_result(struct merge_options *opt,
 	if (result->clean >= 0 && update_worktree_and_index) {
 		struct merge_options_internal *opti = result->priv;
 
+		trace2_region_enter("merge", "checkout", opt->repo);
 		if (checkout(opt, head, result->tree)) {
 			/* failure to function */
 			result->clean = -1;
 			return;
 		}
+		trace2_region_leave("merge", "checkout", opt->repo);
 
+		trace2_region_enter("merge", "record_unmerged", opt->repo);
 		if (record_unmerged_index_entries(opt, opt->repo->index,
 						  &opti->paths,
 						  &opti->unmerged)) {
@@ -837,6 +854,7 @@ void merge_switch_to_result(struct merge_options *opt,
 			result->clean = -1;
 			return;
 		}
+		trace2_region_leave("merge", "record_unmerged", opt->repo);
 	}
 
 	if (display_update_msgs) {
@@ -875,6 +893,7 @@ void merge_finalize(struct merge_options *opt,
 static void merge_start(struct merge_options *opt, struct merge_result *result)
 {
 	/* Sanity checks on opt */
+	trace2_region_enter("merge", "sanity checks", opt->repo);
 	assert(opt->repo);
 
 	assert(opt->branch1 && opt->branch2);
@@ -901,11 +920,13 @@ static void merge_start(struct merge_options *opt, struct merge_result *result)
 	assert(opt->obuf.len == 0);
 
 	assert(opt->priv == NULL);
+	trace2_region_leave("merge", "sanity checks", opt->repo);
 
 	/* Default to histogram diff.  Actually, just hardcode it...for now. */
 	opt->xdl_opts = DIFF_WITH_ALG(opt, HISTOGRAM_DIFF);
 
 	/* Initialization of opt->priv, our internal merge data */
+	trace2_region_enter("merge", "allocate/init", opt->repo);
 	opt->priv = xcalloc(1, sizeof(*opt->priv));
 	/*
 	 * Although we initialize opt->priv->paths with strdup_strings=0,
@@ -918,6 +939,7 @@ static void merge_start(struct merge_options *opt, struct merge_result *result)
 	 */
 	strmap_init_with_options(&opt->priv->paths, NULL, 0);
 	strmap_init_with_options(&opt->priv->unmerged, NULL, 0);
+	trace2_region_leave("merge", "allocate/init", opt->repo);
 }
 
 /*
@@ -931,6 +953,7 @@ static void merge_ort_nonrecursive_internal(struct merge_options *opt,
 {
 	struct object_id working_tree_oid;
 
+	trace2_region_enter("merge", "collect_merge_info", opt->repo);
 	if (collect_merge_info(opt, merge_base, side1, side2) != 0) {
 		err(opt, _("collecting merge info failed for trees %s, %s, %s"),
 		    oid_to_hex(&merge_base->object.oid),
@@ -939,10 +962,16 @@ static void merge_ort_nonrecursive_internal(struct merge_options *opt,
 		result->clean = -1;
 		return;
 	}
+	trace2_region_leave("merge", "collect_merge_info", opt->repo);
 
+	trace2_region_enter("merge", "renames", opt->repo);
 	result->clean = detect_and_process_renames(opt, merge_base,
 						   side1, side2);
+	trace2_region_leave("merge", "renames", opt->repo);
+
+	trace2_region_enter("merge", "process_entries", opt->repo);
 	process_entries(opt, &working_tree_oid);
+	trace2_region_leave("merge", "process_entries", opt->repo);
 
 	/* Set return values */
 	result->tree = parse_tree_indirect(&working_tree_oid);
@@ -960,9 +989,15 @@ void merge_incore_nonrecursive(struct merge_options *opt,
 			       struct tree *side2,
 			       struct merge_result *result)
 {
+	trace2_region_enter("merge", "incore_nonrecursive", opt->repo);
+
+	trace2_region_enter("merge", "merge_start", opt->repo);
 	assert(opt->ancestor != NULL);
 	merge_start(opt, result);
+	trace2_region_leave("merge", "merge_start", opt->repo);
+
 	merge_ort_nonrecursive_internal(opt, merge_base, side1, side2, result);
+	trace2_region_leave("merge", "incore_nonrecursive", opt->repo);
 }
 
 void merge_incore_recursive(struct merge_options *opt,
