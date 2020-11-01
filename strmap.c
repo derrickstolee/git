@@ -59,11 +59,8 @@ static void strmap_free_entries_(struct strmap *map, int free_values)
 	hashmap_for_each_entry(&map->map, &iter, e, ent) {
 		if (free_values)
 			free(e->value);
-		if (!map->pool) {
-			if (map->strdup_strings)
-				free((char*)e->key);
+		if (!map->pool)
 			free(e);
-		}
 	}
 }
 
@@ -88,16 +85,23 @@ void *strmap_put(struct strmap *map, const char *str, void *data)
 		old = entry->value;
 		entry->value = data;
 	} else {
-		const char *key = str;
-
-		entry = map->pool ? mem_pool_alloc(map->pool, sizeof(*entry))
-				  : xmalloc(sizeof(*entry));
+		if (map->strdup_strings) {
+			if (!map->pool) {
+				FLEXPTR_ALLOC_STR(entry, key, str);
+			} else {
+				/* Remember +1 for nul byte twice below */
+				size_t len = strlen(str);
+				entry = mem_pool_alloc(map->pool,
+					       st_add3(sizeof(*entry), len, 1));
+				memcpy(entry->keydata, str, len+1);
+			}
+		} else if (!map->pool) {
+			entry = xmalloc(sizeof(*entry));
+		} else {
+			entry = mem_pool_alloc(map->pool, sizeof(*entry));
+		}
 		hashmap_entry_init(&entry->ent, strhash(str));
-
-		if (map->strdup_strings)
-			key = map->pool ? mem_pool_strdup(map->pool, str)
-					: xstrdup(str);
-		entry->key = key;
+		entry->key = map->strdup_strings ? entry->keydata : str;
 		entry->value = data;
 		hashmap_add(&map->map, &entry->ent);
 	}
@@ -130,11 +134,8 @@ void strmap_remove(struct strmap *map, const char *str, int free_value)
 		return;
 	if (free_value)
 		free(ret->value);
-	if (!map->pool) {
-		if (map->strdup_strings)
-			free((char*)ret->key);
+	if (!map->pool)
 		free(ret);
-	}
 }
 
 void strintmap_incr(struct strintmap *map, const char *str, intptr_t amt)

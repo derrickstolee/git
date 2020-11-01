@@ -14,6 +14,7 @@ struct strmap_entry {
 	struct hashmap_entry ent;
 	const char *key;
 	void *value;
+	char keydata[FLEX_ARRAY]; /* if strdup_strings=1, key == &keydata[0] */
 };
 
 int cmp_strmap_entry(const void *hashmap_cmp_fn_data,
