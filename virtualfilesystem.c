@@ -343,7 +343,7 @@ void apply_virtualfilesystem(struct index_state *istate)
  * Free the virtual file system data structures.
  */
 void free_virtualfilesystem(void) {
-	hashmap_free_entries(&virtual_filesystem_hashmap, struct virtualfilesystem, ent);
-	hashmap_free_entries(&parent_directory_hashmap, struct virtualfilesystem, ent);
+	hashmap_clear_and_free(&virtual_filesystem_hashmap, struct virtualfilesystem, ent);
+	hashmap_clear_and_free(&parent_directory_hashmap, struct virtualfilesystem, ent);
 	strbuf_release(&virtual_filesystem_data);
 }

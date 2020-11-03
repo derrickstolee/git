@@ -706,6 +706,7 @@ TEST_BUILTINS_OBJS += test-dump-fsmonitor.o
 TEST_BUILTINS_OBJS += test-dump-split-index.o
 TEST_BUILTINS_OBJS += test-dump-untracked-cache.o
 TEST_BUILTINS_OBJS += test-example-decorate.o
+TEST_BUILTINS_OBJS += test-fast-rebase.o
 TEST_BUILTINS_OBJS += test-genrandom.o
 TEST_BUILTINS_OBJS += test-genzeros.o
 TEST_BUILTINS_OBJS += test-hash-speed.o
@@ -926,6 +927,8 @@ LIB_OBJS += mailmap.o
 LIB_OBJS += match-trees.o
 LIB_OBJS += mem-pool.o
 LIB_OBJS += merge-blobs.o
+LIB_OBJS += merge-ort.o
+LIB_OBJS += merge-ort-wrappers.o
 LIB_OBJS += merge-recursive.o
 LIB_OBJS += merge.o
 LIB_OBJS += mergesort.o
@@ -1005,6 +1008,7 @@ LIB_OBJS += stable-qsort.o
 LIB_OBJS += strbuf.o
 LIB_OBJS += streaming.o
 LIB_OBJS += string-list.o
+LIB_OBJS += strmap.o
 LIB_OBJS += strvec.o
 LIB_OBJS += sub-process.o
 LIB_OBJS += submodule-config.o
@@ -3002,15 +3006,12 @@ endif
 	} && \
 	for p in $(filter $(install_bindir_programs),$(BUILT_INS)); do \
 		$(RM) "$$bindir/$$p" && \
-		if test -z "$(SKIP_DASHED_BUILT_INS)"; \
-		then \
-			test -n "$(INSTALL_SYMLINKS)" && \
-			ln -s "git$X" "$$bindir/$$p" || \
-			{ test -z "$(NO_INSTALL_HARDLINKS)" && \
-			  ln "$$bindir/git$X" "$$bindir/$$p" 2>/dev/null || \
-			  ln -s "git$X" "$$bindir/$$p" 2>/dev/null || \
-			  cp "$$bindir/git$X" "$$bindir/$$p" || exit; }; \
-		fi \
+		test -n "$(INSTALL_SYMLINKS)" && \
+		ln -s "git$X" "$$bindir/$$p" || \
+		{ test -z "$(NO_INSTALL_HARDLINKS)" && \
+		  ln "$$bindir/git$X" "$$bindir/$$p" 2>/dev/null || \
+		  ln -s "git$X" "$$bindir/$$p" 2>/dev/null || \
+		  cp "$$bindir/git$X" "$$bindir/$$p" || exit; }; \
 	done && \
 	for p in $(BUILT_INS); do \
 		$(RM) "$$execdir/$$p" && \
