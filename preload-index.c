@@ -55,6 +55,8 @@ static void *preload_thread(void *_data)
 			continue;
 		if (S_ISGITLINK(ce->ce_mode))
 			continue;
+		if (S_ISSPARSEDIR(ce->ce_mode))
+			continue;
 		if (ce_uptodate(ce))
 			continue;
 		if (ce_skip_worktree(ce))
