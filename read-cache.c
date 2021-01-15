@@ -3042,7 +3042,8 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 		if (err)
 			return -1;
 	}
-	if (!strip_extensions && istate->fsmonitor_last_update) {
+	if (!strip_extensions && istate->fsmonitor_last_update &&
+	    !istate->sparse_index) {
 		struct strbuf sb = STRBUF_INIT;
 
 		write_fsmonitor_extension(&sb, istate);
