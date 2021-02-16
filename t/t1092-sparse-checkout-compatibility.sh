@@ -420,8 +420,9 @@ test_expect_success 'sparse-index is not expanded' '
 	init_repos &&
 
 	rm -f trace2.txt &&
+	echo >>sparse-index/untracked.txt &&
 	GIT_TRACE2_EVENT="$(pwd)/trace2.txt" GIT_TRACE2_EVENT_NESTING=10 \
-		git -C sparse-index status -uno &&
+		git -C sparse-index status &&
 	test_region ! index ensure_full_index trace2.txt
 '
 
