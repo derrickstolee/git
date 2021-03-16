@@ -62,11 +62,16 @@ test_expect_success 'setup' '
 	mkdir dir1 &&
 	: >dir1/tracked &&
 	: >dir1/modified &&
+	mkdir dir1a &&
+	: >dir1a/a &&
+	: >dir1a/b &&
 	mkdir dir2 &&
 	: >dir2/tracked &&
 	: >dir2/modified &&
 	git -c core.fsmonitor= add . &&
 	git -c core.fsmonitor= commit -m initial &&
+	git sparse-checkout init --cone --no-sparse-index &&
+	git sparse-checkout set dir1 dir2 &&
 	git config core.fsmonitor .git/hooks/fsmonitor-test &&
 	cat >.gitignore <<-\EOF
 	.gitignore
@@ -99,6 +104,8 @@ test_expect_success 'update-index --no-fsmonitor" removes the fsmonitor extensio
 cat >expect <<EOF &&
 h dir1/modified
 H dir1/tracked
+S dir1a/a
+S dir1a/b
 h dir2/modified
 H dir2/tracked
 h modified
@@ -121,6 +128,8 @@ test_expect_success 'update-index --fsmonitor-valid" sets the fsmonitor valid bi
 cat >expect <<EOF &&
 H dir1/modified
 H dir1/tracked
+S dir1a/a
+S dir1a/b
 H dir2/modified
 H dir2/tracked
 H modified
@@ -139,6 +148,8 @@ test_expect_success 'update-index --no-fsmonitor-valid" clears the fsmonitor val
 cat >expect <<EOF &&
 H dir1/modified
 H dir1/tracked
+S dir1a/a
+S dir1a/b
 H dir2/modified
 H dir2/tracked
 H modified
@@ -158,6 +169,8 @@ cat >expect <<EOF &&
 H dir1/modified
 h dir1/new
 H dir1/tracked
+S dir1a/a
+S dir1a/b
 H dir2/modified
 h dir2/new
 H dir2/tracked
@@ -182,6 +195,8 @@ cat >expect <<EOF &&
 H dir1/modified
 h dir1/new
 h dir1/tracked
+S dir1a/a
+S dir1a/b
 H dir2/modified
 h dir2/new
 h dir2/tracked
@@ -201,6 +216,8 @@ test_expect_success 'all unmodified files get marked valid' '
 cat >expect <<EOF &&
 H dir1/modified
 h dir1/tracked
+S dir1a/a
+S dir1a/b
 h dir2/modified
 h dir2/tracked
 h modified
