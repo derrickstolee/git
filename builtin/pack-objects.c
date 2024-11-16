@@ -4779,13 +4779,20 @@ int cmd_pack_objects(int argc,
 
 	if (path_walk < 0) {
 		if (use_bitmap_index > 0 ||
-		    !use_internal_rev_list)
+		    !use_internal_rev_list) {
 			path_walk = 0;
-		else if (the_repository->gitdir &&
-			 the_repository->settings.pack_use_path_walk)
+		} else if (the_repository->gitdir &&
+			 the_repository->settings.pack_use_path_walk) {
 			path_walk = 1;
-		else
+			/*
+			 * If we are using config to enforce this, then
+			 * let's make sure we're getting the most out of
+			 * our compression by ignoring existing deltas.
+			 */
+			reuse_delta = 0;
+		} else {
 			path_walk = git_env_bool("GIT_TEST_PACK_PATH_WALK", 0);
+		}
 	}
 
 	if (depth < 0)
