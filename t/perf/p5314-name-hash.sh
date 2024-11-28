@@ -14,7 +14,7 @@ test_size 'paths at head' '
 	test-tool name-hash <path-list >name-hashes
 '
 
-for version in 1 2
+for version in 1 2 3
 do
 	test_size "distinct hash value: v$version" '
 		awk "{ print \$$version; }" <name-hashes | sort | \

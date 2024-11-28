@@ -25,7 +25,7 @@ test_expect_success 'create rev input' '
 	EOF
 '
 
-for version in 1 2
+for version in 1 2 3
 do
 	export version
 

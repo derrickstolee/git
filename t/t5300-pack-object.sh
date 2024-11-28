@@ -680,13 +680,13 @@ test_expect_success 'valid and invalid --name-hash-versions' '
 	# Valid values are hard to verify other than "do not fail".
 	# Performance tests will be more valuable to validate these versions.
 	# Negative values are converted to version 1.
-	for value in -1 1 2
+	for value in -1 1 2 3
 	do
 		git pack-objects base --all --name-hash-version=$value || return 1
 	done &&
 
 	# Invalid values have clear post-conditions.
-	for value in 0 3
+	for value in 0 4
 	do
 		test_must_fail git pack-objects base --all --name-hash-version=$value 2>err &&
 		test_grep "invalid --name-hash-version option" err || return 1

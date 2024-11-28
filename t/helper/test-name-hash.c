@@ -15,6 +15,7 @@ int cmd__name_hash(int argc UNUSED, const char **argv UNUSED)
 	while (!strbuf_getline(&line, stdin)) {
 		printf("%10u ", pack_name_hash(line.buf));
 		printf("%10u ", pack_name_hash_v2((unsigned const char *)line.buf));
+		printf("%10u ", pack_name_hash_v3(line.buf));
 		printf("%s\n", line.buf);
 	}
 

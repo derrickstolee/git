@@ -374,6 +374,15 @@ breaking most of the collisions from a similarly-named file appearing in
 many different directories. At the moment, this version is not allowed
 when writing reachability bitmap files with `--write-bitmap-index` and it
 will be automatically changed to version `1`.
++
+The name hash version `3` abandons the locality features of versions `1`
+and `2` in favor of minimizing collisions. The goal here is to separate
+objects by their full path and abandon hope for cross-path delta
+compression. For this reason, this option is preferred for repacking large
+repositories with many versions and many name hash collisions when using
+the first two versions. At the moment, this version is not allowed when
+writing reachability bitmap files with `--write-bitmap-index` and it will
+be automatically changed to version `1`.
 
 
 DELTA ISLANDS

@@ -45,13 +45,13 @@ test_expect_success 'name-hash value stability' '
 	test-tool name-hash <names >out &&
 
 	cat >expect <<-\EOF &&
-	2582249472 1763573760 first
-	2289942528 1188134912 second
-	2300837888 1130758144 third
-	2544516325 3963087891 a/one-long-enough-for-collisions
-	2544516325 4013419539 b/two-long-enough-for-collisions
-	1420111091 1709547268 many/parts/to/this/path/enough/to/collide/in/v2
-	1420111091 1709547268 enough/parts/to/this/path/enough/to/collide/in/v2
+	2582249472 1763573760 3109209818 first
+	2289942528 1188134912 3781118409 second
+	2300837888 1130758144 3028707182 third
+	2544516325 3963087891 3586976147 a/one-long-enough-for-collisions
+	2544516325 4013419539 1701624798 b/two-long-enough-for-collisions
+	1420111091 1709547268 2676129939 many/parts/to/this/path/enough/to/collide/in/v2
+	1420111091 1709547268 2740459187 enough/parts/to/this/path/enough/to/collide/in/v2
 	EOF
 
 	test_cmp expect out

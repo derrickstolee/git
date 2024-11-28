@@ -274,7 +274,7 @@ static int name_hash_version = -1;
  */
 static void validate_name_hash_version(void)
 {
-	if (name_hash_version < 1 || name_hash_version > 2)
+	if (name_hash_version < 1 || name_hash_version > 3)
 		die(_("invalid --name-hash-version option: %d"), name_hash_version);
 	if (write_bitmap_index && name_hash_version != 1) {
 		warning(_("currently, --write-bitmap-index requires --name-hash-version=1"));
@@ -298,6 +298,9 @@ static inline uint32_t pack_name_hash_fn(const char *name)
 
 	case 2:
 		return pack_name_hash_v2((const unsigned char *)name);
+
+	case 3:
+		return pack_name_hash_v3(name);
 
 	default:
 		BUG("invalid name-hash version: %d", name_hash_version);
