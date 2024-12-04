@@ -9,10 +9,13 @@
 #include "commit.h"
 #include "dir.h"
 #include "environment.h"
+#include "hashmap.h"
 #include "hex.h"
+#include "list-objects.h"
 #include "tree.h"
 #include "tree-walk.h"
 #include "object.h"
+#include "object-name.h"
 #include "object-store-ll.h"
 #include "oid-array.h"
 #include "oidset.h"
@@ -24,9 +27,10 @@
 #include "progress.h"
 #include "packfile.h"
 #include "path-walk.h"
+#include "pathspec.h"
 
 static const char * const builtin_backfill_usage[] = {
-	N_("git backfill [--batch-size=<n>] [--[no-]sparse]"),
+	N_("git backfill [--batch-size=<n>] [--[no-]sparse] [[--] <pathspec>]"),
 	NULL
 };
 
@@ -35,6 +39,10 @@ struct backfill_context {
 	struct oid_array current_batch;
 	size_t min_batch_size;
 	int sparse;
+
+	int use_pathspec;
+	struct pathspec ps;
+	struct string_list matching_paths;
 };
 
 static void backfill_context_clear(struct backfill_context *ctx)
@@ -56,7 +64,7 @@ static void download_batch(struct backfill_context *ctx)
 	reprepare_packed_git(ctx->repo);
 }
 
-static int fill_missing_blobs(const char *path UNUSED,
+static int fill_missing_blobs(const char *path,
 			      struct oid_array *list,
 			      enum object_type type,
 			      void *data)
@@ -64,6 +72,11 @@ static int fill_missing_blobs(const char *path UNUSED,
 	struct backfill_context *ctx = data;
 
 	if (type != OBJ_BLOB)
+		return 0;
+
+	if (ctx->use_pathspec &&
+	    !match_pathspec(ctx->repo->index, &ctx->ps, path, strlen(path),
+			    0, NULL, 0))
 		return 0;
 
 	for (size_t i = 0; i < list->nr; i++) {
@@ -144,8 +157,14 @@ int cmd_backfill(int argc, const char **argv, const char *prefix, struct reposit
 
 	repo_config(repo, git_default_config, NULL);
 
-	if (ctx.sparse < 0)
+	if (argc) {
+		parse_pathspec(&ctx.ps, 0, 0, prefix, argv);
+		ctx.use_pathspec = 1;
+		if (ctx.sparse > 0)
+			warning(_("ignoring --sparse option due to presence of pathspec"));
+	} else if (ctx.sparse < 0) {
 		ctx.sparse = core_apply_sparse_checkout;
+	}
 
 	return do_backfill(&ctx);
 }
