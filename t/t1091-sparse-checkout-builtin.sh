@@ -1123,19 +1123,7 @@ test_expect_success 'clean with sparse file states' '
 	# Now, stage the change to the tracked file.
 	git -C repo add --sparse folder2/a &&
 
-	# Clean will continue not doing anything.
-	git -C repo sparse-checkout clean >out &&
-	test_line_count = 0 out &&
-	test_path_exists repo/folder2/a &&
-	test_path_exists repo/folder2/file &&
-
-	# But we can reapply to remove the staged change.
-	git -C repo sparse-checkout reapply 2>err &&
-	test_grep folder2 err &&
-	test_path_is_missing repo/folder2/a &&
-	test_path_exists repo/folder2/file &&
-
-	# We can clean now.
+	# Clean will update the skip-worktree bit and remove this file.
 	cat >expect <<-\EOF &&
 	Removing folder2/
 	EOF
@@ -1143,15 +1131,17 @@ test_expect_success 'clean with sparse file states' '
 	test_cmp expect out &&
 	test_path_is_missing repo/folder2 &&
 
-	# At the moment, the file is staged.
+	# We are now in a strange state: the change is staged but it
+	# is also removed from the worktree.
 	cat >expect <<-\EOF &&
-	M  folder2/a
+	MD folder2/a
 	EOF
 
 	git -C repo status -s >out &&
 	test_cmp expect out &&
 
-	# Reapply persists the modified state.
+	# Reapply updates the skip-worktree bit to remove this
+	# "deleted" state.
 	git -C repo sparse-checkout reapply &&
 	cat >expect <<-\EOF &&
 	M  folder2/a
@@ -1168,15 +1158,21 @@ test_expect_success 'clean with sparse file states' '
 	mkdir repo/folder2/ &&
 	echo dirtier >repo/folder2/a &&
 	git -C repo add --sparse folder2/a &&
+	cat >expect <<-\EOF &&
+	Removing folder2/
+	EOF
 	git -C repo sparse-checkout clean >out &&
-	test_must_be_empty out &&
-	test_path_exists repo/folder2/a &&
+	test_cmp expect out &&
+	test_path_is_missing repo/folder2 &&
 
 	# Committing without reapplying makes it look like a deletion
 	# due to no skip-worktree bit.
 	git -C repo commit -m "dirtier" &&
+	cat >expect <<-\EOF &&
+	 D folder2/a
+	EOF
 	git -C repo status -s >out &&
-	test_must_be_empty out &&
+	test_cmp expect out &&
 
 	git -C repo sparse-checkout reapply &&
 	git -C repo status -s >out &&
@@ -1202,7 +1198,11 @@ test_expect_success 'sparse-checkout operations with merge conflicts' '
 		git commit -a -m "left" &&
 
 		git checkout -b merge &&
-		git sparse-checkout set deep/deeper1 &&
+
+		touch deep/deeper2/extra &&
+		git sparse-checkout set deep/deeper1 2>err &&
+		grep "contains untracked files" err &&
+		test_path_exists deep/deeper2/extra &&
 
 		test_must_fail git merge -m "will-conflict" right &&
 
@@ -1214,15 +1214,26 @@ test_expect_success 'sparse-checkout operations with merge conflicts' '
 		git merge --continue &&
 
 		test_path_exists folder1/even/more/dirs/file &&
+		test_path_exists deep/deeper2/extra &&
 
-		# clean does not remove the file, because the
-		# SKIP_WORKTREE bit was not cleared by the merge command.
+		cat >expect <<-\EOF &&
+		Removing deep/deeper2/
+		Removing folder1/
+		EOF
 		git sparse-checkout clean -f >out &&
-		test_line_count = 0 out &&
-		test_path_exists folder1/even/more/dirs/file &&
+		test_cmp expect out &&
+		test_path_is_missing folder1 &&
+		test_path_is_missing deep/deeper2 &&
+
+		cat >expect <<-\EOF &&
+		 D folder1/even/more/dirs/file
+		EOF
+		git status -s -uno >out &&
+		test_cmp expect out &&
 
 		git sparse-checkout reapply &&
-		test_path_is_missing folder1
+		git status -s -uno >out &&
+		test_must_be_empty out
 	)
 '
 
