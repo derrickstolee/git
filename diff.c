@@ -45,6 +45,7 @@
 #include "read-cache-ll.h"
 #include "setup.h"
 #include "strmap.h"
+#include "trace2.h"
 #include "ws.h"
 
 #ifdef NO_FAST_WORKING_DIRECTORY
@@ -6725,6 +6726,7 @@ static void diff_flush_patch_all_file_pairs(struct diff_options *o)
 	if (WSEH_NEW & WS_RULE_MASK)
 		BUG("WS rules bit mask overlaps with diff symbol flags");
 
+	trace2_region_enter("diff", "diff_flush_patch_all_file_pairs", the_repository);
 	if (o->color_moved)
 		o->emitted_symbols = &esm;
 
@@ -6762,6 +6764,7 @@ static void diff_flush_patch_all_file_pairs(struct diff_options *o)
 
 		o->emitted_symbols = NULL;
 	}
+	trace2_region_leave("diff", "diff_flush_patch_all_file_pairs", the_repository);
 }
 
 static void diff_free_file(struct diff_options *options)
@@ -6830,6 +6833,8 @@ void diff_flush(struct diff_options *options)
 		FILE *dev_null = NULL;
 		int saved_color_moved = options->color_moved;
 
+		trace2_region_enter("diff-flush", "collect-queue", the_repository);
+
 		if (options->flags.diff_from_contents) {
 			dev_null = xfopen("/dev/null", "w");
 			options->color_moved = 0;
@@ -6857,6 +6862,8 @@ void diff_flush(struct diff_options *options)
 			options->color_moved = saved_color_moved;
 		}
 		separator++;
+
+		trace2_region_leave("diff-flush", "collect-queue", the_repository);
 	}
 
 	if (output_format & DIFF_FORMAT_DIRSTAT && options->flags.dirstat_by_line)
@@ -6866,6 +6873,7 @@ void diff_flush(struct diff_options *options)
 	    dirstat_by_line) {
 		struct diffstat_t diffstat;
 
+		trace2_printf("compute_diffstat");
 		compute_diffstat(options, &diffstat, q);
 		if (output_format & DIFF_FORMAT_NUMSTAT)
 			show_numstat(&diffstat, options);
@@ -6875,6 +6883,8 @@ void diff_flush(struct diff_options *options)
 			show_shortstats(&diffstat, options);
 		if (output_format & DIFF_FORMAT_DIRSTAT && dirstat_by_line)
 			show_dirstat_by_line(&diffstat, options);
+
+		trace2_printf("free_diffstat_info");
 		free_diffstat_info(&diffstat);
 		separator++;
 	}
@@ -6882,6 +6892,7 @@ void diff_flush(struct diff_options *options)
 		show_dirstat(options);
 
 	if (output_format & DIFF_FORMAT_SUMMARY && !is_summary_empty(q)) {
+		trace2_printf("diff_summary");
 		for (i = 0; i < q->nr; i++) {
 			diff_summary(options, q->queue[i]);
 		}
@@ -6911,14 +6922,17 @@ void diff_flush(struct diff_options *options)
 		 * options->file to /dev/null should be safe, because we
 		 * aren't supposed to produce any output anyway.
 		 */
+		trace2_printf("diff_free_file");
 		diff_free_file(options);
 		options->file = xfopen("/dev/null", "w");
 		options->close_file = 1;
 		options->color_moved = 0;
 		for (i = 0; i < q->nr; i++) {
 			struct diff_filepair *p = q->queue[i];
-			if (check_pair_status(p))
+			if (check_pair_status(p)) {
+				trace2_printf("diff_flush_patch_quietly");
 				diff_flush_patch_quietly(p, options);
+			}
 			if (options->found_changes)
 				break;
 		}
@@ -7106,18 +7120,23 @@ void diff_queued_diff_prefetch(void *repository)
 	struct diff_queue_struct *q = &diff_queued_diff;
 	struct oid_array to_fetch = OID_ARRAY_INIT;
 
+	trace2_region_enter("diff", "queued-diff", the_repository);
+
 	for (i = 0; i < q->nr; i++) {
 		struct diff_filepair *p = q->queue[i];
 		diff_add_if_missing(repo, &to_fetch, p->one);
 		diff_add_if_missing(repo, &to_fetch, p->two);
 	}
 
+	trace2_printf("promisor_remote_get_direct");
 	/*
 	 * NEEDSWORK: Consider deduplicating the OIDs sent.
 	 */
 	promisor_remote_get_direct(repo, to_fetch.oid, to_fetch.nr);
 
+	trace2_printf("oid_array_clear");
 	oid_array_clear(&to_fetch);
+	trace2_region_leave("diff", "queued-diff", the_repository);
 }
 
 void init_diffstat_widths(struct diff_options *options)
@@ -7145,19 +7164,26 @@ void diffcore_std(struct diff_options *options)
 	 */
 	if (options->repo == the_repository && repo_has_promisor_remote(the_repository) &&
 	    (options->output_format & output_formats_to_prefetch ||
-	     options->pickaxe_opts & DIFF_PICKAXE_KINDS_MASK))
+	     options->pickaxe_opts & DIFF_PICKAXE_KINDS_MASK)) {
 		diff_queued_diff_prefetch(options->repo);
+	}
 
 	/* NOTE please keep the following in sync with diff_tree_combined() */
-	if (options->skip_stat_unmatch)
+	if (options->skip_stat_unmatch) {
+		trace2_printf("diffcore_skip_stat_unmatch");
 		diffcore_skip_stat_unmatch(options);
+	}
 	if (!options->found_follow) {
 		/* See try_to_follow_renames() in tree-diff.c */
-		if (options->break_opt != -1)
+		if (options->break_opt != -1) {
+			trace2_printf("diffcore_break");
 			diffcore_break(options->repo,
 				       options->break_opt);
-		if (options->detect_rename)
+		}
+		if (options->detect_rename) {
+			trace2_printf("diffcore_rename");
 			diffcore_rename(options);
+		}
 		if (options->break_opt != -1)
 			diffcore_merge_broken();
 	}

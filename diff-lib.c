@@ -25,6 +25,7 @@
 #include "dir.h"
 #include "fsmonitor.h"
 #include "commit-reach.h"
+#include "trace2.h"
 
 /*
  * diff-files
@@ -637,9 +638,13 @@ void run_diff_index(struct rev_info *revs, unsigned int option)
 	if (diff_cache(revs, &oid, name, cached))
 		exit(128);
 
+	trace2_printf("diff_set_mnemonic_prefix");
 	diff_set_mnemonic_prefix(&revs->diffopt, "c/", cached ? "i/" : "w/");
+	trace2_printf("diffcore_fix_diff_index");
 	diffcore_fix_diff_index();
+	trace2_printf("diffcore_std");
 	diffcore_std(&revs->diffopt);
+	trace2_printf("diff_flush");
 	diff_flush(&revs->diffopt);
 	trace_performance_leave("diff-index");
 }
