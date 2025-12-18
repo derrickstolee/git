@@ -7099,7 +7099,26 @@ static int diffnamecmp(const void *a_, const void *b_)
 void diffcore_fix_diff_index(void)
 {
 	struct diff_queue_struct *q = &diff_queued_diff;
+
+	for (int i = 0; i < q->nr; i++) {
+		struct diff_filepair *p = q->queue[i];
+
+		if (p->one)
+			trace2_printf("i=%d, p->one: %s", i, p->one->path);
+		if (p->two)
+			trace2_printf("i=%d, p->two: %s", i, p->two->path);
+	}
+
 	QSORT(q->queue, q->nr, diffnamecmp);
+
+	for (int i = 0; i < q->nr; i++) {
+		struct diff_filepair *p = q->queue[i];
+
+		if (p->one)
+			trace2_printf("i=%d, p->one: %s", i, p->one->path);
+		if (p->two)
+			trace2_printf("i=%d, p->two: %s", i, p->two->path);
+	}
 }
 
 void diff_add_if_missing(struct repository *r,
@@ -7334,8 +7353,10 @@ struct diff_filepair *diff_queue_change(struct diff_queue_struct *queue,
 	struct diff_filepair *p;
 
 	if (S_ISGITLINK(old_mode) && S_ISGITLINK(new_mode) &&
-	    is_submodule_ignored(concatpath, options))
+	    is_submodule_ignored(concatpath, options)) {
+		trace2_printf("is submodule");
 		return NULL;
+	}
 
 	if (options->flags.reverse_diff) {
 		SWAP(old_mode, new_mode);
@@ -7345,8 +7366,10 @@ struct diff_filepair *diff_queue_change(struct diff_queue_struct *queue,
 	}
 
 	if (options->prefix &&
-	    strncmp(concatpath, options->prefix, options->prefix_length))
+	    strncmp(concatpath, options->prefix, options->prefix_length)) {
+		trace2_printf("not in prefix");
 		return NULL;
+	}
 
 	one = alloc_filespec(concatpath);
 	two = alloc_filespec(concatpath);
@@ -7387,6 +7410,7 @@ void diff_change(struct diff_options *options,
 		 const char *concatpath,
 		 unsigned old_dirty_submodule, unsigned new_dirty_submodule)
 {
+	trace2_printf("diff_change: %s,%s", oid_to_hex(old_oid), oid_to_hex(new_oid));
 	diff_queue_change(&diff_queued_diff, options, old_mode, new_mode,
 			  old_oid, new_oid, old_oid_valid, new_oid_valid,
 			  concatpath, old_dirty_submodule, new_dirty_submodule);
