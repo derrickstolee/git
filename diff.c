@@ -7143,7 +7143,9 @@ void diff_queued_diff_prefetch(void *repository)
 
 	for (i = 0; i < q->nr; i++) {
 		struct diff_filepair *p = q->queue[i];
+		trace2_printf("i=%d, p->one=%s", i, p->one ? p->one->path : "<null>");
 		diff_add_if_missing(repo, &to_fetch, p->one);
+		trace2_printf("i=%d, p->two=%s", i, p->two ? p->two->path : "<null>");
 		diff_add_if_missing(repo, &to_fetch, p->two);
 	}
 
