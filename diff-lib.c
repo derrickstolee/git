@@ -384,6 +384,7 @@ static int show_modified(struct rev_info *revs,
 	 * a modification.
 	 */
 	if (S_ISSPARSEDIR(new_entry->ce_mode)) {
+		trace2_printf("show_modified: (sparse) old:%s new:%s", old_entry->name, new_entry->name);
 		diff_tree_oid(&old_entry->oid, &new_entry->oid, new_entry->name, &revs->diffopt);
 		return 0;
 	}
@@ -420,6 +421,7 @@ static int show_modified(struct rev_info *revs,
 	    !revs->diffopt.flags.find_copies_harder)
 		return 0;
 
+	trace2_printf("show_modified: old:%s new:%s", old_entry->name, new_entry->name);
 	diff_change(&revs->diffopt, oldmode, mode,
 		    &old_entry->oid, oid, 1, !is_null_oid(oid),
 		    old_entry->name, 0, dirty_submodule);
@@ -470,6 +472,7 @@ static void do_oneway_diff(struct unpack_trees_options *o,
 	 * Something added to the tree?
 	 */
 	if (!tree) {
+		trace2_printf("oneway_diff: (added?) idx:%s tree:%s", idx ? idx->name : "null", tree ? tree->name : "null");
 		show_new_file(revs, idx, cached, match_missing);
 		return;
 	}
@@ -479,10 +482,12 @@ static void do_oneway_diff(struct unpack_trees_options *o,
 	 */
 	if (!idx) {
 		if (S_ISSPARSEDIR(tree->ce_mode)) {
+			trace2_printf("oneway_diff: (sparse tree!) idx:%s tree:%s", idx ? idx->name : "null", tree ? tree->name : "null");
 			diff_tree_oid(&tree->oid, NULL, tree->name, &revs->diffopt);
 			return;
 		}
 
+		trace2_printf("oneway_diff: (index missing) idx:%s tree:%s", idx ? idx->name : "null", tree ? tree->name : "null");
 		diff_index_show_file(revs, "-", tree, &tree->oid, 1,
 				     tree->ce_mode, 0);
 		return;
