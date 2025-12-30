@@ -137,7 +137,7 @@ static void repo_set_commondir(struct repository *repo,
 {
 	struct strbuf sb = STRBUF_INIT;
 
-	free(repo->commondir);
+	FREE_AND_NULL(repo->commondir);
 
 	if (commondir) {
 		repo->different_commondir = 1;
@@ -438,7 +438,7 @@ int repo_read_index(struct repository *repo)
 
 	prepare_repo_settings(repo);
 	if (repo->settings.command_requires_full_index)
-		ensure_full_index(repo->index);
+		ensure_full_index_with_reason(repo->index, "incompatible builtin");
 
 	/*
 	 * If sparse checkouts are in use, check whether paths with the

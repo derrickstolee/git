@@ -34,6 +34,7 @@
 #include "quote.h"
 #include "chdir-notify.h"
 #include "setup.h"
+#include "transport.h"
 #include "ws.h"
 #include "write-or-die.h"
 
@@ -78,8 +79,10 @@ int grafts_keep_true_parents;
 int core_apply_sparse_checkout;
 int core_sparse_checkout_cone;
 int sparse_expect_files_outside_of_patterns;
+char *core_virtualfilesystem;
 int precomposed_unicode = -1; /* see probe_utf8_pathname_composition() */
 unsigned long pack_size_limit_cfg;
+int core_virtualize_objects;
 int max_allowed_tree_depth =
 #ifdef _MSC_VER
 	/*
@@ -102,7 +105,19 @@ int max_allowed_tree_depth =
 	 */
 	1280;
 #else
+#if defined(GIT_WINDOWS_NATIVE) && defined(__clang__) && defined(__aarch64__)
+	/*
+	 * Similar to Visual C, it seems that on Windows/ARM64 the clang-based
+	 * builds have a smaller stack space available. When running out of
+	 * that stack space, a `STATUS_STACK_OVERFLOW` is produced. When the
+	 * Git command was run from an MSYS2 Bash, this unfortunately results
+	 * in an exit code 127. Let's prevent that by lowering the maximal
+	 * tree depth; This value seems to be low enough.
+	 */
+	1280;
+#else
 	2048;
+#endif
 #endif
 
 #ifndef PROTECT_HFS_DEFAULT
@@ -114,6 +129,9 @@ int protect_hfs = PROTECT_HFS_DEFAULT;
 #define PROTECT_NTFS_DEFAULT 1
 #endif
 int protect_ntfs = PROTECT_NTFS_DEFAULT;
+int core_use_gvfs_helper;
+char *gvfs_cache_server_url;
+struct strbuf gvfs_shared_cache_pathname = STRBUF_INIT;
 
 /*
  * The character that begins a commented line in user-editable file
@@ -324,8 +342,8 @@ next_name:
 	return (current & ~negative) | positive;
 }
 
-static int git_default_core_config(const char *var, const char *value,
-				   const struct config_context *ctx, void *cb)
+int git_default_core_config(const char *var, const char *value,
+			    const struct config_context *ctx, void *cb)
 {
 	/* This needs a better name */
 	if (!strcmp(var, "core.filemode")) {
@@ -544,8 +562,17 @@ static int git_default_core_config(const char *var, const char *value,
 		return 0;
 	}
 
+	if (!strcmp(var, "core.usegvfshelper")) {
+		core_use_gvfs_helper = git_config_bool(var, value);
+		return 0;
+	}
+
 	if (!strcmp(var, "core.sparsecheckout")) {
-		core_apply_sparse_checkout = git_config_bool(var, value);
+		/* virtual file system relies on the sparse checkout logic so force it on */
+		if (core_virtualfilesystem)
+			core_apply_sparse_checkout = 1;
+		else
+			core_apply_sparse_checkout = git_config_bool(var, value);
 		return 0;
 	}
 
@@ -686,6 +713,37 @@ static int git_default_mailmap_config(const char *var, const char *value)
 	return 0;
 }
 
+static int git_default_gvfs_config(const char *var, const char *value)
+{
+	if (!strcmp(var, "gvfs.cache-server")) {
+		char *v2 = NULL;
+
+		if (!git_config_string(&v2, var, value) && v2 && *v2) {
+			free(gvfs_cache_server_url);
+			gvfs_cache_server_url = transport_anonymize_url(v2);
+		}
+		free(v2);
+		return 0;
+	}
+
+	if (!strcmp(var, "gvfs.sharedcache") && value && *value) {
+		strbuf_setlen(&gvfs_shared_cache_pathname, 0);
+		strbuf_addstr(&gvfs_shared_cache_pathname, value);
+		if (strbuf_normalize_path(&gvfs_shared_cache_pathname) < 0) {
+			/*
+			 * Pretend it wasn't set.  This will cause us to
+			 * fallback to ".git/objects" effectively.
+			 */
+			strbuf_release(&gvfs_shared_cache_pathname);
+			return 0;
+		}
+		strbuf_trim_trailing_dir_sep(&gvfs_shared_cache_pathname);
+		return 0;
+	}
+
+	return 0;
+}
+
 static int git_default_attr_config(const char *var, const char *value)
 {
 	if (!strcmp(var, "attr.tree")) {
@@ -752,6 +810,9 @@ int git_default_config(const char *var, const char *value,
 
 	if (starts_with(var, "sparse."))
 		return git_default_sparse_config(var, value);
+
+	if (starts_with(var, "gvfs."))
+		return git_default_gvfs_config(var, value);
 
 	/* Add other config variables here and to Documentation/config.adoc. */
 	return 0;

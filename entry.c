@@ -324,7 +324,7 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 		if (!has_symlinks || to_tempfile)
 			goto write_file_entry;
 
-		ret = symlink(new_blob, path);
+		ret = create_symlink(state->istate, new_blob, path);
 		free(new_blob);
 		if (ret)
 			return error_errno("unable to create symlink %s", path);
@@ -411,6 +411,9 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 	}
 
 finish:
+	/* Flush cached lstat in fscache after writing to disk. */
+	flush_fscache();
+
 	if (state->refresh_cache) {
 		if (!fstat_done && lstat(ce->name, &st) < 0)
 			return error_errno("unable to stat just-written file %s",
@@ -452,7 +455,7 @@ static void mark_colliding_entries(const struct checkout *state,
 	ce->ce_flags |= CE_MATCHED;
 
 	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(state->istate);
+	ensure_full_index_unaudited(state->istate);
 	for (size_t i = 0; i < state->istate->cache_nr; i++) {
 		struct cache_entry *dup = state->istate->cache[i];
 

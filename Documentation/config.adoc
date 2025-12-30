@@ -449,6 +449,8 @@ include::config/gui.adoc[]
 
 include::config/guitool.adoc[]
 
+include::config/gvfs.adoc[]
+
 include::config/help.adoc[]
 
 include::config/http.adoc[]
@@ -489,6 +491,8 @@ include::config/pack.adoc[]
 
 include::config/pager.adoc[]
 
+include::config/postcommand.adoc[]
+
 include::config/pretty.adoc[]
 
 include::config/promisor.adoc[]
@@ -519,9 +523,13 @@ include::config/safe.adoc[]
 
 include::config/sendemail.adoc[]
 
+include::config/sendpack.adoc[]
+
 include::config/sequencer.adoc[]
 
 include::config/showbranch.adoc[]
+
+include::config/sideband.adoc[]
 
 include::config/sparse.adoc[]
 
@@ -534,6 +542,8 @@ include::config/stash.adoc[]
 include::config/status.adoc[]
 
 include::config/submodule.adoc[]
+
+include::config/survey.adoc[]
 
 include::config/tag.adoc[]
 
@@ -556,5 +566,7 @@ include::config/user.adoc[]
 include::config/versionsort.adoc[]
 
 include::config/web.adoc[]
+
+include::config/windows.adoc[]
 
 include::config/worktree.adoc[]

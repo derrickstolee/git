@@ -38,6 +38,10 @@
 #include "trace2.h"
 #include "dir.h"
 #include "add-interactive.h"
+#include "strbuf.h"
+#include "quote.h"
+#include "dir.h"
+#include "entry.h"
 
 #define REFRESH_INDEX_DELAY_WARNING_IN_MS (2 * 1000)
 
@@ -46,6 +50,7 @@ static const char * const git_reset_usage[] = {
 	N_("git reset [-q] [<tree-ish>] [--] <pathspec>..."),
 	N_("git reset [-q] [--pathspec-from-file [--pathspec-file-nul]] [<tree-ish>]"),
 	N_("git reset --patch [<tree-ish>] [--] [<pathspec>...]"),
+	N_("DEPRECATED: git reset [-q] [--stdin [-z]] [<tree-ish>]"),
 	NULL
 };
 
@@ -157,9 +162,48 @@ static void update_index_from_diff(struct diff_queue_struct *q,
 
 	for (i = 0; i < q->nr; i++) {
 		int pos;
+		int respect_skip_worktree = 1;
 		struct diff_filespec *one = q->queue[i]->one;
+		struct diff_filespec *two = q->queue[i]->two;
 		int is_in_reset_tree = one->mode && !is_null_oid(&one->oid);
+		int is_missing = !(one->mode && !is_null_oid(&one->oid));
+		int was_missing = !two->mode && is_null_oid(&two->oid);
 		struct cache_entry *ce;
+		struct cache_entry *ceBefore;
+		struct checkout state = CHECKOUT_INIT;
+
+		/*
+		 * When using the virtual filesystem feature, the cache entries that are
+		 * added here will not have the skip-worktree bit set.
+		 *
+		 * Without this code there is data that is lost because the files that
+		 * would normally be in the working directory are not there and show as
+		 * deleted for the next status or in the case of added files just disappear.
+		 * We need to create the previous version of the files in the working
+		 * directory so that they will have the right content and the next
+		 * status call will show modified or untracked files correctly.
+		 */
+		if (core_virtualfilesystem && !file_exists(two->path))
+		{
+			respect_skip_worktree = 0;
+			pos = index_name_pos(the_repository->index, two->path, strlen(two->path));
+
+			if ((pos >= 0 && ce_skip_worktree(the_repository->index->cache[pos])) &&
+			    (is_missing || !was_missing))
+			{
+				state.force = 1;
+				state.refresh_cache = 1;
+				state.istate = the_repository->index;
+				ceBefore = make_cache_entry(the_repository->index, two->mode,
+							    &two->oid, two->path,
+							    0, 0);
+				if (!ceBefore)
+					die(_("make_cache_entry failed for path '%s'"),
+						two->path);
+
+				checkout_entry(ceBefore, &state, NULL, NULL);
+			}
+		}
 
 		if (!is_in_reset_tree && !intent_to_add) {
 			remove_file_from_index(the_repository->index, one->path);
@@ -178,8 +222,14 @@ static void update_index_from_diff(struct diff_queue_struct *q,
 		 * to properly construct the reset sparse directory.
 		 */
 		pos = index_name_pos(the_repository->index, one->path, strlen(one->path));
-		if ((pos >= 0 && ce_skip_worktree(the_repository->index->cache[pos])) ||
-		    (pos < 0 && !path_in_sparse_checkout(one->path, the_repository->index)))
+
+		/*
+		 * Do not add the SKIP_WORKTREE bit back if we populated the
+		 * file on purpose in a virtual filesystem scenario.
+		 */
+		if (respect_skip_worktree &&
+		    ((pos >= 0 && ce_skip_worktree(the_repository->index->cache[pos])) ||
+		     (pos < 0 && !path_in_sparse_checkout(one->path, the_repository->index))))
 			ce->ce_flags |= CE_SKIP_WORKTREE;
 
 		if (!ce)
@@ -212,7 +262,8 @@ static int read_from_tree(const struct pathspec *pathspec,
 	opt.add_remove = diff_addremove;
 
 	if (pathspec->nr && pathspec_needs_expanded_index(the_repository->index, pathspec))
-		ensure_full_index(the_repository->index);
+		ensure_full_index_with_reason(the_repository->index,
+					      "reset pathspec");
 
 	if (do_diff_cache(tree_oid, &opt))
 		return 1;
@@ -347,6 +398,7 @@ int cmd_reset(int argc,
 	struct pathspec pathspec;
 	int intent_to_add = 0;
 	struct add_p_opt add_p_opt = ADD_P_OPT_INIT;
+	int nul_term_line = 0, read_from_stdin = 0;
 	const struct option options[] = {
 		OPT__QUIET(&quiet, N_("be quiet, only report errors")),
 		OPT_BOOL(0, "no-refresh", &no_refresh,
@@ -377,6 +429,10 @@ int cmd_reset(int argc,
 				N_("record only the fact that removed paths will be added later")),
 		OPT_PATHSPEC_FROM_FILE(&pathspec_from_file),
 		OPT_PATHSPEC_FILE_NUL(&pathspec_file_nul),
+		OPT_BOOL('z', NULL, &nul_term_line,
+			N_("DEPRECATED (use --pathspec-file-nul instead): paths are separated with NUL character")),
+		OPT_BOOL(0, "stdin", &read_from_stdin,
+				N_("DEPRECATED (use --pathspec-from-file=- instead): read paths from <stdin>")),
 		OPT_END()
 	};
 
@@ -385,6 +441,14 @@ int cmd_reset(int argc,
 	argc = parse_options(argc, argv, prefix, options, git_reset_usage,
 						PARSE_OPT_KEEP_DASHDASH);
 	parse_args(&pathspec, argv, prefix, patch_mode, &rev);
+
+	if (read_from_stdin) {
+		warning(_("--stdin is deprecated, please use --pathspec-from-file=- instead"));
+		free(pathspec_from_file);
+		pathspec_from_file = xstrdup("-");
+		if (nul_term_line)
+			pathspec_file_nul = 1;
+	}
 
 	if (pathspec_from_file) {
 		if (patch_mode)

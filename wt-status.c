@@ -40,7 +40,7 @@
 #define UF_DELAY_WARNING_IN_MS (2 * 1000)
 
 static const char cut_line[] =
-"------------------------ >8 ------------------------\n";
+"------------------------ >8 ------------------------";
 
 static char default_wt_status_colors[][COLOR_MAXLEN] = {
 	GIT_COLOR_NORMAL, /* WT_STATUS_HEADER */
@@ -792,6 +792,9 @@ static void wt_status_collect_untracked(struct wt_status *s)
 	if (s->show_untracked_files != SHOW_ALL_UNTRACKED_FILES)
 		dir.flags |=
 			DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
+	if (s->show_untracked_files == SHOW_COMPLETE_UNTRACKED_FILES)
+		dir.flags |= DIR_KEEP_UNTRACKED_CONTENTS;
+
 	if (s->show_ignored_mode) {
 		dir.flags |= DIR_SHOW_IGNORED_TOO;
 
@@ -1097,15 +1100,22 @@ conclude:
 	status_printf_ln(s, GIT_COLOR_NORMAL, "%s", "");
 }
 
+static inline int starts_with_newline(const char *p)
+{
+    return *p == '\n' || (*p == '\r' && p[1] == '\n');
+}
+
 size_t wt_status_locate_end(const char *s, size_t len)
 {
 	const char *p;
 	struct strbuf pattern = STRBUF_INIT;
 
 	strbuf_addf(&pattern, "\n%s %s", comment_line_str, cut_line);
-	if (starts_with(s, pattern.buf + 1))
+	if (starts_with(s, pattern.buf + 1) &&
+	    starts_with_newline(s + pattern.len - 1))
 		len = 0;
-	else if ((p = strstr(s, pattern.buf))) {
+	else if ((p = strstr(s, pattern.buf)) && // CodeQL [SM01932] justification: CodeQL is wrong here because the value is read from a file via strbuf_read() which does NUL-terminate the string, something CodeQL fails to understand
+		 starts_with_newline(p + pattern.len)) {
 		size_t newlen = p - s + 1;
 		if (newlen < len)
 			len = newlen;
@@ -1604,6 +1614,8 @@ static void show_sparse_checkout_in_use(struct wt_status *s,
 					const char *color)
 {
 	if (s->state.sparse_checkout_percentage == SPARSE_CHECKOUT_DISABLED)
+		return;
+	if (core_virtualfilesystem)
 		return;
 
 	if (s->state.sparse_checkout_percentage == SPARSE_CHECKOUT_SPARSE_INDEX)
@@ -2562,6 +2574,36 @@ void wt_status_print(struct wt_status *s)
 			   s->untracked.nr);
 	trace2_data_intmax("status", s->repo, "count/ignored", s->ignored.nr);
 
+	switch (s->state.sparse_checkout_percentage) {
+	case SPARSE_CHECKOUT_DISABLED:
+		break;
+	case SPARSE_CHECKOUT_SPARSE_INDEX:
+		/*
+		 * Log just the observed size of the sparse-index.
+		 *
+		 * When sparse-index is enabled we can have
+		 * sparse-directory entries in addition to individual
+		 * sparse-file entries, so we don't know the complete
+		 * size of the index.  And we do not want to force
+		 * expand it just to emit some telemetry data.  So we
+		 * cannot report a percentage for the space savings.
+		 *
+		 * It is possible that if the telemetry data is
+		 * aggregated, someone will have a good estimate for
+		 * the size of a fully populated index and can compute
+		 * a percentage after the fact.
+		 */
+		trace2_data_intmax("status", s->repo,
+				   "sparse-index/size",
+				   s->repo->index->cache_nr);
+		break;
+	default:
+		trace2_data_intmax("status", s->repo,
+				   "sparse-checkout/percentage",
+				   s->state.sparse_checkout_percentage);
+		break;
+	}
+
 	trace2_region_enter("status", "print", s->repo);
 
 	switch (s->status_format) {
@@ -2580,6 +2622,9 @@ void wt_status_print(struct wt_status *s)
 	case STATUS_FORMAT_NONE:
 	case STATUS_FORMAT_LONG:
 		wt_longstatus_print(s);
+		break;
+	case STATUS_FORMAT_SERIALIZE_V1:
+		wt_status_serialize_v1(1, s);
 		break;
 	}
 

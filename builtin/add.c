@@ -1,3 +1,5 @@
+#define USE_THE_REPOSITORY_VARIABLE
+
 /*
  * "git add" builtin command
  *
@@ -5,6 +7,7 @@
  */
 
 #include "builtin.h"
+#include "environment.h"
 #include "advice.h"
 #include "config.h"
 #include "environment.h"
@@ -50,6 +53,7 @@ static int chmod_pathspec(struct repository *repo,
 		int err;
 
 		if (!include_sparse &&
+		    !core_virtualfilesystem &&
 		    (ce_skip_worktree(ce) ||
 		     !path_in_sparse_checkout(ce->name, repo->index)))
 			continue;
@@ -135,8 +139,9 @@ static int refresh(struct repository *repo, int verbose, const struct pathspec *
 		if (!seen[i]) {
 			const char *path = pathspec->items[i].original;
 
-			if (matches_skip_worktree(pathspec, i, &skip_worktree_seen) ||
-			    !path_in_sparse_checkout(path, repo->index)) {
+			if (!core_virtualfilesystem &&
+			    (matches_skip_worktree(pathspec, i, &skip_worktree_seen) ||
+			     !path_in_sparse_checkout(path, repo->index))) {
 				string_list_append(&only_match_skip_worktree,
 						   pathspec->items[i].original);
 			} else {
@@ -146,7 +151,11 @@ static int refresh(struct repository *repo, int verbose, const struct pathspec *
 		}
 	}
 
-	if (only_match_skip_worktree.nr) {
+	/*
+	 * When using a virtual filesystem, we might re-add a path
+	 * that is currently virtual and we want that to succeed.
+	 */
+	if (!core_virtualfilesystem && only_match_skip_worktree.nr) {
 		advise_on_updating_sparse_paths(&only_match_skip_worktree);
 		ret = 1;
 	}
@@ -493,6 +502,10 @@ int cmd_add(int argc,
 	die_in_unpopulated_submodule(repo->index, prefix);
 	die_path_inside_submodule(repo->index, &pathspec);
 
+	enable_fscache(0);
+	/* We do not really re-read the index but update the up-to-date flags */
+	preload_index(repo->index, &pathspec, 0);
+
 	if (add_new_files) {
 		int baselen;
 
@@ -541,7 +554,11 @@ int cmd_add(int argc,
 			if (seen[i])
 				continue;
 
-			if (!include_sparse &&
+			/*
+			 * When using a virtual filesystem, we might re-add a path
+			 * that is currently virtual and we want that to succeed.
+			 */
+			if (!include_sparse && !core_virtualfilesystem &&
 			    matches_skip_worktree(&pathspec, i, &skip_worktree_seen)) {
 				string_list_append(&only_match_skip_worktree,
 						   pathspec.items[i].original);
@@ -564,7 +581,6 @@ int cmd_add(int argc,
 					    pathspec.items[i].original);
 			}
 		}
-
 
 		if (only_match_skip_worktree.nr) {
 			advise_on_updating_sparse_paths(&only_match_skip_worktree);
@@ -605,5 +621,6 @@ finish:
 	free(ps_matched);
 	dir_clear(&dir);
 	clear_pathspec(&pathspec);
+	enable_fscache(0);
 	return exit_status;
 }

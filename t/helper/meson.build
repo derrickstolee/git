@@ -29,6 +29,7 @@ test_tool_sources = [
   'test-hash.c',
   'test-hashmap.c',
   'test-hexdump.c',
+  'test-iconv.c',
   'test-json-writer.c',
   'test-lazy-init-name-hash.c',
   'test-match-trees.c',
@@ -86,6 +87,13 @@ test_tool = executable('test-tool',
 )
 bin_wrappers += test_tool
 test_dependencies += test_tool
+
+test_gvfs_protocol = executable('test-gvfs-protocol',
+  sources: 'test-gvfs-protocol.c',
+  dependencies: [libgit_commonmain],
+)
+bin_wrappers += test_gvfs_protocol
+test_dependencies += test_gvfs_protocol
 
 test_fake_ssh = executable('test-fake-ssh',
   sources: 'test-fake-ssh.c',

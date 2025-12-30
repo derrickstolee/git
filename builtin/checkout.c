@@ -21,6 +21,7 @@
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
+#include "packfile.h"
 #include "parse-options.h"
 #include "path.h"
 #include "preload-index.h"
@@ -415,6 +416,7 @@ static int checkout_worktree(const struct checkout_opts *opts,
 	if (pc_workers > 1)
 		init_parallel_checkout();
 
+	enable_fscache(the_repository->index->cache_nr);
 	for (pos = 0; pos < the_repository->index->cache_nr; pos++) {
 		struct cache_entry *ce = the_repository->index->cache[pos];
 		if (ce->ce_flags & CE_MATCHED) {
@@ -440,6 +442,7 @@ static int checkout_worktree(const struct checkout_opts *opts,
 		errs |= run_parallel_checkout(&state, pc_workers, pc_threshold,
 					      NULL, NULL);
 	mem_pool_discard(&ce_mem_pool, should_validate_cache_entries());
+	disable_fscache();
 	remove_marked_cache_entries(the_repository->index, 1);
 	remove_scheduled_dirs();
 	errs |= finish_delayed_checkout(&state, opts->show_progress);
@@ -1059,8 +1062,16 @@ static void update_refs_for_switch(const struct checkout_opts *opts,
 	strbuf_release(&msg);
 	if (!opts->quiet &&
 	    !opts->force_detach &&
-	    (new_branch_info->path || !strcmp(new_branch_info->name, "HEAD")))
+	    (new_branch_info->path || !strcmp(new_branch_info->name, "HEAD"))) {
+		unsigned long nr_unpack_entry_at_start;
+
+		trace2_region_enter("tracking", "report_tracking", the_repository);
+		nr_unpack_entry_at_start = get_nr_unpack_entry();
 		report_tracking(new_branch_info);
+		trace2_data_intmax("tracking", NULL, "report_tracking/nr_unpack_entries",
+				   (intmax_t)(get_nr_unpack_entry() - nr_unpack_entry_at_start));
+		trace2_region_leave("tracking", "report_tracking", the_repository);
+	}
 }
 
 static int add_pending_uninteresting_ref(const char *refname, const char *referent UNUSED,

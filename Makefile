@@ -470,6 +470,11 @@ include shared.mak
 #
 #     CURL_LDFLAGS=-lcurl
 #
+# Define LAZYLOAD_LIBCURL to dynamically load the libcurl; This can be useful
+# if Multiple libcurl versions exist (with different file names) that link to
+# various SSL/TLS backends, to support the `http.sslBackend` runtime switch in
+# such a scenario.
+#
 # === Optional library: libpcre2 ===
 #
 # Define USE_LIBPCRE if you have and want to use libpcre. Various
@@ -819,6 +824,7 @@ TEST_BUILTINS_OBJS += test-hash-speed.o
 TEST_BUILTINS_OBJS += test-hash.o
 TEST_BUILTINS_OBJS += test-hashmap.o
 TEST_BUILTINS_OBJS += test-hexdump.o
+TEST_BUILTINS_OBJS += test-iconv.o
 TEST_BUILTINS_OBJS += test-json-writer.o
 TEST_BUILTINS_OBJS += test-lazy-init-name-hash.o
 TEST_BUILTINS_OBJS += test-match-trees.o
@@ -1156,6 +1162,8 @@ LIB_OBJS += git-zlib.o
 LIB_OBJS += gpg-interface.o
 LIB_OBJS += graph.o
 LIB_OBJS += grep.o
+LIB_OBJS += gvfs.o
+LIB_OBJS += gvfs-helper-client.o
 LIB_OBJS += hash-lookup.o
 LIB_OBJS += hash.o
 LIB_OBJS += hashmap.o
@@ -1338,6 +1346,7 @@ LIB_OBJS += varint.o
 endif
 LIB_OBJS += version.o
 LIB_OBJS += versioncmp.o
+LIB_OBJS += virtualfilesystem.o
 LIB_OBJS += walker.o
 LIB_OBJS += wildmatch.o
 LIB_OBJS += worktree.o
@@ -1345,6 +1354,8 @@ LIB_OBJS += wrapper.o
 LIB_OBJS += write-or-die.o
 LIB_OBJS += ws.o
 LIB_OBJS += wt-status.o
+LIB_OBJS += wt-status-deserialize.o
+LIB_OBJS += wt-status-serialize.o
 LIB_OBJS += xdiff-interface.o
 LIB_OBJS += xdiff/xdiffi.o
 LIB_OBJS += xdiff/xemit.o
@@ -1469,11 +1480,13 @@ BUILTIN_OBJS += builtin/sparse-checkout.o
 BUILTIN_OBJS += builtin/stash.o
 BUILTIN_OBJS += builtin/stripspace.o
 BUILTIN_OBJS += builtin/submodule--helper.o
+BUILTIN_OBJS += builtin/survey.o
 BUILTIN_OBJS += builtin/symbolic-ref.o
 BUILTIN_OBJS += builtin/tag.o
 BUILTIN_OBJS += builtin/unpack-file.o
 BUILTIN_OBJS += builtin/unpack-objects.o
 BUILTIN_OBJS += builtin/update-index.o
+BUILTIN_OBJS += builtin/update-microsoft-git.o
 BUILTIN_OBJS += builtin/update-ref.o
 BUILTIN_OBJS += builtin/update-server-info.o
 BUILTIN_OBJS += builtin/upload-archive.o
@@ -1492,6 +1505,7 @@ BUILTIN_OBJS += builtin/write-tree.o
 # upstream unnecessarily (making merging in future changes easier).
 THIRD_PARTY_SOURCES += compat/inet_ntop.c
 THIRD_PARTY_SOURCES += compat/inet_pton.c
+THIRD_PARTY_SOURCES += compat/mimalloc/%
 THIRD_PARTY_SOURCES += compat/nedmalloc/%
 THIRD_PARTY_SOURCES += compat/obstack.%
 THIRD_PARTY_SOURCES += compat/poll/%
@@ -1507,6 +1521,7 @@ CLAR_TEST_SUITES += u-example-decorate
 CLAR_TEST_SUITES += u-hash
 CLAR_TEST_SUITES += u-hashmap
 CLAR_TEST_SUITES += u-mem-pool
+CLAR_TEST_SUITES += u-mingw
 CLAR_TEST_SUITES += u-oid-array
 CLAR_TEST_SUITES += u-oidmap
 CLAR_TEST_SUITES += u-oidtree
@@ -1734,15 +1749,31 @@ else
 		CURL_LIBCURL =
         endif
 
-        ifndef CURL_LDFLAGS
-		CURL_LDFLAGS = $(eval CURL_LDFLAGS := $$(shell $$(CURL_CONFIG) --libs))$(CURL_LDFLAGS)
+        ifdef LAZYLOAD_LIBCURL
+		LAZYLOAD_LIBCURL_OBJ = compat/lazyload-curl.o
+		OBJECTS += $(LAZYLOAD_LIBCURL_OBJ)
+		# The `CURL_STATICLIB` constant must be defined to avoid seeing the functions
+		# declared as DLL imports
+		CURL_CFLAGS = -DCURL_STATICLIB
+ifneq ($(uname_S),MINGW)
+ifneq ($(uname_S),Windows)
+		CURL_LIBCURL = -ldl
+endif
+endif
+        else
+                ifndef CURL_LDFLAGS
+			CURL_LDFLAGS = $(eval CURL_LDFLAGS := $$(shell $$(CURL_CONFIG) --libs))$(CURL_LDFLAGS)
+                endif
+		CURL_LIBCURL += $(CURL_LDFLAGS)
         endif
-	CURL_LIBCURL += $(CURL_LDFLAGS)
 
         ifndef CURL_CFLAGS
 		CURL_CFLAGS = $(eval CURL_CFLAGS := $$(shell $$(CURL_CONFIG) --cflags))$(CURL_CFLAGS)
         endif
 	BASIC_CFLAGS += $(CURL_CFLAGS)
+
+	PROGRAM_OBJS += gvfs-helper.o
+	TEST_PROGRAMS_NEED_X += test-gvfs-protocol
 
 	REMOTE_CURL_PRIMARY = git-remote-http$X
 	REMOTE_CURL_ALIASES = git-remote-https$X git-remote-ftp$X git-remote-ftps$X
@@ -1758,7 +1789,7 @@ else
         endif
         ifdef USE_CURL_FOR_IMAP_SEND
 		BASIC_CFLAGS += -DUSE_CURL_FOR_IMAP_SEND
-		IMAP_SEND_BUILDDEPS = http.o
+		IMAP_SEND_BUILDDEPS = http.o $(LAZYLOAD_LIBCURL_OBJ)
 		IMAP_SEND_LDFLAGS += $(CURL_LIBCURL)
         endif
         ifndef NO_EXPAT
@@ -2213,6 +2244,46 @@ ifdef USE_NED_ALLOCATOR
 	COMPAT_CFLAGS += -Icompat/nedmalloc
 	COMPAT_OBJS += compat/nedmalloc/nedmalloc.o
 	OVERRIDE_STRDUP = YesPlease
+endif
+
+ifdef USE_MIMALLOC
+	MIMALLOC_OBJS = \
+		compat/mimalloc/alloc-aligned.o \
+		compat/mimalloc/alloc.o \
+		compat/mimalloc/arena.o \
+		compat/mimalloc/bitmap.o \
+		compat/mimalloc/heap.o \
+		compat/mimalloc/init.o \
+		compat/mimalloc/libc.o \
+		compat/mimalloc/options.o \
+		compat/mimalloc/os.o \
+		compat/mimalloc/page.o \
+		compat/mimalloc/random.o \
+		compat/mimalloc/prim/prim.o \
+		compat/mimalloc/segment.o \
+		compat/mimalloc/segment-map.o \
+		compat/mimalloc/stats.o
+
+	COMPAT_CFLAGS += -Icompat/mimalloc -DMI_DEBUG=0 -DUSE_MIMALLOC --std=gnu11
+	COMPAT_OBJS += $(MIMALLOC_OBJS)
+
+$(MIMALLOC_OBJS): COMPAT_CFLAGS += -DBANNED_H
+
+$(MIMALLOC_OBJS): COMPAT_CFLAGS += \
+	-DMI_WIN_USE_FLS \
+	-Wno-attributes \
+	-Wno-unknown-pragmas \
+	-Wno-unused-function \
+	-Wno-array-bounds
+
+ifdef DEVELOPER
+$(MIMALLOC_OBJS): COMPAT_CFLAGS += \
+	-Wno-pedantic \
+	-Wno-declaration-after-statement \
+	-Wno-old-style-definition \
+	-Wno-missing-prototypes \
+	-Wno-implicit-function-declaration
+endif
 endif
 
 ifdef OVERRIDE_STRDUP
@@ -2802,6 +2873,7 @@ GIT_OBJS += git.o
 .PHONY: git-objs
 git-objs: $(GIT_OBJS)
 
+SCALAR_OBJS := json-parser.o
 SCALAR_OBJS += scalar.o
 .PHONY: scalar-objs
 scalar-objs: $(SCALAR_OBJS)
@@ -2905,7 +2977,7 @@ gettext.sp gettext.s gettext.o: GIT-PREFIX
 gettext.sp gettext.s gettext.o: EXTRA_CPPFLAGS = \
 	-DGIT_LOCALE_PATH='"$(localedir_relative_SQ)"'
 
-http-push.sp http.sp http-walker.sp remote-curl.sp imap-send.sp: SP_EXTRA_FLAGS += \
+http-push.sp http.sp http-walker.sp remote-curl.sp imap-send.sp gvfs-helper.sp: SP_EXTRA_FLAGS += \
 	-DCURL_DISABLE_TYPECHECK
 
 pack-revindex.sp: SP_EXTRA_FLAGS += -Wno-memcpy-max-count
@@ -2939,10 +3011,10 @@ git-imap-send$X: imap-send.o $(IMAP_SEND_BUILDDEPS) GIT-LDFLAGS $(GITLIBS)
 	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) $(filter %.o,$^) \
 		$(IMAP_SEND_LDFLAGS) $(LIBS)
 
-git-http-fetch$X: http.o http-walker.o http-fetch.o GIT-LDFLAGS $(GITLIBS)
+git-http-fetch$X: http.o http-walker.o http-fetch.o $(LAZYLOAD_LIBCURL_OBJ) GIT-LDFLAGS $(GITLIBS)
 	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) $(filter %.o,$^) \
 		$(CURL_LIBCURL) $(LIBS)
-git-http-push$X: http.o http-push.o GIT-LDFLAGS $(GITLIBS)
+git-http-push$X: http.o http-push.o $(LAZYLOAD_LIBCURL_OBJ) GIT-LDFLAGS $(GITLIBS)
 	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) $(filter %.o,$^) \
 		$(CURL_LIBCURL) $(EXPAT_LIBEXPAT) $(LIBS)
 
@@ -2952,13 +3024,17 @@ $(REMOTE_CURL_ALIASES): $(REMOTE_CURL_PRIMARY)
 	ln -s $< $@ 2>/dev/null || \
 	cp $< $@
 
-$(REMOTE_CURL_PRIMARY): remote-curl.o http.o http-walker.o GIT-LDFLAGS $(GITLIBS)
+$(REMOTE_CURL_PRIMARY): remote-curl.o http.o http-walker.o $(LAZYLOAD_LIBCURL_OBJ) GIT-LDFLAGS $(GITLIBS)
 	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) $(filter %.o,$^) \
 		$(CURL_LIBCURL) $(EXPAT_LIBEXPAT) $(LIBS)
 
-scalar$X: scalar.o GIT-LDFLAGS $(GITLIBS)
+scalar$X: $(SCALAR_OBJS) GIT-LDFLAGS $(GITLIBS)
 	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) \
 		$(filter %.o,$^) $(LIBS)
+
+git-gvfs-helper$X: gvfs-helper.o http.o GIT-LDFLAGS $(GITLIBS) $(LAZYLOAD_LIBCURL_OBJ)
+	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) $(filter %.o,$^) \
+		$(CURL_LIBCURL) $(EXPAT_LIBEXPAT) $(LIBS)
 
 $(LIB_FILE): $(LIB_OBJS)
 	$(QUIET_AR)$(RM) $@ && $(AR) $(ARFLAGS) $@ $^
@@ -3731,7 +3807,7 @@ dist: git-archive$(X) configure
 	@$(MAKE) -C git-gui TARDIR=../.dist-tmp-dir/git-gui dist-version
 	./git-archive --format=tar \
 		$(GIT_ARCHIVE_EXTRA_FILES) \
-		--prefix=$(GIT_TARNAME)/ HEAD^{tree} > $(GIT_TARNAME).tar
+		--prefix=$(GIT_TARNAME)/ HEAD > $(GIT_TARNAME).tar
 	@$(RM) -r .dist-tmp-dir
 	gzip -f -9 $(GIT_TARNAME).tar
 
@@ -3844,12 +3920,15 @@ ifdef MSVC
 	$(RM) $(patsubst %.o,%.o.pdb,$(OBJECTS))
 	$(RM) headless-git.o.pdb
 	$(RM) $(patsubst %.exe,%.pdb,$(OTHER_PROGRAMS))
+	$(RM) $(patsubst %.exe,%.ilk,$(OTHER_PROGRAMS))
 	$(RM) $(patsubst %.exe,%.iobj,$(OTHER_PROGRAMS))
 	$(RM) $(patsubst %.exe,%.ipdb,$(OTHER_PROGRAMS))
 	$(RM) $(patsubst %.exe,%.pdb,$(PROGRAMS))
+	$(RM) $(patsubst %.exe,%.ilk,$(PROGRAMS))
 	$(RM) $(patsubst %.exe,%.iobj,$(PROGRAMS))
 	$(RM) $(patsubst %.exe,%.ipdb,$(PROGRAMS))
 	$(RM) $(patsubst %.exe,%.pdb,$(TEST_PROGRAMS))
+	$(RM) $(patsubst %.exe,%.ilk,$(TEST_PROGRAMS))
 	$(RM) $(patsubst %.exe,%.iobj,$(TEST_PROGRAMS))
 	$(RM) $(patsubst %.exe,%.ipdb,$(TEST_PROGRAMS))
 	$(RM) compat/vcbuild/MSVC-DEFS-GEN

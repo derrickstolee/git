@@ -544,7 +544,7 @@ static int run_dir_diff(struct repository *repo,
 				}
 				add_path(&wtdir, wtdir_len, dst_path);
 				if (dt_options->symlinks) {
-					if (symlink(wtdir.buf, rdir.buf)) {
+					if (create_symlink(lstate.istate, wtdir.buf, rdir.buf)) {
 						ret = error_errno("could not symlink '%s' to '%s'", wtdir.buf, rdir.buf);
 						goto finish;
 					}
@@ -607,7 +607,7 @@ static int run_dir_diff(struct repository *repo,
 	ret = run_command(&cmd);
 
 	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(&wtindex);
+	ensure_full_index_unaudited(&wtindex);
 
 	/*
 	 * If the diff includes working copy files and those

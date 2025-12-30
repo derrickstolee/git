@@ -158,7 +158,7 @@ static struct commit *deref_without_lazy_fetch(const struct object_id *oid,
 			struct tag *tag = (struct tag *)
 				parse_object(the_repository, oid);
 
-			if (!tag->tagged)
+			if (!tag || !tag->tagged)
 				return NULL;
 			if (mark_tags_complete_and_check_obj_db)
 				tag->object.flags |= COMPLETE;
@@ -768,6 +768,7 @@ static void mark_complete_and_common_ref(struct fetch_negotiator *negotiator,
 	save_commit_buffer = 0;
 
 	trace2_region_enter("fetch-pack", "parse_remote_refs_and_find_cutoff", NULL);
+	enable_fscache(0);
 	for (ref = *refs; ref; ref = ref->next) {
 		struct commit *commit;
 
@@ -792,6 +793,7 @@ static void mark_complete_and_common_ref(struct fetch_negotiator *negotiator,
 		if (!cutoff || cutoff < commit->date)
 			cutoff = commit->date;
 	}
+	disable_fscache();
 	trace2_region_leave("fetch-pack", "parse_remote_refs_and_find_cutoff", NULL);
 
 	/*

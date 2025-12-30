@@ -15,6 +15,7 @@
 #include "environment.h"
 #include "fsck.h"
 #include "gettext.h"
+#include "gvfs.h"
 #include "hex.h"
 #include "loose.h"
 #include "object-file-convert.h"
@@ -92,17 +93,27 @@ int check_and_freshen_file(const char *fn, int freshen)
 
 static int check_and_freshen_source(struct odb_source *source,
 				    const struct object_id *oid,
-				    int freshen)
+				    int freshen, int skip_virtualized_objects)
 {
 	static struct strbuf path = STRBUF_INIT;
+	int ret, tried_hook = 0;
+
 	odb_loose_path(source, &path, oid);
-	return check_and_freshen_file(path.buf, freshen);
+retry:
+	ret = check_and_freshen_file(path.buf, freshen);
+	if (!ret && gvfs_virtualize_objects(source->odb->repo) &&
+	    !skip_virtualized_objects && !tried_hook) {
+		tried_hook = 1;
+		if (!read_object_process(source->odb->repo, oid))
+			goto retry;
+	}
+	return ret;
 }
 
 int has_loose_object(struct odb_source *source,
 		     const struct object_id *oid)
 {
-	return check_and_freshen_source(source, oid, 0);
+	return check_and_freshen_source(source, oid, 0, 0);
 }
 
 int format_object_header(char *str, size_t size, enum object_type type,
@@ -502,9 +513,9 @@ cleanup:
 }
 
 static void hash_object_body(const struct git_hash_algo *algo, struct git_hash_ctx *c,
-			     const void *buf, unsigned long len,
+			     const void *buf, size_t len,
 			     struct object_id *oid,
-			     char *hdr, int *hdrlen)
+			     char *hdr, size_t *hdrlen)
 {
 	algo->init_fn(c);
 	git_hash_update(c, hdr, *hdrlen);
@@ -513,16 +524,16 @@ static void hash_object_body(const struct git_hash_algo *algo, struct git_hash_c
 }
 
 static void write_object_file_prepare(const struct git_hash_algo *algo,
-				      const void *buf, unsigned long len,
+				      const void *buf, size_t len,
 				      enum object_type type, struct object_id *oid,
-				      char *hdr, int *hdrlen)
+				      char *hdr, size_t *hdrlen)
 {
 	struct git_hash_ctx c;
 
 	/* Generate the header */
 	*hdrlen = format_object_header(hdr, *hdrlen, type, len);
 
-	/* Sha1.. */
+	/* Hash (function pointers) computation */
 	hash_object_body(algo, &c, buf, len, oid, hdr, hdrlen);
 }
 
@@ -658,11 +669,11 @@ out:
 }
 
 void hash_object_file(const struct git_hash_algo *algo, const void *buf,
-		      unsigned long len, enum object_type type,
+		      size_t len, enum object_type type,
 		      struct object_id *oid)
 {
 	char hdr[MAX_HEADER_LEN];
-	int hdrlen = sizeof(hdr);
+	size_t hdrlen = sizeof(hdr);
 
 	write_object_file_prepare(algo, buf, len, type, oid, hdr, &hdrlen);
 }
@@ -987,11 +998,12 @@ static int write_loose_object(struct odb_source *source,
 }
 
 static int freshen_loose_object(struct object_database *odb,
-				const struct object_id *oid)
+				const struct object_id *oid,
+				int skip_virtualized_objects)
 {
 	odb_prepare_alternates(odb);
 	for (struct odb_source *source = odb->sources; source; source = source->next)
-		if (check_and_freshen_source(source, oid, 1))
+		if (check_and_freshen_source(source, oid, 1, skip_virtualized_objects))
 			return 1;
 	return 0;
 }
@@ -1092,7 +1104,7 @@ int stream_loose_object(struct odb_source *source,
 	close_loose_object(source, fd, tmp_file.buf);
 
 	if (freshen_packed_object(source->odb, oid) ||
-	    freshen_loose_object(source->odb, oid)) {
+	    freshen_loose_object(source->odb, oid, 1)) {
 		unlink_or_warn(tmp_file.buf);
 		goto cleanup;
 	}
@@ -1125,7 +1137,7 @@ cleanup:
 }
 
 int write_object_file(struct odb_source *source,
-		      const void *buf, unsigned long len,
+		      const void *buf, size_t len,
 		      enum object_type type, struct object_id *oid,
 		      struct object_id *compat_oid_in, unsigned flags)
 {
@@ -1133,7 +1145,7 @@ int write_object_file(struct odb_source *source,
 	const struct git_hash_algo *compat = source->odb->repo->compat_hash_algo;
 	struct object_id compat_oid;
 	char hdr[MAX_HEADER_LEN];
-	int hdrlen = sizeof(hdr);
+	size_t hdrlen = sizeof(hdr);
 
 	/* Generate compat_oid */
 	if (compat) {
@@ -1156,7 +1168,7 @@ int write_object_file(struct odb_source *source,
 	 */
 	write_object_file_prepare(algo, buf, len, type, oid, hdr, &hdrlen);
 	if (freshen_packed_object(source->odb, oid) ||
-	    freshen_loose_object(source->odb, oid))
+	    freshen_loose_object(source->odb, oid, 1))
 		return 0;
 	if (write_loose_object(source, oid, hdr, hdrlen, buf, len, 0, flags))
 		return -1;
@@ -1832,6 +1844,13 @@ struct oidtree *odb_loose_cache(struct odb_source *source,
 	*bitmap |= mask;
 	strbuf_release(&buf);
 	return source->loose_objects_cache;
+}
+
+void odb_loose_cache_add_new_oid(struct odb_source *source,
+				 const struct object_id *oid)
+{
+	struct oidtree *cache = odb_loose_cache(source, oid);
+	append_loose_object(oid, NULL, cache);
 }
 
 void odb_clear_loose_cache(struct odb_source *source)
