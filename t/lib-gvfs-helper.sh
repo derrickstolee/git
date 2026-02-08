@@ -58,8 +58,8 @@ SHARED_CACHE_T2="$(pwd)"/shared_cache_t2
 # The server will shut down if/when we delete it.  (This is a little
 # easier than killing it by PID.)
 #
-PID_FILE="$(pwd)"/pid-file.pid
-SERVER_LOG="$(pwd)"/OUT.server.log
+PID_FILE="$(pwd)"/pid-file-gvfs.pid
+SERVER_LOG="$(pwd)"/OUT.gvfs.server.log
 
 # Helper functions to compute port, pid-file, and log for a given
 # port increment. An increment of 0 (or empty) uses the base values.
@@ -82,19 +82,19 @@ server_pid_file () {
 }
 
 server_log_file () {
-	local instance="${1:-0}"
+	local instance="${1:-1}"
 	if test "$instance" -eq 0
 	then
 		echo "$SERVER_LOG"
 	else
-		echo "$(pwd)/OUT.server-$instance.log"
+		echo "$(pwd)/OUT.gvfs.server-$instance.log"
 	fi
 }
 
 # Helper to build a cache-server URL for a given port increment.
 #
 cache_server_url () {
-	local instance="${1:-0}"
+	local instance="${1:-1}"
 	local port="$(server_port "$instance")"
 	echo "http://127.0.0.1:$port/servertype/cache"
 }
@@ -277,7 +277,7 @@ test_expect_success 'setup repos' '
 # Increment 0 uses the base port, 1 uses base+1, etc.
 #
 stop_gvfs_protocol_server () {
-	local instance="${1:-0}"
+	local instance="${1:-1}"
 	local pid_file="$(server_pid_file "$instance")"
 	local log_file="$(server_log_file "$instance")"
 
@@ -294,7 +294,7 @@ stop_gvfs_protocol_server () {
 	# port before the next test start another instance and it attempts to
 	# bind to it).
 	#
-	for k in 0 1 2 3 4
+	for k in $(test_seq 5)
 	do
 		if grep -q "Starting graceful shutdown" "$log_file"
 		then
@@ -315,7 +315,7 @@ stop_gvfs_protocol_server () {
 # This allows running multiple servers simultaneously on different ports.
 #
 start_gvfs_protocol_server () {
-	local instance="${1:-0}"
+	local instance="${1:-1}"
 	local port="$(server_port "$instance")"
 	local pid_file="$(server_pid_file "$instance")"
 	local log_file="$(server_log_file "$instance")"
@@ -334,7 +334,7 @@ start_gvfs_protocol_server () {
 	#
 	# Give it a few seconds to get started.
 	#
-	for k in 0 1 2 3 4
+	for k in $(test_seq 5)
 	do
 		if test -f "$pid_file"
 		then
@@ -375,7 +375,7 @@ start_gvfs_protocol_server_with_mayhem () {
 	#
 	# Give it a few seconds to get started.
 	#
-	for k in 0 1 2 3 4
+	for k in $(test_seq 5)
 	do
 		if test -f "$PID_FILE"
 		then
@@ -392,7 +392,7 @@ start_gvfs_protocol_server_with_mayhem () {
 # Usage: verify_server_was_contacted [<port_increment>]
 #
 verify_server_was_contacted () {
-	local instance="${1:-0}"
+	local instance="${1:-1}"
 	local log_file="$(server_log_file "$instance")"
 	grep -q "Connection from" "$log_file"
 }
@@ -401,7 +401,7 @@ verify_server_was_contacted () {
 # Usage: verify_server_was_not_contacted [<port_increment>]
 #
 verify_server_was_not_contacted () {
-	local instance="${1:-0}"
+	local instance="${1:-1}"
 	local log_file="$(server_log_file "$instance")"
 	! grep -q "Connection from" "$log_file"
 }
@@ -529,9 +529,9 @@ verify_vfs_packfile_count () {
 }
 
 per_test_cleanup () {
-	# Stop servers with port increments 0, 1, 2, 3 to handle tests
+	# Stop servers with port increments 1, 2, 3, 4 to handle tests
 	# that may use multiple servers.
-	for instance in 0 1 2 3
+	for instance in 1 2 3 4
 	do
 		stop_gvfs_protocol_server "$instance"
 	done
@@ -540,7 +540,7 @@ per_test_cleanup () {
 	rm -rf "$SHARED_CACHE_T1"/info/*
 	rm -rf "$SHARED_CACHE_T1"/pack/*
 
-	rm -rf OUT.*
+	rm -rf OUT.gvfs.*
 	return 0
 }
 
