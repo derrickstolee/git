@@ -3243,6 +3243,15 @@ retry_backup:
 		 * then fall back to the regular cache server on failure.
 		 */
 		if (gh__global.cache_server_url_backup) {
+			trace2_data_string(TR2_CAT, the_repository,
+					   "cache_server_url_fallback/type",
+					   "verb-specific-to-default");
+			trace2_data_string(TR2_CAT, the_repository,
+					   "cache_server_url_fallback/verb",
+					   params->tr2_label.buf);
+			trace2_data_string(TR2_CAT, the_repository,
+					   "cache_server_url_fallback/reason",
+					   status->error_message.buf);
 			reset_cache_server();
 			goto retry_backup;
 		}
@@ -3258,6 +3267,16 @@ retry_backup:
 		 */
 		if (status->retry == GH__RETRY_MODE__HTTP_401)
 			return;
+
+		trace2_data_string(TR2_CAT, the_repository,
+				   "cache_server_url_fallback/type",
+				   "cache-server-to-origin");
+		trace2_data_string(TR2_CAT, the_repository,
+				   "cache_server_url_fallback/verb",
+				   params->tr2_label.buf);
+		trace2_data_string(TR2_CAT, the_repository,
+				   "cache_server_url_fallback/reason",
+				   status->error_message.buf);
 	}
 
 	do_req__to_main(url_component, params, status);

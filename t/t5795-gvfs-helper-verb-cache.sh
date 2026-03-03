@@ -221,4 +221,79 @@ test_expect_success 'verb-specific cache-server: all verbs with different server
 	verify_server_was_contacted 3
 '
 
+#################################################################
+# Tests to verify trace2 data events are emitted when gvfs-helper
+# falls back from a verb-specific cache server to the default cache
+# server, or from the cache server to the origin.
+#################################################################
+
+test_expect_success 'trace: verb-specific-to-default fallback emits trace2 data' '
+	test_when_finished "per_test_cleanup" &&
+	test_when_finished "rm -f trace-fallback.event" &&
+	test_when_finished "git -C \"$REPO_T1\" config --unset gvfs.get.cache-server || true" &&
+	start_gvfs_protocol_server 0 &&
+
+	# Configure default cache server to point to the working server.
+	git -C "$REPO_T1" config gvfs.cache-server "$(cache_server_url 0)" &&
+
+	# Configure verb-specific cache server to point to a dead port.
+	# This will fail immediately with a connection-refused curl error.
+	DEAD_PORT=$(($GIT_TEST_GVFS_PROTOCOL_PORT + 999)) &&
+	git -C "$REPO_T1" config gvfs.get.cache-server \
+		"http://127.0.0.1:$DEAD_PORT/servertype/cache" &&
+
+	# Run get with trace2 event logging. The verb-specific URL will fail,
+	# causing a fallback to the default cache server which succeeds.
+	GIT_TRACE2_EVENT="$(pwd)/trace-fallback.event" \
+	git -C "$REPO_T1" gvfs-helper \
+		--cache-server=trust \
+		--remote=origin \
+		--fallback \
+		get \
+		--max-retries=0 \
+		--connect-timeout-ms=200 \
+		<"$OID_ONE_BLOB_FILE" >OUT.output 2>OUT.stderr &&
+
+	stop_gvfs_protocol_server 0 &&
+
+	# Verify the object was fetched successfully via the fallback.
+	sed "s/loose //" <OUT.output | sort >OUT.actual &&
+	test_cmp "$OID_ONE_BLOB_FILE" OUT.actual &&
+
+	# Verify trace2 emitted verb-specific-to-default fallback events.
+	test_grep "\"event\":\"data\".*\"key\":\"cache_server_url_fallback/type\".*\"value\":\"verb-specific-to-default\"" \
+		trace-fallback.event &&
+	test_grep "\"event\":\"data\".*\"key\":\"cache_server_url_fallback/verb\".*\"value\":\"GET/objects\"" \
+		trace-fallback.event
+'
+
+test_expect_success 'trace: cache-server-to-origin fallback emits trace2 data' '
+	test_when_finished "per_test_cleanup" &&
+	test_when_finished "rm -f trace-fallback.event" &&
+	start_gvfs_protocol_server_with_mayhem cache_http_503 &&
+
+	# Run get with trace2 event logging. The cache server will return
+	# HTTP 503 (via cache_http_503 mayhem), causing a fallback to origin.
+	GIT_TRACE2_EVENT="$(pwd)/trace-fallback.event" \
+	git -C "$REPO_T1" gvfs-helper \
+		--cache-server=trust \
+		--remote=origin \
+		--fallback \
+		get \
+		--max-retries=0 \
+		<"$OID_ONE_BLOB_FILE" >OUT.output 2>OUT.stderr &&
+
+	stop_gvfs_protocol_server &&
+
+	# Verify the object was fetched successfully via origin fallback.
+	sed "s/loose //" <OUT.output | sort >OUT.actual &&
+	test_cmp "$OID_ONE_BLOB_FILE" OUT.actual &&
+
+	# Verify trace2 emitted cache-server-to-origin fallback events.
+	test_grep "\"event\":\"data\".*\"key\":\"cache_server_url_fallback/type\".*\"value\":\"cache-server-to-origin\"" \
+		trace-fallback.event &&
+	test_grep "\"event\":\"data\".*\"key\":\"cache_server_url_fallback/verb\".*\"value\":\"GET/objects\"" \
+		trace-fallback.event
+'
+
 test_done
