@@ -256,6 +256,7 @@
 #include "date.h"
 #include "versioncmp.h"
 #include "advice.h"
+#include "thread-utils.h"
 
 #define TR2_CAT "gvfs-helper"
 
@@ -360,6 +361,8 @@ static struct gh__cmd_opts {
 	unsigned int block_size;
 	int max_retries;
 	int max_transient_backoff_sec;
+
+	int max_concurrent_downloads; /* 1 = sequential (default) */
 
 	enum gh__cache_server_mode cache_server_mode;
 } gh__cmd_opts;
@@ -1727,6 +1730,13 @@ static void select_odb(void)
 }
 
 /*
+ * Protects the static counters inside my_create_tempfile() so that
+ * multiple threads can safely create uniquely-named tempfiles
+ * concurrently.
+ */
+static pthread_mutex_t tempfile_counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
  * Create a unique tempfile or tempfile-pair inside the
  * tempPacks directory.
  */
@@ -1750,6 +1760,12 @@ static void my_create_tempfile(
 
 	gh__response_status__zero(status);
 
+	/*
+	 * The static counters are shared state; protect them so that
+	 * threads spawned for parallel downloads can each get a unique
+	 * basename without racing.
+	 */
+	pthread_mutex_lock(&tempfile_counter_mutex);
 	if (!nth) {
 		/*
 		 * Create a unique <date> string to use in the name of all
@@ -1770,6 +1786,7 @@ static void my_create_tempfile(
 	 * number <n>.
 	 */
 	strbuf_addf(&basename, "t-%s-%04d", date, nth++);
+	pthread_mutex_unlock(&tempfile_counter_mutex);
 
 	if (!suffix1 || !*suffix1)
 		suffix1 = "temp";
@@ -3379,34 +3396,27 @@ static void do__http_get__gvfs_object(struct gh__response_status *status,
 }
 
 /*
- * Call "gvfs/objects" POST REST API to fetch a batch of objects
- * from the OIDSET.  Normal, this is results in a packfile containing
- * `nr_wanted_in_block` objects.  And we return the number actually
- * consumed (along with the filename of the resulting packfile).
- *
- * However, if we only have 1 oid (remaining) in the OIDSET, the
- * server *MAY* respond to our POST with a loose object rather than
- * a packfile with 1 object.
- *
- * Append a message to the result_list describing the result.
- *
- * Return the number of OIDs consumed from the OIDSET.
+ * Core POST /gvfs/objects request with a pre-built JSON payload.
+ * Extracted from do__http_post__gvfs_objects() so that payload
+ * construction (which advances the oidset iterator) can be separated
+ * from the HTTP request, allowing callers to build all payloads
+ * before dispatching downloads in parallel.
  */
-static void do__http_post__gvfs_objects(struct gh__response_status *status,
-					struct oidset_iter *iter,
-					unsigned long nr_wanted_in_block,
-					int j_pack_num, int j_pack_den,
-					struct string_list *result_list,
-					unsigned long *nr_oid_taken)
+static void do__http_post__gvfs_objects_with_payload(
+	struct gh__response_status *status,
+	const struct strbuf *payload,
+	unsigned long object_count,
+	const struct object_id *loose_oid,
+	int j_pack_num, int j_pack_den,
+	struct string_list *result_list)
 {
-	struct json_writer jw_req = JSON_WRITER_INIT;
 	struct gh__request_params params = GH__REQUEST_PARAMS_INIT;
 
 	gh__response_status__zero(status);
 
-	params.object_count = build_json_payload__gvfs_objects(
-		&jw_req, iter, nr_wanted_in_block, &params.loose_oid);
-	*nr_oid_taken = params.object_count;
+	params.object_count = object_count;
+	if (loose_oid)
+		oidcpy(&params.loose_oid, loose_oid);
 
 	strbuf_addstr(&params.tr2_label, "POST/objects");
 
@@ -3415,7 +3425,7 @@ static void do__http_post__gvfs_objects(struct gh__response_status *status,
 	params.b_permit_cache_server_if_defined = 1;
 	params.objects_mode = GH__OBJECTS_MODE__POST;
 
-	params.post_payload = &jw_req.json;
+	params.post_payload = payload;
 
 	params.result_list = result_list;
 
@@ -3449,6 +3459,43 @@ static void do__http_post__gvfs_objects(struct gh__response_status *status,
 	reset_cache_server();
 
 	gh__request_params__release(&params);
+}
+
+/*
+ * Call "gvfs/objects" POST REST API to fetch a batch of objects
+ * from the OIDSET.  Normal, this is results in a packfile containing
+ * `nr_wanted_in_block` objects.  And we return the number actually
+ * consumed (along with the filename of the resulting packfile).
+ *
+ * However, if we only have 1 oid (remaining) in the OIDSET, the
+ * server *MAY* respond to our POST with a loose object rather than
+ * a packfile with 1 object.
+ *
+ * Append a message to the result_list describing the result.
+ *
+ * Return the number of OIDs consumed from the OIDSET.
+ */
+static void do__http_post__gvfs_objects(struct gh__response_status *status,
+					struct oidset_iter *iter,
+					unsigned long nr_wanted_in_block,
+					int j_pack_num, int j_pack_den,
+					struct string_list *result_list,
+					unsigned long *nr_oid_taken)
+{
+	struct json_writer jw_req = JSON_WRITER_INIT;
+	struct object_id loose_oid;
+	unsigned long object_count;
+
+	gh__response_status__zero(status);
+
+	object_count = build_json_payload__gvfs_objects(
+		&jw_req, iter, nr_wanted_in_block, &loose_oid);
+	*nr_oid_taken = object_count;
+
+	do__http_post__gvfs_objects_with_payload(
+		status, &jw_req.json, object_count, &loose_oid,
+		j_pack_num, j_pack_den, result_list);
+
 	jw_release(&jw_req);
 }
 
