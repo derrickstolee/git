@@ -1975,6 +1975,86 @@ cleanup:
 	child_process_clear(&ip);
 }
 
+/*
+ * Run "git index-pack --stdin" to index exactly nr_bytes bytes read
+ * from fd_in, writing the pack to temp_path_pack and the index to
+ * temp_path_idx simultaneously.  On success, writes the hex pack
+ * checksum into hex_out (must be at least GIT_MAX_HEXSZ+1 bytes).
+ *
+ * This avoids the two-step write-then-read that my_run_index_pack()
+ * requires: the pack bytes flow directly from fd_in to index-pack
+ * without an intermediate disk round-trip.
+ */
+static void my_run_index_pack_stdin(
+	struct gh__request_params *params UNUSED,
+	struct gh__response_status *status,
+	int fd_in,
+	ssize_t nr_bytes,
+	const struct strbuf *temp_path_pack,
+	const struct strbuf *temp_path_idx,
+	char *hex_out)
+{
+	struct child_process ip = CHILD_PROCESS_INIT;
+	struct strbuf ip_stdout = STRBUF_INIT;
+	char buf[8192];
+	ssize_t remaining = nr_bytes;
+
+	strvec_push(&ip.args, "git");
+	strvec_push(&ip.args, "index-pack");
+	strvec_push(&ip.args, "--stdin");
+	strvec_push(&ip.args, "--no-rev-index");
+	strvec_pushl(&ip.args, "-o", temp_path_idx->buf, NULL);
+	strvec_push(&ip.args, temp_path_pack->buf);
+
+	ip.in = -1;  /* we get a pipe to write pack bytes into */
+	ip.out = -1; /* we read the pack checksum from stdout */
+	ip.no_stderr = 1;
+
+	if (start_command(&ip) < 0) {
+		strbuf_addf(&status->error_message,
+			    "could not start index-pack (stdin) for '%s'",
+			    temp_path_pack->buf);
+		status->ec = GH__ERROR_CODE__INDEX_PACK_FAILED;
+		goto cleanup;
+	}
+
+	while (remaining > 0) {
+		ssize_t want = (remaining < (ssize_t)sizeof(buf))
+			       ? remaining : (ssize_t)sizeof(buf);
+		ssize_t got = xread(fd_in, buf, want);
+
+		if (got <= 0)
+			break;
+		if (write_in_full(ip.in, buf, got) < 0)
+			break;
+		remaining -= got;
+	}
+	close(ip.in);
+	ip.in = -1;
+
+	strbuf_read(&ip_stdout, ip.out, 64);
+	close(ip.out);
+	ip.out = -1;
+
+	if (finish_command(&ip)) {
+		unlink(temp_path_pack->buf);
+		unlink(temp_path_idx->buf);
+		strbuf_addf(&status->error_message,
+			    "index-pack (stdin) failed for '%s'",
+			    temp_path_pack->buf);
+		status->retry = GH__RETRY_MODE__TRANSIENT;
+		status->ec = GH__ERROR_CODE__INDEX_PACK_FAILED;
+		goto cleanup;
+	}
+
+	strbuf_trim_trailing_newline(&ip_stdout);
+	xsnprintf(hex_out, GIT_MAX_HEXSZ + 1, "%s", ip_stdout.buf);
+
+cleanup:
+	strbuf_release(&ip_stdout);
+	child_process_clear(&ip);
+}
+
 static void my_finalize_packfile(struct gh__request_params *params,
 				 struct gh__response_status *status,
 				 int b_keep,
@@ -2208,10 +2288,8 @@ static void extract_packfile_from_multipack(
 	unsigned short k)
 {
 	struct ph ph;
-	struct tempfile *tempfile_pack = NULL;
-	int result = -1;
+	struct tempfile *tempfile_idx = NULL;
 	int b_no_idx_in_multipack;
-	struct object_id packfile_checksum;
 	char hex_checksum[GIT_MAX_HEXSZ + 1];
 	struct strbuf buf_timestamp = STRBUF_INIT;
 	struct strbuf temp_path_pack = STRBUF_INIT;
@@ -2246,46 +2324,41 @@ static void extract_packfile_from_multipack(
 	 * We are going to harden `gvfs-helper` here and ignore the .idx file
 	 * if it is provided and always compute it locally so that we get the
 	 * added verification that `git index-pack` provides.
-	 */
-	my_create_tempfile(status, 0, "pack", &tempfile_pack, NULL, NULL);
-	if (!tempfile_pack)
-		goto done;
-
-	/*
-	 * Copy the current packfile from the open stream and capture
-	 * the checksum.
 	 *
-	 * TODO This assumes that the checksum is SHA1.  Fix this if/when
-	 * TODO Git converts to SHA256.
+	 * Stream the pack bytes directly to "git index-pack --stdin" rather
+	 * than writing them to a temp file first.  This avoids a redundant
+	 * disk read: the pack data flows from the multipack fd to index-pack
+	 * in one pass, and index-pack writes both the .pack and .idx files
+	 * simultaneously.
+	 *
+	 * We create only the .idx tempfile to reserve a unique basename in
+	 * the tempPacks directory; we then release it so index-pack can
+	 * create both files at those paths itself.
 	 */
-	result = my_copy_fd_len_tail(fd_multipack,
-				     get_tempfile_fd(tempfile_pack),
-				     ph.pack_len,
-				     packfile_checksum.hash,
-				     GIT_SHA1_RAWSZ);
-	packfile_checksum.algo = GIT_HASH_SHA1;
-
-	if (result < 0){
-		strbuf_addf(&status->error_message,
-			    "could not extract packfile[%d] from multipack",
-			    k);
+	my_create_tempfile(status, 0, "idx", &tempfile_idx, NULL, NULL);
+	if (!tempfile_idx)
 		goto done;
-	}
-	strbuf_addstr(&temp_path_pack, get_tempfile_path(tempfile_pack));
-	close_tempfile_gently(tempfile_pack);
 
-	oid_to_hex_r(hex_checksum, &packfile_checksum);
+	strbuf_addstr(&temp_path_idx, get_tempfile_path(tempfile_idx));
+
+	/* Derive the .pack path from the reserved .idx basename. */
+	strbuf_addbuf(&temp_path_pack, &temp_path_idx);
+	strbuf_strip_suffix(&temp_path_pack, ".idx");
+	strbuf_addstr(&temp_path_pack, ".pack");
 
 	/*
-	 * Always compute the .idx file from the .pack file.
+	 * Release the .idx tempfile registration before spawning
+	 * index-pack so that index-pack can create both files.
+	 * index-pack opens the pack with O_CREAT|O_EXCL and the idx
+	 * with O_CREAT|O_TRUNC, so the pack path must be free and the
+	 * idx path will be overwritten.
 	 */
-	strbuf_addbuf(&temp_path_idx, &temp_path_pack);
-	strbuf_strip_suffix(&temp_path_idx, ".pack");
-	strbuf_addstr(&temp_path_idx, ".idx");
+	delete_tempfile(&tempfile_idx);
 
-	my_run_index_pack(params, status,
-			  &temp_path_pack, &temp_path_idx,
-			  NULL);
+	my_run_index_pack_stdin(params, status,
+				fd_multipack, ph.pack_len,
+				&temp_path_pack, &temp_path_idx,
+				hex_checksum);
 	if (status->ec != GH__ERROR_CODE__OK)
 		goto done;
 
@@ -2315,7 +2388,7 @@ static void extract_packfile_from_multipack(
 			     &final_filename);
 
 done:
-	delete_tempfile(&tempfile_pack);
+	delete_tempfile(&tempfile_idx);
 	strbuf_release(&temp_path_pack);
 	strbuf_release(&temp_path_idx);
 	strbuf_release(&final_path_pack);
