@@ -3690,6 +3690,327 @@ cleanup:
 	strbuf_release(&err404);
 }
 
+/* ------------------------------------------------------------------ */
+/* Parallel batch download infrastructure                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One pre-built batch payload, ready to POST.  All batches are built
+ * in the main thread (which owns the oidset iterator) before any
+ * download thread is spawned.
+ */
+struct gh__batch_item {
+	struct strbuf payload;     /* JSON POST body */
+	unsigned long object_count;
+	struct object_id loose_oid; /* valid iff object_count == 1 */
+	int j_pack_num;
+};
+
+/*
+ * Shared state written by download threads; protected by a mutex.
+ */
+struct gh__dl_shared {
+	pthread_mutex_t mutex;
+	struct string_list *result_list;
+	int had_404;
+	struct strbuf first_err404_msg;
+	int had_hard_error;
+	struct gh__response_status first_hard_error;
+};
+
+/*
+ * Per-thread argument block.
+ */
+struct gh__dl_thread_args {
+	const struct gh__batch_item *batch;
+	int j_pack_den;
+	const char *url;    /* full URL including endpoint */
+	CURL *curl;         /* exclusive to this thread; freed by thread */
+	struct curl_slist *headers; /* per-thread header list */
+	struct gh__dl_shared *shared;
+};
+
+/*
+ * Worker thread: POST one pre-built batch, install the result, and
+ * report back through the shared state.
+ *
+ * Each thread owns its curl handle and a per-thread result list.
+ * install_result() writes to the per-thread list; results are merged
+ * into the shared list under the mutex after install completes.
+ */
+static void *gh__post_batch_thread_fn(void *vargs)
+{
+	struct gh__dl_thread_args *args = vargs;
+	struct gh__dl_shared *shared = args->shared;
+	struct gh__response_status status = GH__RESPONSE_STATUS_INIT;
+	struct gh__request_params params = GH__REQUEST_PARAMS_INIT;
+	struct string_list thread_results = STRING_LIST_INIT_DUP;
+	CURLcode res;
+	long http_code = 0;
+	const char *ct = NULL;
+	int i;
+
+	/* Create a tempfile for the response body. */
+	my_create_tempfile(&status, 1, NULL, &params.tempfile, NULL, NULL);
+	if (status.ec != GH__ERROR_CODE__OK)
+		goto report;
+
+	/* Configure this thread's curl handle for the POST. */
+	curl_easy_setopt(args->curl, CURLOPT_URL, args->url);
+	curl_easy_setopt(args->curl, CURLOPT_POST, 1L);
+	curl_easy_setopt(args->curl, CURLOPT_ENCODING, NULL);
+	curl_easy_setopt(args->curl, CURLOPT_POSTFIELDS,
+			 args->batch->payload.buf);
+	curl_easy_setopt(args->curl, CURLOPT_POSTFIELDSIZE,
+			 (long)args->batch->payload.len);
+	curl_easy_setopt(args->curl, CURLOPT_WRITEFUNCTION, fwrite);
+	curl_easy_setopt(args->curl, CURLOPT_WRITEDATA,
+			 (void *)params.tempfile->fp);
+	curl_easy_setopt(args->curl, CURLOPT_HTTPHEADER, args->headers);
+	curl_easy_setopt(args->curl, CURLOPT_NOPROGRESS, 1L);
+
+	res = curl_easy_perform(args->curl);
+	fflush(params.tempfile->fp);
+
+	if (res != CURLE_OK) {
+		strbuf_addf(&status.error_message,
+			    "curl error in batch %d: %s",
+			    args->batch->j_pack_num,
+			    curl_easy_strerror(res));
+		status.ec = GH__ERROR_CODE__CURL_ERROR;
+		status.retry = GH__RETRY_MODE__TRANSIENT;
+		goto report;
+	}
+
+	curl_easy_getinfo(args->curl, CURLINFO_RESPONSE_CODE, &http_code);
+	curl_easy_getinfo(args->curl, CURLINFO_CONTENT_TYPE, &ct);
+	if (ct)
+		strbuf_addstr(&status.content_type, ct);
+
+	if (http_code == 404) {
+		strbuf_addf(&status.error_message,
+			    "batch %d: 404 Not Found",
+			    args->batch->j_pack_num);
+		status.ec = GH__ERROR_CODE__HTTP_404;
+		goto report;
+	} else if (http_code != 200) {
+		strbuf_addf(&status.error_message,
+			    "batch %d: HTTP %ld", args->batch->j_pack_num,
+			    http_code);
+		status.ec = GH__ERROR_CODE__HTTP_OTHER;
+		goto report;
+	}
+
+	/* Install the downloaded data (packfile or loose object). */
+	params.object_count = args->batch->object_count;
+	oidcpy(&params.loose_oid, &args->batch->loose_oid);
+	params.objects_mode = GH__OBJECTS_MODE__POST;
+	params.b_is_post = 1;
+	params.b_write_to_file = 1;
+	params.result_list = &thread_results;
+	install_result(&params, &status);
+
+report:
+	gh__request_params__release(&params);
+	curl_easy_cleanup(args->curl);
+	args->curl = NULL;
+	curl_slist_free_all(args->headers);
+	args->headers = NULL;
+
+	/* Merge per-thread results into the shared list under the mutex. */
+	pthread_mutex_lock(&shared->mutex);
+
+	if (status.ec == GH__ERROR_CODE__HTTP_404) {
+		shared->had_404 = 1;
+		if (!shared->first_err404_msg.len)
+			strbuf_addf(&shared->first_err404_msg,
+				    "%s: from POST",
+				    status.error_message.buf);
+	} else if (status.ec != GH__ERROR_CODE__OK &&
+		   !shared->had_hard_error) {
+		shared->had_hard_error = 1;
+		strbuf_addbuf(&shared->first_hard_error.error_message,
+			      &status.error_message);
+		shared->first_hard_error.ec = status.ec;
+		shared->first_hard_error.retry = status.retry;
+	}
+
+	for (i = 0; i < thread_results.nr; i++)
+		string_list_append(shared->result_list,
+				   thread_results.items[i].string);
+
+	pthread_mutex_unlock(&shared->mutex);
+
+	string_list_clear(&thread_results, 0);
+	gh__response_status__release(&status);
+	return NULL;
+}
+
+/*
+ * Pre-build all batch payloads from the oidset in the main thread,
+ * then dispatch up to max_concurrent downloads concurrently.
+ *
+ * Each thread owns a cloned curl handle (duplicated from a base slot
+ * configured by http.c) so that SSL, proxy, and auth settings are
+ * inherited without requiring thread-safe access to the slot pool.
+ *
+ * Limitations of this first implementation:
+ *   - No retry logic per thread; a failed batch is reported as an
+ *     error without retrying against the origin server.
+ *   - Throttle (Azure retry-after) headers are ignored in threaded
+ *     mode; the sequential path should be used when throttling matters.
+ */
+static void do__http_post__fetch_oidset_parallel(
+	struct gh__response_status *status,
+	struct oidset *oids,
+	unsigned long nr_oid_total,
+	struct string_list *result_list,
+	int max_concurrent)
+{
+	struct oidset_iter iter;
+	int n_batches, i;
+	int j_pack_den;
+	struct gh__batch_item *batches;
+	struct gh__dl_shared shared;
+	struct gh__dl_thread_args *args;
+	pthread_t *threads;
+	struct active_request_slot *base_slot;
+	struct strbuf full_url = STRBUF_INIT;
+
+	gh__response_status__zero(status);
+	if (!nr_oid_total)
+		return;
+
+	/* Calculate total batch count. */
+	j_pack_den = (int)((nr_oid_total + gh__cmd_opts.block_size - 1)
+			   / gh__cmd_opts.block_size);
+	n_batches = j_pack_den;
+
+	/* Pre-build all payloads in the main thread. */
+	CALLOC_ARRAY(batches, n_batches);
+	oidset_iter_init(oids, &iter);
+	for (i = 0; i < n_batches; i++) {
+		struct json_writer jw = JSON_WRITER_INIT;
+		batches[i].payload = (struct strbuf)STRBUF_INIT;
+		batches[i].j_pack_num = i + 1;
+		batches[i].object_count = build_json_payload__gvfs_objects(
+			&jw, &iter, gh__cmd_opts.block_size,
+			&batches[i].loose_oid);
+		strbuf_addbuf(&batches[i].payload, &jw.json);
+		jw_release(&jw);
+	}
+
+	/*
+	 * Determine the URL for all downloads.  update_cache_server_for_verb()
+	 * may switch cache_server_url to a verb-specific value; we read that
+	 * once in the main thread and pass it to all threads as a plain string.
+	 */
+	update_cache_server_for_verb(POST);
+	end_url_with_slash(&full_url,
+			   gh__global.cache_server_url
+			   ? gh__global.cache_server_url
+			   : gh__global.main_url);
+	strbuf_addstr(&full_url, "gvfs/objects");
+	reset_cache_server();
+
+	/*
+	 * Get a configured curl handle from the pool as a template.
+	 * We duplicate it for each thread so they inherit all of the
+	 * SSL, proxy, and authentication settings that http.c applied.
+	 * The base slot is released immediately without being used.
+	 */
+	base_slot = get_active_slot();
+
+	/* Initialise shared state. */
+	memset(&shared, 0, sizeof(shared));
+	pthread_mutex_init(&shared.mutex, NULL);
+	shared.result_list = result_list;
+	shared.first_err404_msg = (struct strbuf)STRBUF_INIT;
+	shared.first_hard_error = (struct gh__response_status)
+				  GH__RESPONSE_STATUS_INIT;
+
+	CALLOC_ARRAY(args, n_batches);
+	CALLOC_ARRAY(threads, n_batches);
+
+	/* Dispatch threads in windows of max_concurrent. */
+	for (i = 0; i < n_batches; i++) {
+		int window_start = i - (max_concurrent - 1);
+
+		/* Wait for the oldest in-flight thread before launching more. */
+		if (window_start >= 0)
+			pthread_join(threads[window_start], NULL);
+
+		if (shared.had_hard_error) {
+			/* Don't start new threads after a hard error. */
+			args[i].batch = NULL;
+			threads[i] = 0;
+			continue;
+		}
+
+		args[i].batch = &batches[i];
+		args[i].j_pack_den = j_pack_den;
+		args[i].url = full_url.buf;
+		args[i].curl = curl_easy_duphandle(base_slot->curl);
+		args[i].shared = &shared;
+
+		/* Each thread gets its own header list (curl_slist is not shared). */
+		args[i].headers = http_copy_default_headers();
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "X-TFS-FedAuthRedirect: Suppress");
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "Pragma: no-cache");
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "Content-Type: application/json");
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "Accept: application/x-git-packfile");
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "Accept: application/x-git-loose-object");
+
+		pthread_create(&threads[i], NULL, gh__post_batch_thread_fn,
+			       &args[i]);
+	}
+
+	/* Wait for any remaining in-flight threads. */
+	for (i = MY_MAX(0, n_batches - max_concurrent); i < n_batches; i++) {
+		if (threads[i])
+			pthread_join(threads[i], NULL);
+		/* Clean up any thread that was never started due to hard error. */
+		if (args[i].curl)
+			curl_easy_cleanup(args[i].curl);
+		if (args[i].headers)
+			curl_slist_free_all(args[i].headers);
+	}
+
+	/* Return the base slot to the pool without running a request. */
+	base_slot->in_use = 0;
+
+	/* Propagate any error to the caller. */
+	if (shared.had_hard_error) {
+		strbuf_addbuf(&status->error_message,
+			      &shared.first_hard_error.error_message);
+		strbuf_addstr(&status->error_message, ": from POST");
+		status->ec = shared.first_hard_error.ec;
+		status->retry = shared.first_hard_error.retry;
+	} else if (shared.had_404) {
+		strbuf_addbuf(&status->error_message,
+			      &shared.first_err404_msg);
+		status->ec = GH__ERROR_CODE__HTTP_404;
+	}
+
+	pthread_mutex_destroy(&shared.mutex);
+	strbuf_release(&shared.first_err404_msg);
+	gh__response_status__release(&shared.first_hard_error);
+
+	for (i = 0; i < n_batches; i++)
+		strbuf_release(&batches[i].payload);
+	free(batches);
+	free(args);
+	free(threads);
+	strbuf_release(&full_url);
+}
+
+/* ------------------------------------------------------------------ */
+
 /*
  * Drive one or more HTTP POST requests to bulk fetch the objects in
  * the given OIDSET.  Create one or more packfiles and/or loose objects.
@@ -3713,6 +4034,13 @@ static void do__http_post__fetch_oidset(struct gh__response_status *status,
 	gh__response_status__zero(status);
 	if (!nr_oid_total)
 		return;
+
+	if (gh__cmd_opts.max_concurrent_downloads > 1) {
+		do__http_post__fetch_oidset_parallel(
+			status, oids, nr_oid_total, result_list,
+			gh__cmd_opts.max_concurrent_downloads);
+		return;
+	}
 
 	oidset_iter_init(oids, &iter);
 
@@ -4449,6 +4777,12 @@ int cmd_main(int argc, const char **argv)
 	// TODO options for them.)
 	// TODO
 	// TODO See "scalar.max-retries" (and maybe "gvfs.max-retries")
+
+	gh__cmd_opts.max_concurrent_downloads = 1; /* sequential by default */
+	repo_config_get_int(the_repository, "gvfs.maxconcurrentdownloads",
+			    &gh__cmd_opts.max_concurrent_downloads);
+	if (gh__cmd_opts.max_concurrent_downloads < 1)
+		gh__cmd_opts.max_concurrent_downloads = 1;
 
 	repo_config(the_repository, git_default_config, NULL);
 
