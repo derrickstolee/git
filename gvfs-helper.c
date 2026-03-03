@@ -256,6 +256,7 @@
 #include "date.h"
 #include "versioncmp.h"
 #include "advice.h"
+#include "thread-utils.h"
 
 #define TR2_CAT "gvfs-helper"
 
@@ -360,6 +361,8 @@ static struct gh__cmd_opts {
 	unsigned int block_size;
 	int max_retries;
 	int max_transient_backoff_sec;
+
+	int max_concurrent_downloads; /* 1 = sequential (default) */
 
 	enum gh__cache_server_mode cache_server_mode;
 } gh__cmd_opts;
@@ -1727,6 +1730,13 @@ static void select_odb(void)
 }
 
 /*
+ * Protects the static counters inside my_create_tempfile() so that
+ * multiple threads can safely create uniquely-named tempfiles
+ * concurrently.
+ */
+static pthread_mutex_t tempfile_counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
  * Create a unique tempfile or tempfile-pair inside the
  * tempPacks directory.
  */
@@ -1750,6 +1760,12 @@ static void my_create_tempfile(
 
 	gh__response_status__zero(status);
 
+	/*
+	 * The static counters are shared state; protect them so that
+	 * threads spawned for parallel downloads can each get a unique
+	 * basename without racing.
+	 */
+	pthread_mutex_lock(&tempfile_counter_mutex);
 	if (!nth) {
 		/*
 		 * Create a unique <date> string to use in the name of all
@@ -1770,6 +1786,7 @@ static void my_create_tempfile(
 	 * number <n>.
 	 */
 	strbuf_addf(&basename, "t-%s-%04d", date, nth++);
+	pthread_mutex_unlock(&tempfile_counter_mutex);
 
 	if (!suffix1 || !*suffix1)
 		suffix1 = "temp";
@@ -1975,6 +1992,86 @@ cleanup:
 	child_process_clear(&ip);
 }
 
+/*
+ * Run "git index-pack --stdin" to index exactly nr_bytes bytes read
+ * from fd_in, writing the pack to temp_path_pack and the index to
+ * temp_path_idx simultaneously.  On success, writes the hex pack
+ * checksum into hex_out (must be at least GIT_MAX_HEXSZ+1 bytes).
+ *
+ * This avoids the two-step write-then-read that my_run_index_pack()
+ * requires: the pack bytes flow directly from fd_in to index-pack
+ * without an intermediate disk round-trip.
+ */
+static void my_run_index_pack_stdin(
+	struct gh__request_params *params UNUSED,
+	struct gh__response_status *status,
+	int fd_in,
+	ssize_t nr_bytes,
+	const struct strbuf *temp_path_pack,
+	const struct strbuf *temp_path_idx,
+	char *hex_out)
+{
+	struct child_process ip = CHILD_PROCESS_INIT;
+	struct strbuf ip_stdout = STRBUF_INIT;
+	char buf[8192];
+	ssize_t remaining = nr_bytes;
+
+	strvec_push(&ip.args, "git");
+	strvec_push(&ip.args, "index-pack");
+	strvec_push(&ip.args, "--stdin");
+	strvec_push(&ip.args, "--no-rev-index");
+	strvec_pushl(&ip.args, "-o", temp_path_idx->buf, NULL);
+	strvec_push(&ip.args, temp_path_pack->buf);
+
+	ip.in = -1;  /* we get a pipe to write pack bytes into */
+	ip.out = -1; /* we read the pack checksum from stdout */
+	ip.no_stderr = 1;
+
+	if (start_command(&ip) < 0) {
+		strbuf_addf(&status->error_message,
+			    "could not start index-pack (stdin) for '%s'",
+			    temp_path_pack->buf);
+		status->ec = GH__ERROR_CODE__INDEX_PACK_FAILED;
+		goto cleanup;
+	}
+
+	while (remaining > 0) {
+		ssize_t want = (remaining < (ssize_t)sizeof(buf))
+			       ? remaining : (ssize_t)sizeof(buf);
+		ssize_t got = xread(fd_in, buf, want);
+
+		if (got <= 0)
+			break;
+		if (write_in_full(ip.in, buf, got) < 0)
+			break;
+		remaining -= got;
+	}
+	close(ip.in);
+	ip.in = -1;
+
+	strbuf_read(&ip_stdout, ip.out, 64);
+	close(ip.out);
+	ip.out = -1;
+
+	if (finish_command(&ip)) {
+		unlink(temp_path_pack->buf);
+		unlink(temp_path_idx->buf);
+		strbuf_addf(&status->error_message,
+			    "index-pack (stdin) failed for '%s'",
+			    temp_path_pack->buf);
+		status->retry = GH__RETRY_MODE__TRANSIENT;
+		status->ec = GH__ERROR_CODE__INDEX_PACK_FAILED;
+		goto cleanup;
+	}
+
+	strbuf_trim_trailing_newline(&ip_stdout);
+	xsnprintf(hex_out, GIT_MAX_HEXSZ + 1, "%s", ip_stdout.buf);
+
+cleanup:
+	strbuf_release(&ip_stdout);
+	child_process_clear(&ip);
+}
+
 static void my_finalize_packfile(struct gh__request_params *params,
 				 struct gh__response_status *status,
 				 int b_keep,
@@ -2128,60 +2225,6 @@ static inline uint64_t my_get_le64(uint64_t le_val)
 #define MY_MIN(x,y) (((x) < (y)) ? (x) : (y))
 #define MY_MAX(x,y) (((x) > (y)) ? (x) : (y))
 
-/*
- * Copy the `nr_bytes_total` from `fd_in` to `fd_out`.
- *
- * This could be used to extract a single packfile from
- * a multipart file, for example.
- */
-static int my_copy_fd_len(int fd_in, int fd_out, ssize_t nr_bytes_total)
-{
-	char buffer[8192];
-
-	while (nr_bytes_total > 0) {
-		ssize_t len_to_read = MY_MIN(nr_bytes_total, (ssize_t)sizeof(buffer));
-		ssize_t nr_read = xread(fd_in, buffer, len_to_read);
-
-		if (!nr_read)
-			break;
-		if (nr_read < 0)
-			return -1;
-
-		if (write_in_full(fd_out, buffer, nr_read) < 0)
-			return -1;
-
-		nr_bytes_total -= nr_read;
-	}
-
-	return 0;
-}
-
-/*
- * Copy the `nr_bytes_total` from `fd_in` to `fd_out` AND save the
- * final `tail_len` bytes in the given buffer.
- *
- * This could be used to extract a single packfile from
- * a multipart file and read the final SHA into the buffer.
- */
-static int my_copy_fd_len_tail(int fd_in, int fd_out, ssize_t nr_bytes_total,
-			       unsigned char *buf_tail, ssize_t tail_len)
-{
-	memset(buf_tail, 0, tail_len);
-
-	if (my_copy_fd_len(fd_in, fd_out, nr_bytes_total) < 0)
-		return -1;
-
-	if (nr_bytes_total < tail_len)
-		return 0;
-
-	/* Reset the position to read the tail */
-	lseek(fd_in, -tail_len, SEEK_CUR);
-
-	if (xread(fd_in, (char *)buf_tail, tail_len) != tail_len)
-		return -1;
-
-	return 0;
-}
 
 /*
  * See the protocol document for the per-packfile header.
@@ -2208,10 +2251,8 @@ static void extract_packfile_from_multipack(
 	unsigned short k)
 {
 	struct ph ph;
-	struct tempfile *tempfile_pack = NULL;
-	int result = -1;
+	struct tempfile *tempfile_idx = NULL;
 	int b_no_idx_in_multipack;
-	struct object_id packfile_checksum;
 	char hex_checksum[GIT_MAX_HEXSZ + 1];
 	struct strbuf buf_timestamp = STRBUF_INIT;
 	struct strbuf temp_path_pack = STRBUF_INIT;
@@ -2246,46 +2287,41 @@ static void extract_packfile_from_multipack(
 	 * We are going to harden `gvfs-helper` here and ignore the .idx file
 	 * if it is provided and always compute it locally so that we get the
 	 * added verification that `git index-pack` provides.
-	 */
-	my_create_tempfile(status, 0, "pack", &tempfile_pack, NULL, NULL);
-	if (!tempfile_pack)
-		goto done;
-
-	/*
-	 * Copy the current packfile from the open stream and capture
-	 * the checksum.
 	 *
-	 * TODO This assumes that the checksum is SHA1.  Fix this if/when
-	 * TODO Git converts to SHA256.
+	 * Stream the pack bytes directly to "git index-pack --stdin" rather
+	 * than writing them to a temp file first.  This avoids a redundant
+	 * disk read: the pack data flows from the multipack fd to index-pack
+	 * in one pass, and index-pack writes both the .pack and .idx files
+	 * simultaneously.
+	 *
+	 * We create only the .idx tempfile to reserve a unique basename in
+	 * the tempPacks directory; we then release it so index-pack can
+	 * create both files at those paths itself.
 	 */
-	result = my_copy_fd_len_tail(fd_multipack,
-				     get_tempfile_fd(tempfile_pack),
-				     ph.pack_len,
-				     packfile_checksum.hash,
-				     GIT_SHA1_RAWSZ);
-	packfile_checksum.algo = GIT_HASH_SHA1;
-
-	if (result < 0){
-		strbuf_addf(&status->error_message,
-			    "could not extract packfile[%d] from multipack",
-			    k);
+	my_create_tempfile(status, 0, "idx", &tempfile_idx, NULL, NULL);
+	if (!tempfile_idx)
 		goto done;
-	}
-	strbuf_addstr(&temp_path_pack, get_tempfile_path(tempfile_pack));
-	close_tempfile_gently(tempfile_pack);
 
-	oid_to_hex_r(hex_checksum, &packfile_checksum);
+	strbuf_addstr(&temp_path_idx, get_tempfile_path(tempfile_idx));
+
+	/* Derive the .pack path from the reserved .idx basename. */
+	strbuf_addbuf(&temp_path_pack, &temp_path_idx);
+	strbuf_strip_suffix(&temp_path_pack, ".idx");
+	strbuf_addstr(&temp_path_pack, ".pack");
 
 	/*
-	 * Always compute the .idx file from the .pack file.
+	 * Release the .idx tempfile registration before spawning
+	 * index-pack so that index-pack can create both files.
+	 * index-pack opens the pack with O_CREAT|O_EXCL and the idx
+	 * with O_CREAT|O_TRUNC, so the pack path must be free and the
+	 * idx path will be overwritten.
 	 */
-	strbuf_addbuf(&temp_path_idx, &temp_path_pack);
-	strbuf_strip_suffix(&temp_path_idx, ".pack");
-	strbuf_addstr(&temp_path_idx, ".idx");
+	delete_tempfile(&tempfile_idx);
 
-	my_run_index_pack(params, status,
-			  &temp_path_pack, &temp_path_idx,
-			  NULL);
+	my_run_index_pack_stdin(params, status,
+				fd_multipack, ph.pack_len,
+				&temp_path_pack, &temp_path_idx,
+				hex_checksum);
 	if (status->ec != GH__ERROR_CODE__OK)
 		goto done;
 
@@ -2315,7 +2351,7 @@ static void extract_packfile_from_multipack(
 			     &final_filename);
 
 done:
-	delete_tempfile(&tempfile_pack);
+	delete_tempfile(&tempfile_idx);
 	strbuf_release(&temp_path_pack);
 	strbuf_release(&temp_path_idx);
 	strbuf_release(&final_path_pack);
@@ -3398,34 +3434,27 @@ static void do__http_get__gvfs_object(struct gh__response_status *status,
 }
 
 /*
- * Call "gvfs/objects" POST REST API to fetch a batch of objects
- * from the OIDSET.  Normal, this is results in a packfile containing
- * `nr_wanted_in_block` objects.  And we return the number actually
- * consumed (along with the filename of the resulting packfile).
- *
- * However, if we only have 1 oid (remaining) in the OIDSET, the
- * server *MAY* respond to our POST with a loose object rather than
- * a packfile with 1 object.
- *
- * Append a message to the result_list describing the result.
- *
- * Return the number of OIDs consumed from the OIDSET.
+ * Core POST /gvfs/objects request with a pre-built JSON payload.
+ * Extracted from do__http_post__gvfs_objects() so that payload
+ * construction (which advances the oidset iterator) can be separated
+ * from the HTTP request, allowing callers to build all payloads
+ * before dispatching downloads in parallel.
  */
-static void do__http_post__gvfs_objects(struct gh__response_status *status,
-					struct oidset_iter *iter,
-					unsigned long nr_wanted_in_block,
-					int j_pack_num, int j_pack_den,
-					struct string_list *result_list,
-					unsigned long *nr_oid_taken)
+static void do__http_post__gvfs_objects_with_payload(
+	struct gh__response_status *status,
+	const struct strbuf *payload,
+	unsigned long object_count,
+	const struct object_id *loose_oid,
+	int j_pack_num, int j_pack_den,
+	struct string_list *result_list)
 {
-	struct json_writer jw_req = JSON_WRITER_INIT;
 	struct gh__request_params params = GH__REQUEST_PARAMS_INIT;
 
 	gh__response_status__zero(status);
 
-	params.object_count = build_json_payload__gvfs_objects(
-		&jw_req, iter, nr_wanted_in_block, &params.loose_oid);
-	*nr_oid_taken = params.object_count;
+	params.object_count = object_count;
+	if (loose_oid)
+		oidcpy(&params.loose_oid, loose_oid);
 
 	strbuf_addstr(&params.tr2_label, "POST/objects");
 
@@ -3434,7 +3463,7 @@ static void do__http_post__gvfs_objects(struct gh__response_status *status,
 	params.b_permit_cache_server_if_defined = 1;
 	params.objects_mode = GH__OBJECTS_MODE__POST;
 
-	params.post_payload = &jw_req.json;
+	params.post_payload = payload;
 
 	params.result_list = result_list;
 
@@ -3468,6 +3497,43 @@ static void do__http_post__gvfs_objects(struct gh__response_status *status,
 	reset_cache_server();
 
 	gh__request_params__release(&params);
+}
+
+/*
+ * Call "gvfs/objects" POST REST API to fetch a batch of objects
+ * from the OIDSET.  Normal, this is results in a packfile containing
+ * `nr_wanted_in_block` objects.  And we return the number actually
+ * consumed (along with the filename of the resulting packfile).
+ *
+ * However, if we only have 1 oid (remaining) in the OIDSET, the
+ * server *MAY* respond to our POST with a loose object rather than
+ * a packfile with 1 object.
+ *
+ * Append a message to the result_list describing the result.
+ *
+ * Return the number of OIDs consumed from the OIDSET.
+ */
+static void do__http_post__gvfs_objects(struct gh__response_status *status,
+					struct oidset_iter *iter,
+					unsigned long nr_wanted_in_block,
+					int j_pack_num, int j_pack_den,
+					struct string_list *result_list,
+					unsigned long *nr_oid_taken)
+{
+	struct json_writer jw_req = JSON_WRITER_INIT;
+	struct object_id loose_oid;
+	unsigned long object_count;
+
+	gh__response_status__zero(status);
+
+	object_count = build_json_payload__gvfs_objects(
+		&jw_req, iter, nr_wanted_in_block, &loose_oid);
+	*nr_oid_taken = object_count;
+
+	do__http_post__gvfs_objects_with_payload(
+		status, &jw_req.json, object_count, &loose_oid,
+		j_pack_num, j_pack_den, result_list);
+
 	jw_release(&jw_req);
 }
 
@@ -3662,6 +3728,327 @@ cleanup:
 	strbuf_release(&err404);
 }
 
+/* ------------------------------------------------------------------ */
+/* Parallel batch download infrastructure                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One pre-built batch payload, ready to POST.  All batches are built
+ * in the main thread (which owns the oidset iterator) before any
+ * download thread is spawned.
+ */
+struct gh__batch_item {
+	struct strbuf payload;     /* JSON POST body */
+	unsigned long object_count;
+	struct object_id loose_oid; /* valid iff object_count == 1 */
+	int j_pack_num;
+};
+
+/*
+ * Shared state written by download threads; protected by a mutex.
+ */
+struct gh__dl_shared {
+	pthread_mutex_t mutex;
+	struct string_list *result_list;
+	int had_404;
+	struct strbuf first_err404_msg;
+	int had_hard_error;
+	struct gh__response_status first_hard_error;
+};
+
+/*
+ * Per-thread argument block.
+ */
+struct gh__dl_thread_args {
+	const struct gh__batch_item *batch;
+	int j_pack_den;
+	const char *url;    /* full URL including endpoint */
+	CURL *curl;         /* exclusive to this thread; freed by thread */
+	struct curl_slist *headers; /* per-thread header list */
+	struct gh__dl_shared *shared;
+};
+
+/*
+ * Worker thread: POST one pre-built batch, install the result, and
+ * report back through the shared state.
+ *
+ * Each thread owns its curl handle and a per-thread result list.
+ * install_result() writes to the per-thread list; results are merged
+ * into the shared list under the mutex after install completes.
+ */
+static void *gh__post_batch_thread_fn(void *vargs)
+{
+	struct gh__dl_thread_args *args = vargs;
+	struct gh__dl_shared *shared = args->shared;
+	struct gh__response_status status = GH__RESPONSE_STATUS_INIT;
+	struct gh__request_params params = GH__REQUEST_PARAMS_INIT;
+	struct string_list thread_results = STRING_LIST_INIT_DUP;
+	CURLcode res;
+	long http_code = 0;
+	const char *ct = NULL;
+	int i;
+
+	/* Create a tempfile for the response body. */
+	my_create_tempfile(&status, 1, NULL, &params.tempfile, NULL, NULL);
+	if (status.ec != GH__ERROR_CODE__OK)
+		goto report;
+
+	/* Configure this thread's curl handle for the POST. */
+	curl_easy_setopt(args->curl, CURLOPT_URL, args->url);
+	curl_easy_setopt(args->curl, CURLOPT_POST, 1L);
+	curl_easy_setopt(args->curl, CURLOPT_ENCODING, NULL);
+	curl_easy_setopt(args->curl, CURLOPT_POSTFIELDS,
+			 args->batch->payload.buf);
+	curl_easy_setopt(args->curl, CURLOPT_POSTFIELDSIZE,
+			 (long)args->batch->payload.len);
+	curl_easy_setopt(args->curl, CURLOPT_WRITEFUNCTION, fwrite);
+	curl_easy_setopt(args->curl, CURLOPT_WRITEDATA,
+			 (void *)params.tempfile->fp);
+	curl_easy_setopt(args->curl, CURLOPT_HTTPHEADER, args->headers);
+	curl_easy_setopt(args->curl, CURLOPT_NOPROGRESS, 1L);
+
+	res = curl_easy_perform(args->curl);
+	fflush(params.tempfile->fp);
+
+	if (res != CURLE_OK) {
+		strbuf_addf(&status.error_message,
+			    "curl error in batch %d: %s",
+			    args->batch->j_pack_num,
+			    curl_easy_strerror(res));
+		status.ec = GH__ERROR_CODE__CURL_ERROR;
+		status.retry = GH__RETRY_MODE__TRANSIENT;
+		goto report;
+	}
+
+	curl_easy_getinfo(args->curl, CURLINFO_RESPONSE_CODE, &http_code);
+	curl_easy_getinfo(args->curl, CURLINFO_CONTENT_TYPE, &ct);
+	if (ct)
+		strbuf_addstr(&status.content_type, ct);
+
+	if (http_code == 404) {
+		strbuf_addf(&status.error_message,
+			    "batch %d: 404 Not Found",
+			    args->batch->j_pack_num);
+		status.ec = GH__ERROR_CODE__HTTP_404;
+		goto report;
+	} else if (http_code != 200) {
+		strbuf_addf(&status.error_message,
+			    "batch %d: HTTP %ld", args->batch->j_pack_num,
+			    http_code);
+		status.ec = GH__ERROR_CODE__HTTP_OTHER;
+		goto report;
+	}
+
+	/* Install the downloaded data (packfile or loose object). */
+	params.object_count = args->batch->object_count;
+	oidcpy(&params.loose_oid, &args->batch->loose_oid);
+	params.objects_mode = GH__OBJECTS_MODE__POST;
+	params.b_is_post = 1;
+	params.b_write_to_file = 1;
+	params.result_list = &thread_results;
+	install_result(&params, &status);
+
+report:
+	gh__request_params__release(&params);
+	curl_easy_cleanup(args->curl);
+	args->curl = NULL;
+	curl_slist_free_all(args->headers);
+	args->headers = NULL;
+
+	/* Merge per-thread results into the shared list under the mutex. */
+	pthread_mutex_lock(&shared->mutex);
+
+	if (status.ec == GH__ERROR_CODE__HTTP_404) {
+		shared->had_404 = 1;
+		if (!shared->first_err404_msg.len)
+			strbuf_addf(&shared->first_err404_msg,
+				    "%s: from POST",
+				    status.error_message.buf);
+	} else if (status.ec != GH__ERROR_CODE__OK &&
+		   !shared->had_hard_error) {
+		shared->had_hard_error = 1;
+		strbuf_addbuf(&shared->first_hard_error.error_message,
+			      &status.error_message);
+		shared->first_hard_error.ec = status.ec;
+		shared->first_hard_error.retry = status.retry;
+	}
+
+	for (i = 0; i < thread_results.nr; i++)
+		string_list_append(shared->result_list,
+				   thread_results.items[i].string);
+
+	pthread_mutex_unlock(&shared->mutex);
+
+	string_list_clear(&thread_results, 0);
+	gh__response_status__release(&status);
+	return NULL;
+}
+
+/*
+ * Pre-build all batch payloads from the oidset in the main thread,
+ * then dispatch up to max_concurrent downloads concurrently.
+ *
+ * Each thread owns a cloned curl handle (duplicated from a base slot
+ * configured by http.c) so that SSL, proxy, and auth settings are
+ * inherited without requiring thread-safe access to the slot pool.
+ *
+ * Limitations of this first implementation:
+ *   - No retry logic per thread; a failed batch is reported as an
+ *     error without retrying against the origin server.
+ *   - Throttle (Azure retry-after) headers are ignored in threaded
+ *     mode; the sequential path should be used when throttling matters.
+ */
+static void do__http_post__fetch_oidset_parallel(
+	struct gh__response_status *status,
+	struct oidset *oids,
+	unsigned long nr_oid_total,
+	struct string_list *result_list,
+	int max_concurrent)
+{
+	struct oidset_iter iter;
+	int n_batches, i;
+	int j_pack_den;
+	struct gh__batch_item *batches;
+	struct gh__dl_shared shared;
+	struct gh__dl_thread_args *args;
+	pthread_t *threads;
+	struct active_request_slot *base_slot;
+	struct strbuf full_url = STRBUF_INIT;
+
+	gh__response_status__zero(status);
+	if (!nr_oid_total)
+		return;
+
+	/* Calculate total batch count. */
+	j_pack_den = (int)((nr_oid_total + gh__cmd_opts.block_size - 1)
+			   / gh__cmd_opts.block_size);
+	n_batches = j_pack_den;
+
+	/* Pre-build all payloads in the main thread. */
+	CALLOC_ARRAY(batches, n_batches);
+	oidset_iter_init(oids, &iter);
+	for (i = 0; i < n_batches; i++) {
+		struct json_writer jw = JSON_WRITER_INIT;
+		batches[i].payload = (struct strbuf)STRBUF_INIT;
+		batches[i].j_pack_num = i + 1;
+		batches[i].object_count = build_json_payload__gvfs_objects(
+			&jw, &iter, gh__cmd_opts.block_size,
+			&batches[i].loose_oid);
+		strbuf_addbuf(&batches[i].payload, &jw.json);
+		jw_release(&jw);
+	}
+
+	/*
+	 * Determine the URL for all downloads.  update_cache_server_for_verb()
+	 * may switch cache_server_url to a verb-specific value; we read that
+	 * once in the main thread and pass it to all threads as a plain string.
+	 */
+	update_cache_server_for_verb(POST);
+	end_url_with_slash(&full_url,
+			   gh__global.cache_server_url
+			   ? gh__global.cache_server_url
+			   : gh__global.main_url);
+	strbuf_addstr(&full_url, "gvfs/objects");
+	reset_cache_server();
+
+	/*
+	 * Get a configured curl handle from the pool as a template.
+	 * We duplicate it for each thread so they inherit all of the
+	 * SSL, proxy, and authentication settings that http.c applied.
+	 * The base slot is released immediately without being used.
+	 */
+	base_slot = get_active_slot();
+
+	/* Initialise shared state. */
+	memset(&shared, 0, sizeof(shared));
+	pthread_mutex_init(&shared.mutex, NULL);
+	shared.result_list = result_list;
+	shared.first_err404_msg = (struct strbuf)STRBUF_INIT;
+	shared.first_hard_error = (struct gh__response_status)
+				  GH__RESPONSE_STATUS_INIT;
+
+	CALLOC_ARRAY(args, n_batches);
+	CALLOC_ARRAY(threads, n_batches);
+
+	/* Dispatch threads in windows of max_concurrent. */
+	for (i = 0; i < n_batches; i++) {
+		int window_start = i - (max_concurrent - 1);
+
+		/* Wait for the oldest in-flight thread before launching more. */
+		if (window_start >= 0)
+			pthread_join(threads[window_start], NULL);
+
+		if (shared.had_hard_error) {
+			/* Don't start new threads after a hard error. */
+			args[i].batch = NULL;
+			threads[i] = 0;
+			continue;
+		}
+
+		args[i].batch = &batches[i];
+		args[i].j_pack_den = j_pack_den;
+		args[i].url = full_url.buf;
+		args[i].curl = curl_easy_duphandle(base_slot->curl);
+		args[i].shared = &shared;
+
+		/* Each thread gets its own header list (curl_slist is not shared). */
+		args[i].headers = http_copy_default_headers();
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "X-TFS-FedAuthRedirect: Suppress");
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "Pragma: no-cache");
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "Content-Type: application/json");
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "Accept: application/x-git-packfile");
+		args[i].headers = curl_slist_append(args[i].headers,
+						    "Accept: application/x-git-loose-object");
+
+		pthread_create(&threads[i], NULL, gh__post_batch_thread_fn,
+			       &args[i]);
+	}
+
+	/* Wait for any remaining in-flight threads. */
+	for (i = MY_MAX(0, n_batches - max_concurrent); i < n_batches; i++) {
+		if (threads[i])
+			pthread_join(threads[i], NULL);
+		/* Clean up any thread that was never started due to hard error. */
+		if (args[i].curl)
+			curl_easy_cleanup(args[i].curl);
+		if (args[i].headers)
+			curl_slist_free_all(args[i].headers);
+	}
+
+	/* Return the base slot to the pool without running a request. */
+	base_slot->in_use = 0;
+
+	/* Propagate any error to the caller. */
+	if (shared.had_hard_error) {
+		strbuf_addbuf(&status->error_message,
+			      &shared.first_hard_error.error_message);
+		strbuf_addstr(&status->error_message, ": from POST");
+		status->ec = shared.first_hard_error.ec;
+		status->retry = shared.first_hard_error.retry;
+	} else if (shared.had_404) {
+		strbuf_addbuf(&status->error_message,
+			      &shared.first_err404_msg);
+		status->ec = GH__ERROR_CODE__HTTP_404;
+	}
+
+	pthread_mutex_destroy(&shared.mutex);
+	strbuf_release(&shared.first_err404_msg);
+	gh__response_status__release(&shared.first_hard_error);
+
+	for (i = 0; i < n_batches; i++)
+		strbuf_release(&batches[i].payload);
+	free(batches);
+	free(args);
+	free(threads);
+	strbuf_release(&full_url);
+}
+
+/* ------------------------------------------------------------------ */
+
 /*
  * Drive one or more HTTP POST requests to bulk fetch the objects in
  * the given OIDSET.  Create one or more packfiles and/or loose objects.
@@ -3685,6 +4072,13 @@ static void do__http_post__fetch_oidset(struct gh__response_status *status,
 	gh__response_status__zero(status);
 	if (!nr_oid_total)
 		return;
+
+	if (gh__cmd_opts.max_concurrent_downloads > 1) {
+		do__http_post__fetch_oidset_parallel(
+			status, oids, nr_oid_total, result_list,
+			gh__cmd_opts.max_concurrent_downloads);
+		return;
+	}
 
 	oidset_iter_init(oids, &iter);
 
@@ -4421,6 +4815,12 @@ int cmd_main(int argc, const char **argv)
 	// TODO options for them.)
 	// TODO
 	// TODO See "scalar.max-retries" (and maybe "gvfs.max-retries")
+
+	gh__cmd_opts.max_concurrent_downloads = 1; /* sequential by default */
+	repo_config_get_int(the_repository, "gvfs.maxconcurrentdownloads",
+			    &gh__cmd_opts.max_concurrent_downloads);
+	if (gh__cmd_opts.max_concurrent_downloads < 1)
+		gh__cmd_opts.max_concurrent_downloads = 1;
 
 	repo_config(the_repository, git_default_config, NULL);
 
