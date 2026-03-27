@@ -11,8 +11,6 @@
 #include "xdiff-interface.h"
 #include "date.h"
 
-fake
-
 static int zip_date;
 static int zip_time;
 
