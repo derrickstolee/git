@@ -2274,6 +2274,7 @@ struct prefetch_stream {
 	struct gh__request_params *params;
 	struct gh__response_status *status;
 
+	struct progress *progress;
 	intmax_t bytes_received;
 	int nr_installed;
 };
@@ -2317,7 +2318,7 @@ static void prefetch_stream_release(struct prefetch_stream *ps)
 	strbuf_release(&ps->temp_path_pack);
 	strbuf_release(&ps->temp_path_idx);
 
-	stop_progress(&ps->params->progress);
+	stop_progress(&ps->progress);
 
 	if (ps->nr_installed)
 		delete_stale_keep_files(ps->params, ps->status);
@@ -2342,8 +2343,15 @@ static void ps_on_multipack_header(struct prefetch_stream *ps)
 		trace2_data_intmax(TR2_CAT, NULL,
 				   "prefetch/packfile_count", ps->np);
 
+	/*
+	 * Stop the curl download-bytes progress (phase 3) before
+	 * starting our pack-count progress, so the two don't fight
+	 * over the same progress handle.
+	 */
+	stop_progress(&ps->params->progress);
+
 	if (gh__cmd_opts.show_progress)
-		ps->params->progress = start_progress(
+		ps->progress = start_progress(
 			the_repository, "Installing prefetch packfiles", ps->np);
 
 	if (ps->np == 0) {
@@ -2462,7 +2470,7 @@ static void ps_on_pack_data_done(struct prefetch_stream *ps)
 			     &final_filename);
 
 	ps->nr_installed++;
-	display_progress(ps->params->progress, ps->k + 1);
+	display_progress(ps->progress, ps->k + 1);
 
 	if (ps->status->ec != GH__ERROR_CODE__OK) {
 		ps->state = PS_ERROR;
