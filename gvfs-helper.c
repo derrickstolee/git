@@ -2392,6 +2392,350 @@ static void delete_stale_keep_files(
 }
 
 /*
+ * Streaming prefetch: process the multipack response as bytes arrive
+ * from curl, piping each pack directly to "git index-pack --stdin"
+ * without writing the multipack to a tempfile first.
+ *
+ * The state machine routes incoming bytes through:
+ *   MULTIPACK_HEADER (8 bytes) -> parse pack count
+ *   PACK_HEADER (24 bytes)     -> parse lengths, start index-pack
+ *   PACK_DATA (pack_len bytes) -> pipe to index-pack stdin
+ *   IDX_DATA (idx_len bytes)   -> discard
+ *   repeat PACK_HEADER..IDX_DATA for each pack
+ */
+
+enum prefetch_stream_state {
+	PS_MULTIPACK_HEADER,
+	PS_PACK_HEADER,
+	PS_PACK_DATA,
+	PS_IDX_DATA,
+	PS_DONE,
+	PS_ERROR,
+};
+
+struct prefetch_stream {
+	enum prefetch_stream_state state;
+
+	unsigned char hdr_buf[24];
+	size_t hdr_len;
+	size_t hdr_needed;
+
+	unsigned short np;
+	unsigned short k;
+
+	struct ph current_ph;
+	ssize_t remaining;
+
+	struct child_process ip;
+	int ip_started;
+
+	struct strbuf temp_path_pack;
+	struct strbuf temp_path_idx;
+	char hex_checksum[GIT_MAX_HEXSZ + 1];
+
+	struct gh__request_params *params;
+	struct gh__response_status *status;
+
+	intmax_t bytes_received;
+	int nr_installed;
+};
+
+static void prefetch_stream_init(struct prefetch_stream *ps,
+				 struct gh__request_params *params,
+				 struct gh__response_status *status)
+{
+	memset(ps, 0, sizeof(*ps));
+	ps->state = PS_MULTIPACK_HEADER;
+	ps->hdr_needed = 8; /* sizeof multipack header (6-byte magic + 2-byte count) */
+	strbuf_init(&ps->temp_path_pack, 0);
+	strbuf_init(&ps->temp_path_idx, 0);
+	child_process_init(&ps->ip);
+	ps->params = params;
+	ps->status = status;
+}
+
+static void prefetch_stream_release(struct prefetch_stream *ps)
+{
+	if (ps->ip_started) {
+		close(ps->ip.in);
+		ps->ip.in = -1;
+		close(ps->ip.out);
+		ps->ip.out = -1;
+		finish_command(&ps->ip);
+		ps->ip_started = 0;
+	}
+	child_process_clear(&ps->ip);
+	strbuf_release(&ps->temp_path_pack);
+	strbuf_release(&ps->temp_path_idx);
+
+	stop_progress(&ps->params->progress);
+
+	if (ps->nr_installed)
+		delete_stale_keep_files(ps->params, ps->status);
+}
+
+static void ps_on_multipack_header(struct prefetch_stream *ps)
+{
+	static unsigned char v1_h[6] = { 'G', 'P', 'R', 'E', ' ', 0x01 };
+
+	if (memcmp(ps->hdr_buf, v1_h, 6)) {
+		strbuf_addstr(&ps->status->error_message,
+			      "invalid prefetch multipart header");
+		ps->status->ec = GH__ERROR_CODE__COULD_NOT_INSTALL_PREFETCH;
+		ps->state = PS_ERROR;
+		return;
+	}
+
+	ps->np = (unsigned short)ps->hdr_buf[6] +
+		 ((unsigned short)ps->hdr_buf[7] << 8);
+
+	if (ps->np)
+		trace2_data_intmax(TR2_CAT, NULL,
+				   "prefetch/packfile_count", ps->np);
+
+	if (gh__cmd_opts.show_progress)
+		ps->params->progress = start_progress(
+			the_repository, "Installing prefetch packfiles", ps->np);
+
+	if (ps->np == 0) {
+		ps->state = PS_DONE;
+		return;
+	}
+
+	ps->hdr_len = 0;
+	ps->hdr_needed = sizeof(struct ph);
+	ps->state = PS_PACK_HEADER;
+}
+
+static void ps_on_pack_header(struct prefetch_stream *ps)
+{
+	struct tempfile *tempfile_idx = NULL;
+	struct ph *ph = (struct ph *)ps->hdr_buf;
+
+	ps->current_ph.timestamp = my_get_le64(ph->timestamp);
+	ps->current_ph.pack_len = my_get_le64(ph->pack_len);
+	ps->current_ph.idx_len = my_get_le64(ph->idx_len);
+
+	if (!ps->current_ph.pack_len) {
+		strbuf_addf(&ps->status->error_message,
+			    "packfile[%d]: zero length packfile?", ps->k);
+		ps->status->ec = GH__ERROR_CODE__COULD_NOT_INSTALL_PREFETCH;
+		ps->state = PS_ERROR;
+		return;
+	}
+
+	strbuf_reset(&ps->temp_path_pack);
+	strbuf_reset(&ps->temp_path_idx);
+
+	my_create_tempfile(ps->status, 0, "idx", &tempfile_idx, NULL, NULL);
+	if (!tempfile_idx) {
+		ps->state = PS_ERROR;
+		return;
+	}
+
+	strbuf_addstr(&ps->temp_path_idx, get_tempfile_path(tempfile_idx));
+	strbuf_addbuf(&ps->temp_path_pack, &ps->temp_path_idx);
+	strbuf_strip_suffix(&ps->temp_path_pack, ".idx");
+	strbuf_addstr(&ps->temp_path_pack, ".pack");
+
+	delete_tempfile(&tempfile_idx);
+
+	child_process_init(&ps->ip);
+	strvec_push(&ps->ip.args, "git");
+	strvec_push(&ps->ip.args, "index-pack");
+	strvec_push(&ps->ip.args, "--stdin");
+	strvec_push(&ps->ip.args, "--no-rev-index");
+	strvec_pushl(&ps->ip.args, "-o", ps->temp_path_idx.buf, NULL);
+	strvec_push(&ps->ip.args, ps->temp_path_pack.buf);
+
+	ps->ip.in = -1;
+	ps->ip.out = -1;
+	ps->ip.no_stderr = 1;
+
+	if (start_command(&ps->ip) < 0) {
+		strbuf_addf(&ps->status->error_message,
+			    "could not start index-pack (stdin) for '%s'",
+			    ps->temp_path_pack.buf);
+		ps->status->ec = GH__ERROR_CODE__INDEX_PACK_FAILED;
+		ps->state = PS_ERROR;
+		return;
+	}
+
+	ps->ip_started = 1;
+	ps->remaining = (ssize_t)ps->current_ph.pack_len;
+	ps->state = PS_PACK_DATA;
+}
+
+static void ps_on_pack_data_done(struct prefetch_stream *ps)
+{
+	struct strbuf ip_stdout = STRBUF_INIT;
+	int b_no_idx;
+	struct strbuf buf_timestamp = STRBUF_INIT;
+	struct strbuf final_path_pack = STRBUF_INIT;
+	struct strbuf final_path_idx = STRBUF_INIT;
+	struct strbuf final_filename = STRBUF_INIT;
+
+	close(ps->ip.in);
+	ps->ip.in = -1;
+
+	strbuf_read(&ip_stdout, ps->ip.out, 64);
+	close(ps->ip.out);
+	ps->ip.out = -1;
+
+	if (finish_command(&ps->ip)) {
+		unlink(ps->temp_path_pack.buf);
+		unlink(ps->temp_path_idx.buf);
+		strbuf_addf(&ps->status->error_message,
+			    "index-pack (stdin) failed for '%s'",
+			    ps->temp_path_pack.buf);
+		ps->status->retry = GH__RETRY_MODE__TRANSIENT;
+		ps->status->ec = GH__ERROR_CODE__INDEX_PACK_FAILED;
+		ps->state = PS_ERROR;
+		goto cleanup;
+	}
+	ps->ip_started = 0;
+	child_process_clear(&ps->ip);
+
+	strbuf_trim_trailing_newline(&ip_stdout);
+	xsnprintf(ps->hex_checksum, sizeof(ps->hex_checksum),
+		  "%s", ip_stdout.buf);
+
+	strbuf_addf(&buf_timestamp, "%u",
+		    (unsigned int)ps->current_ph.timestamp);
+	create_final_packfile_pathnames("prefetch", buf_timestamp.buf,
+					ps->hex_checksum,
+					&final_path_pack, &final_path_idx,
+					&final_filename);
+
+	my_finalize_packfile(ps->params, ps->status, 1,
+			     &ps->temp_path_pack, &ps->temp_path_idx,
+			     &final_path_pack, &final_path_idx,
+			     &final_filename);
+
+	ps->nr_installed++;
+	display_progress(ps->params->progress, ps->k + 1);
+
+	if (ps->status->ec != GH__ERROR_CODE__OK) {
+		ps->state = PS_ERROR;
+		goto cleanup;
+	}
+
+	b_no_idx = (ps->current_ph.idx_len ==
+		    maximum_unsigned_value_of_type(uint64_t) ||
+		    ps->current_ph.idx_len == 0);
+	ps->k++;
+
+	if (!b_no_idx) {
+		ps->remaining = (ssize_t)ps->current_ph.idx_len;
+		ps->state = PS_IDX_DATA;
+	} else if (ps->k < ps->np) {
+		ps->hdr_len = 0;
+		ps->hdr_needed = sizeof(struct ph);
+		ps->state = PS_PACK_HEADER;
+	} else {
+		ps->state = PS_DONE;
+	}
+
+cleanup:
+	strbuf_release(&ip_stdout);
+	strbuf_release(&buf_timestamp);
+	strbuf_release(&final_path_pack);
+	strbuf_release(&final_path_idx);
+	strbuf_release(&final_filename);
+}
+
+static void ps_on_idx_data_done(struct prefetch_stream *ps)
+{
+	if (ps->k < ps->np) {
+		ps->hdr_len = 0;
+		ps->hdr_needed = sizeof(struct ph);
+		ps->state = PS_PACK_HEADER;
+	} else {
+		ps->state = PS_DONE;
+	}
+}
+
+static size_t fwrite_prefetch_stream(char *ptr, size_t size, size_t nmemb,
+				     void *userdata)
+{
+	struct prefetch_stream *ps = userdata;
+	size_t total = size * nmemb;
+	size_t consumed = 0;
+
+	ps->bytes_received += (intmax_t)total;
+
+	while (consumed < total) {
+		size_t avail = total - consumed;
+
+		switch (ps->state) {
+		case PS_MULTIPACK_HEADER:
+		case PS_PACK_HEADER: {
+			size_t need = ps->hdr_needed - ps->hdr_len;
+			size_t take = MY_MIN(avail, need);
+
+			memcpy(ps->hdr_buf + ps->hdr_len,
+			       ptr + consumed, take);
+			ps->hdr_len += take;
+			consumed += take;
+
+			if (ps->hdr_len == ps->hdr_needed) {
+				if (ps->state == PS_MULTIPACK_HEADER)
+					ps_on_multipack_header(ps);
+				else
+					ps_on_pack_header(ps);
+			}
+			break;
+		}
+
+		case PS_PACK_DATA: {
+			size_t take = MY_MIN(avail, (size_t)ps->remaining);
+
+			if (write_in_full(ps->ip.in, ptr + consumed,
+					  take) < 0) {
+				strbuf_addf(&ps->status->error_message,
+					    "write to index-pack failed for '%s'",
+					    ps->temp_path_pack.buf);
+				ps->status->ec =
+					GH__ERROR_CODE__INDEX_PACK_FAILED;
+				ps->state = PS_ERROR;
+				break;
+			}
+
+			consumed += take;
+			ps->remaining -= (ssize_t)take;
+
+			if (ps->remaining == 0)
+				ps_on_pack_data_done(ps);
+			break;
+		}
+
+		case PS_IDX_DATA: {
+			size_t take = MY_MIN(avail, (size_t)ps->remaining);
+
+			consumed += take;
+			ps->remaining -= (ssize_t)take;
+
+			if (ps->remaining == 0)
+				ps_on_idx_data_done(ps);
+			break;
+		}
+
+		case PS_DONE:
+			consumed = total;
+			break;
+
+		case PS_ERROR:
+			return 0;
+		}
+
+		if (ps->state == PS_ERROR)
+			return 0;
+	}
+
+	return total;
+}
+
+/*
  * Cut apart the received multipart response into individual packfiles
  * and install each one.
  */
