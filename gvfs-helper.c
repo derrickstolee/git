@@ -2026,86 +2026,6 @@ cleanup:
 	child_process_clear(&ip);
 }
 
-/*
- * Run "git index-pack --stdin" to index exactly nr_bytes bytes read
- * from fd_in, writing the pack to temp_path_pack and the index to
- * temp_path_idx simultaneously.  On success, writes the hex pack
- * checksum into hex_out (must be at least GIT_MAX_HEXSZ+1 bytes).
- *
- * This avoids the two-step write-then-read that my_run_index_pack()
- * requires: the pack bytes flow directly from fd_in to index-pack
- * without an intermediate disk round-trip.
- */
-static void my_run_index_pack_stdin(
-	struct gh__request_params *params UNUSED,
-	struct gh__response_status *status,
-	int fd_in,
-	ssize_t nr_bytes,
-	const struct strbuf *temp_path_pack,
-	const struct strbuf *temp_path_idx,
-	char *hex_out)
-{
-	struct child_process ip = CHILD_PROCESS_INIT;
-	struct strbuf ip_stdout = STRBUF_INIT;
-	char buf[8192];
-	ssize_t remaining = nr_bytes;
-
-	strvec_push(&ip.args, "git");
-	strvec_push(&ip.args, "index-pack");
-	strvec_push(&ip.args, "--stdin");
-	strvec_push(&ip.args, "--no-rev-index");
-	strvec_pushl(&ip.args, "-o", temp_path_idx->buf, NULL);
-	strvec_push(&ip.args, temp_path_pack->buf);
-
-	ip.in = -1;  /* we get a pipe to write pack bytes into */
-	ip.out = -1; /* we read the pack checksum from stdout */
-	ip.no_stderr = 1;
-
-	if (start_command(&ip) < 0) {
-		strbuf_addf(&status->error_message,
-			    "could not start index-pack (stdin) for '%s'",
-			    temp_path_pack->buf);
-		status->ec = GH__ERROR_CODE__INDEX_PACK_FAILED;
-		goto cleanup;
-	}
-
-	while (remaining > 0) {
-		ssize_t want = (remaining < (ssize_t)sizeof(buf))
-			       ? remaining : (ssize_t)sizeof(buf);
-		ssize_t got = xread(fd_in, buf, want);
-
-		if (got <= 0)
-			break;
-		if (write_in_full(ip.in, buf, got) < 0)
-			break;
-		remaining -= got;
-	}
-	close(ip.in);
-	ip.in = -1;
-
-	strbuf_read(&ip_stdout, ip.out, 64);
-	close(ip.out);
-	ip.out = -1;
-
-	if (finish_command(&ip)) {
-		unlink(temp_path_pack->buf);
-		unlink(temp_path_idx->buf);
-		strbuf_addf(&status->error_message,
-			    "index-pack (stdin) failed for '%s'",
-			    temp_path_pack->buf);
-		status->retry = GH__RETRY_MODE__TRANSIENT;
-		status->ec = GH__ERROR_CODE__INDEX_PACK_FAILED;
-		goto cleanup;
-	}
-
-	strbuf_trim_trailing_newline(&ip_stdout);
-	xsnprintf(hex_out, GIT_MAX_HEXSZ + 1, "%s", ip_stdout.buf);
-
-cleanup:
-	strbuf_release(&ip_stdout);
-	child_process_clear(&ip);
-}
-
 static void my_finalize_packfile(struct gh__request_params *params,
 				 struct gh__response_status *status,
 				 int b_keep,
@@ -2267,130 +2187,6 @@ struct ph {
 	uint64_t pack_len;
 	uint64_t idx_len;
 };
-
-/*
- * Extract the next packfile from the multipack.
- * Install {.pack, .idx, .keep} set.
- *
- * Mark each successfully installed prefetch pack as .keep it as installed
- * in case we have errors decoding/indexing later packs within the received
- * multipart file.  (A later pass can delete the unnecessary .keep files
- * from this and any previous invocations.)
- */
-static void extract_packfile_from_multipack(
-	struct gh__request_params *params,
-	struct gh__response_status *status,
-	int fd_multipack,
-	unsigned short k)
-{
-	struct ph ph;
-	struct tempfile *tempfile_idx = NULL;
-	int b_no_idx_in_multipack;
-	char hex_checksum[GIT_MAX_HEXSZ + 1];
-	struct strbuf buf_timestamp = STRBUF_INIT;
-	struct strbuf temp_path_pack = STRBUF_INIT;
-	struct strbuf temp_path_idx = STRBUF_INIT;
-	struct strbuf final_path_pack = STRBUF_INIT;
-	struct strbuf final_path_idx = STRBUF_INIT;
-	struct strbuf final_filename = STRBUF_INIT;
-
-	if (xread(fd_multipack, &ph, sizeof(ph)) != sizeof(ph)) {
-		strbuf_addf(&status->error_message,
-			    "could not read header for packfile[%d] in multipack",
-			    k);
-		status->ec = GH__ERROR_CODE__COULD_NOT_INSTALL_PREFETCH;
-		goto done;
-	}
-
-	ph.timestamp = my_get_le64(ph.timestamp);
-	ph.pack_len = my_get_le64(ph.pack_len);
-	ph.idx_len = my_get_le64(ph.idx_len);
-
-	if (!ph.pack_len) {
-		strbuf_addf(&status->error_message,
-			    "packfile[%d]: zero length packfile?", k);
-		status->ec = GH__ERROR_CODE__COULD_NOT_INSTALL_PREFETCH;
-		goto done;
-	}
-
-	b_no_idx_in_multipack = (ph.idx_len == maximum_unsigned_value_of_type(uint64_t) ||
-				 ph.idx_len == 0);
-
-	/*
-	 * We are going to harden `gvfs-helper` here and ignore the .idx file
-	 * if it is provided and always compute it locally so that we get the
-	 * added verification that `git index-pack` provides.
-	 *
-	 * Stream the pack bytes directly to "git index-pack --stdin" rather
-	 * than writing them to a temp file first.  This avoids a redundant
-	 * disk read: the pack data flows from the multipack fd to index-pack
-	 * in one pass, and index-pack writes both the .pack and .idx files
-	 * simultaneously.
-	 *
-	 * We create only the .idx tempfile to reserve a unique basename in
-	 * the tempPacks directory; we then release it so index-pack can
-	 * create both files at those paths itself.
-	 */
-	my_create_tempfile(status, 0, "idx", &tempfile_idx, NULL, NULL);
-	if (!tempfile_idx)
-		goto done;
-
-	strbuf_addstr(&temp_path_idx, get_tempfile_path(tempfile_idx));
-
-	/* Derive the .pack path from the reserved .idx basename. */
-	strbuf_addbuf(&temp_path_pack, &temp_path_idx);
-	strbuf_strip_suffix(&temp_path_pack, ".idx");
-	strbuf_addstr(&temp_path_pack, ".pack");
-
-	/*
-	 * Release the .idx tempfile registration before spawning
-	 * index-pack so that index-pack can create both files.
-	 * index-pack opens the pack with O_CREAT|O_EXCL and the idx
-	 * with O_CREAT|O_TRUNC, so the pack path must be free and the
-	 * idx path will be overwritten.
-	 */
-	delete_tempfile(&tempfile_idx);
-
-	my_run_index_pack_stdin(params, status,
-				fd_multipack, ph.pack_len,
-				&temp_path_pack, &temp_path_idx,
-				hex_checksum);
-	if (status->ec != GH__ERROR_CODE__OK)
-		goto done;
-
-	if (!b_no_idx_in_multipack) {
-		/*
-		 * Server sent the .idx immediately after the .pack in the
-		 * data stream.  Skip over it.
-		 */
-		if (lseek(fd_multipack, ph.idx_len, SEEK_CUR) < 0) {
-			strbuf_addf(&status->error_message,
-				    "could not skip index[%d] in multipack",
-				    k);
-			status->ec = GH__ERROR_CODE__COULD_NOT_INSTALL_PREFETCH;
-			goto done;
-		}
-	}
-
-	strbuf_addf(&buf_timestamp, "%u", (unsigned int)ph.timestamp);
-	create_final_packfile_pathnames("prefetch", buf_timestamp.buf, hex_checksum,
-					&final_path_pack, &final_path_idx,
-					&final_filename);
-	strbuf_release(&buf_timestamp);
-
-	my_finalize_packfile(params, status, 1,
-			     &temp_path_pack, &temp_path_idx,
-			     &final_path_pack, &final_path_idx,
-			     &final_filename);
-
-done:
-	delete_tempfile(&tempfile_idx);
-	strbuf_release(&temp_path_pack);
-	strbuf_release(&temp_path_idx);
-	strbuf_release(&final_path_pack);
-	strbuf_release(&final_path_idx);
-	strbuf_release(&final_filename);
-}
 
 struct keep_files_data {
 	timestamp_t max_timestamp;
@@ -2789,84 +2585,6 @@ static size_t fwrite_prefetch_stream(char *ptr, size_t size, size_t nmemb,
 }
 
 /*
- * Cut apart the received multipart response into individual packfiles
- * and install each one.
- */
-static void install_prefetch(struct gh__request_params *params,
-			     struct gh__response_status *status)
-{
-	static unsigned char v1_h[6] = { 'G', 'P', 'R', 'E', ' ', 0x01 };
-
-	struct mh {
-		unsigned char h[6];
-		unsigned char np[2];
-	};
-
-	struct mh mh;
-	unsigned short np;
-	unsigned short k;
-	int fd = -1;
-	int nr_installed = 0;
-
-	struct strbuf temp_path_mp = STRBUF_INIT;
-
-	/*
-	 * Steal the multi-part file from the tempfile class.
-	 */
-	strbuf_addf(&temp_path_mp, "%s.mp", get_tempfile_path(params->tempfile));
-	if (rename_tempfile(&params->tempfile, temp_path_mp.buf) == -1) {
-		strbuf_addf(&status->error_message,
-			    "could not rename prefetch tempfile to '%s'",
-			    temp_path_mp.buf);
-		status->ec = GH__ERROR_CODE__COULD_NOT_INSTALL_PREFETCH;
-		goto cleanup;
-	}
-
-	fd = git_open_cloexec(temp_path_mp.buf, O_RDONLY);
-	if (fd == -1) {
-		strbuf_addf(&status->error_message,
-			    "could not reopen prefetch tempfile '%s'",
-			    temp_path_mp.buf);
-		status->ec = GH__ERROR_CODE__COULD_NOT_INSTALL_PREFETCH;
-		goto cleanup;
-	}
-
-	if ((xread(fd, &mh, sizeof(mh)) != sizeof(mh)) ||
-	    (memcmp(mh.h, &v1_h, sizeof(mh.h)))) {
-		strbuf_addstr(&status->error_message,
-			      "invalid prefetch multipart header");
-		goto cleanup;
-	}
-
-	np = (unsigned short)mh.np[0] + ((unsigned short)mh.np[1] << 8);
-	if (np)
-		trace2_data_intmax(TR2_CAT, NULL,
-				   "prefetch/packfile_count", np);
-
-	if (gh__cmd_opts.show_progress)
-		params->progress = start_progress(the_repository, "Installing prefetch packfiles", np);
-
-	for (k = 0; k < np; k++) {
-		extract_packfile_from_multipack(params, status, fd, k);
-		display_progress(params->progress, k + 1);
-		if (status->ec != GH__ERROR_CODE__OK)
-			break;
-		nr_installed++;
-	}
-	stop_progress(&params->progress);
-
-	if (nr_installed)
-		delete_stale_keep_files(params, status);
-
-cleanup:
-	if (fd != -1)
-		close(fd);
-
-	unlink(temp_path_mp.buf);
-	strbuf_release(&temp_path_mp);
-}
-
-/*
  * Wrapper for read_loose_object() to read and verify the hash of a
  * loose object, and discard the contents buffer.
  *
@@ -2978,45 +2696,23 @@ cleanup:
 static void install_result(struct gh__request_params *params,
 			   struct gh__response_status *status)
 {
-	if (params->objects_mode == GH__OBJECTS_MODE__PREFETCH) {
+	if (!strcmp(status->content_type.buf, "application/x-git-packfile")) {
+		assert(params->b_is_post);
+		assert(params->objects_mode == GH__OBJECTS_MODE__POST);
+
+		install_packfile(params, status);
+		return;
+	}
+
+	if (!strcmp(status->content_type.buf,
+		   "application/x-git-loose-object")) {
 		/*
-		 * The "gvfs/prefetch" API is the only thing that sends
-		 * these multi-part packfiles.  According to the protocol
-		 * documentation, they will have this x- content type.
+		 * We get these for "gvfs/objects" GET and POST requests.
 		 *
-		 * However, it appears that there is a BUG in the origin
-		 * server causing it to sometimes send "text/html" instead.
-		 * So, we silently handle both.
+		 * Note that this content type is singular, not plural.
 		 */
-		if (!strcmp(status->content_type.buf,
-			    "application/x-gvfs-timestamped-packfiles-indexes")) {
-			install_prefetch(params, status);
-			return;
-		}
-
-		if (!strcmp(status->content_type.buf, "text/html")) {
-			install_prefetch(params, status);
-			return;
-		}
-	} else {
-		if (!strcmp(status->content_type.buf, "application/x-git-packfile")) {
-			assert(params->b_is_post);
-			assert(params->objects_mode == GH__OBJECTS_MODE__POST);
-
-			install_packfile(params, status);
-			return;
-		}
-
-		if (!strcmp(status->content_type.buf,
-			"application/x-git-loose-object")) {
-			/*
-			* We get these for "gvfs/objects" GET and POST requests.
-			*
-			* Note that this content type is singular, not plural.
-			*/
-			install_loose(params, status);
-			return;
-		}
+		install_loose(params, status);
+		return;
 	}
 
 	strbuf_addf(&status->error_message,
