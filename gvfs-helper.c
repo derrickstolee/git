@@ -538,6 +538,25 @@ enum gh__progress_state {
 };
 
 /*
+ * Forward declarations for the streaming prefetch state machine.
+ * Full definitions appear later alongside the implementation.
+ */
+enum prefetch_stream_state {
+	PS_MULTIPACK_HEADER,
+	PS_PACK_HEADER,
+	PS_PACK_DATA,
+	PS_IDX_DATA,
+	PS_DONE,
+	PS_ERROR,
+};
+
+struct prefetch_stream;
+static void prefetch_stream_release(struct prefetch_stream *);
+static intmax_t prefetch_stream_get_bytes(const struct prefetch_stream *);
+static enum prefetch_stream_state prefetch_stream_get_state(
+		const struct prefetch_stream *);
+
+/*
  * Parameters to drive an HTTP request (with any necessary retries).
  */
 struct gh__request_params {
@@ -556,6 +575,7 @@ struct gh__request_params {
 	 */
 	int b_is_post;
 	int b_write_to_file;      /* write to file=1 or strbuf=0 */
+	int b_stream_prefetch;    /* stream prefetch directly to index-pack */
 	int b_permit_cache_server_if_defined;
 
 	enum gh__objects_mode objects_mode;
@@ -571,6 +591,7 @@ struct gh__request_params {
 	struct curl_slist *headers; /* additional http headers to send */
 	struct tempfile *tempfile; /* for response content when file */
 	struct strbuf *buffer;     /* for response content when strbuf */
+	struct prefetch_stream *prefetch_ctx; /* for streaming prefetch */
 	struct strbuf tr2_label;   /* for trace2 regions */
 
 	struct object_id loose_oid;
@@ -604,6 +625,7 @@ struct gh__request_params {
 #define GH__REQUEST_PARAMS_INIT { \
 	.b_is_post = 0, \
 	.b_write_to_file = 0, \
+	.b_stream_prefetch = 0, \
 	.b_permit_cache_server_if_defined = 1, \
 	.server_type = GH__SERVER_TYPE__MAIN, \
 	.k_attempt = 0, \
@@ -613,6 +635,7 @@ struct gh__request_params {
 	.headers = NULL, \
 	.tempfile = NULL, \
 	.buffer = NULL, \
+	.prefetch_ctx = NULL, \
 	.tr2_label = STRBUF_INIT, \
 	.loose_oid = {{0}}, \
 	.progress_state = GH__PROGRESS_STATE__START, \
@@ -635,6 +658,12 @@ static void gh__request_params__release(struct gh__request_params *params)
 	params->headers = NULL;
 
 	delete_tempfile(&params->tempfile);
+
+	if (params->prefetch_ctx) {
+		prefetch_stream_release(params->prefetch_ctx);
+		free(params->prefetch_ctx);
+		params->prefetch_ctx = NULL;
+	}
 
 	params->buffer = NULL; /* we do not own this */
 
@@ -1080,6 +1109,9 @@ static void gh__response_status__set_from_slot(
 
 	if (status->ec != GH__ERROR_CODE__OK)
 		status->bytes_received = 0;
+	else if (params->b_stream_prefetch && params->prefetch_ctx)
+		status->bytes_received =
+			prefetch_stream_get_bytes(params->prefetch_ctx);
 	else if (params->b_write_to_file)
 		status->bytes_received = (intmax_t)ftell(params->tempfile->fp);
 	else
@@ -1241,7 +1273,21 @@ static void gh__run_one_slot(struct active_request_slot *slot,
 		if (params->b_write_to_file)
 			fflush(params->tempfile->fp);
 
-		gh__response_status__set_from_slot(params, status, slot);
+		/*
+		 * If the streaming prefetch callback already reported a
+		 * specific error (e.g. index-pack failure), preserve it
+		 * rather than letting set_from_slot overwrite it with a
+		 * generic CURLE_WRITE_ERROR.
+		 */
+		if (params->b_stream_prefetch && params->prefetch_ctx &&
+		    prefetch_stream_get_state(params->prefetch_ctx) == PS_ERROR &&
+		    status->ec != GH__ERROR_CODE__OK) {
+			status->bytes_received =
+				prefetch_stream_get_bytes(params->prefetch_ctx);
+		} else {
+			gh__response_status__set_from_slot(params, status,
+							   slot);
+		}
 
 		log_e2eid(params, status);
 
@@ -1265,7 +1311,12 @@ static void gh__run_one_slot(struct active_request_slot *slot,
 	if (params->progress)
 		stop_progress(&params->progress);
 
-	if (status->ec == GH__ERROR_CODE__OK && params->b_write_to_file)
+	/*
+	 * Streaming prefetch installs packs during the curl transfer;
+	 * file-based modes install after the transfer completes.
+	 */
+	if (status->ec == GH__ERROR_CODE__OK && params->b_write_to_file &&
+	    !params->b_stream_prefetch)
 		install_result(params, status);
 
 	trace2_region_leave(TR2_CAT, key.buf, NULL);
@@ -2404,15 +2455,6 @@ static void delete_stale_keep_files(
  *   repeat PACK_HEADER..IDX_DATA for each pack
  */
 
-enum prefetch_stream_state {
-	PS_MULTIPACK_HEADER,
-	PS_PACK_HEADER,
-	PS_PACK_DATA,
-	PS_IDX_DATA,
-	PS_DONE,
-	PS_ERROR,
-};
-
 struct prefetch_stream {
 	enum prefetch_stream_state state;
 
@@ -2439,6 +2481,17 @@ struct prefetch_stream {
 	intmax_t bytes_received;
 	int nr_installed;
 };
+
+static intmax_t prefetch_stream_get_bytes(const struct prefetch_stream *ps)
+{
+	return ps->bytes_received;
+}
+
+static enum prefetch_stream_state prefetch_stream_get_state(
+		const struct prefetch_stream *ps)
+{
+	return ps->state;
+}
 
 static void prefetch_stream_init(struct prefetch_stream *ps,
 				 struct gh__request_params *params,
@@ -3333,7 +3386,15 @@ static void do_req(const char *url_base,
 
 	gh__response_status__zero(status);
 
-	if (params->b_write_to_file) {
+	if (params->b_stream_prefetch) {
+		/* Reset streaming context for this attempt. */
+		if (params->prefetch_ctx) {
+			prefetch_stream_release(params->prefetch_ctx);
+			free(params->prefetch_ctx);
+		}
+		CALLOC_ARRAY(params->prefetch_ctx, 1);
+		prefetch_stream_init(params->prefetch_ctx, params, status);
+	} else if (params->b_write_to_file) {
 		/* Delete dirty tempfile from a previous attempt. */
 		if (params->tempfile)
 			delete_tempfile(&params->tempfile);
@@ -3383,7 +3444,12 @@ static void do_req(const char *url_base,
 		curl_easy_setopt(slot->curl, CURLOPT_POST, 0L);
 	}
 
-	if (params->b_write_to_file) {
+	if (params->b_stream_prefetch) {
+		curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION,
+				 fwrite_prefetch_stream);
+		curl_easy_setopt(slot->curl, CURLOPT_WRITEDATA,
+				 params->prefetch_ctx);
+	} else if (params->b_write_to_file) {
 		curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, fwrite);
 		curl_easy_setopt(slot->curl, CURLOPT_WRITEDATA,
 				 (void*)params->tempfile->fp);
@@ -3909,7 +3975,8 @@ static void do__http_get__gvfs_prefetch(struct gh__response_status *status,
 			   seconds_since_epoch);
 
 	params.b_is_post = 0;
-	params.b_write_to_file = 1;
+	params.b_write_to_file = 0;
+	params.b_stream_prefetch = 1;
 	params.b_permit_cache_server_if_defined = 1;
 	params.objects_mode = GH__OBJECTS_MODE__PREFETCH;
 
