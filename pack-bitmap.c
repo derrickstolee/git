@@ -2195,11 +2195,20 @@ struct bitmap_index *prepare_bitmap_walk(struct rev_info *revs,
 			haves_bitmap = find_boundary_objects(bitmap_git, revs, haves);
 			trace2_region_leave("pack-bitmap", "haves/boundary", repo);
 		} else {
+			int save_boundary = revs->boundary;
 			trace2_region_enter("pack-bitmap", "haves/classic", repo);
 			revs->ignore_missing_links = 1;
 			haves_bitmap = find_objects(bitmap_git, revs, haves, NULL);
 			reset_revision_walk();
 			revs->ignore_missing_links = 0;
+			/*
+			 * If revs->boundary was set (e.g. from --boundary),
+			 * the fill-in traversal inside find_objects() changes
+			 * it from 1 to 2 as part of the boundary commit output
+			 * phase. Reset it so the subsequent wants traversal
+			 * does not skip its normal commit walk.
+			 */
+			revs->boundary = save_boundary;
 			trace2_region_leave("pack-bitmap", "haves/classic", repo);
 		}
 
