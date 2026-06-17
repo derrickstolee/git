@@ -2627,14 +2627,14 @@ test_expect_success 'sparse-index is expanded: checkout-index --all outside cone
 	ensure_expanded checkout-index --all --ignore-skip-worktree-bits -f
 '
 
-test_expect_success 'sparse-index is expanded: check-ignore' '
+test_expect_success 'sparse-index is not expanded: check-ignore' '
 	init_repos &&
 
-	# "git check-ignore" reads the index to watch for submodules.
-	# The catch-all guard in repository.c expands the sparse index
-	# because check-ignore has not been integrated.
+	# "git check-ignore" reads the index to watch for submodules
+	# but does not iterate index entries, so it works without
+	# expanding the sparse index.
 	# check-ignore returns 1 when no path is ignored, so use "!".
-	ensure_expanded ! check-ignore deep/a
+	ensure_not_expanded ! check-ignore deep/a
 '
 
 test_expect_success 'sparse-index is expanded: fsck' '

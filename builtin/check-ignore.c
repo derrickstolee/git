@@ -7,6 +7,7 @@
 #include "quote.h"
 #include "pathspec.h"
 #include "parse-options.h"
+#include "repo-settings.h"
 #include "submodule.h"
 #include "write-or-die.h"
 
@@ -161,6 +162,8 @@ int cmd_check_ignore(int argc,
 	struct dir_struct dir = DIR_INIT;
 
 	repo_config(the_repository, git_default_config, NULL);
+	prepare_repo_settings(the_repository);
+	the_repository->settings.command_requires_full_index = 0;
 
 	argc = parse_options(argc, argv, prefix, check_ignore_options,
 			     check_ignore_usage, 0);
