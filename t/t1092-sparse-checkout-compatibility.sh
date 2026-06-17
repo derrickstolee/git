@@ -2609,13 +2609,13 @@ test_expect_success 'sparse-index is expanded: ls-files without --sparse' '
 	ensure_expanded ls-files
 '
 
-test_expect_success 'sparse-index is expanded: rev-list --indexed-objects' '
+test_expect_success 'sparse-index is not expanded: rev-list --indexed-objects' '
 	init_repos &&
 
-	# "git rev-list --indexed-objects" calls
-	# do_add_index_objects_to_pending() which iterates all index
-	# entries to add blobs (revision.c:1808).
-	ensure_expanded rev-list --indexed-objects --objects HEAD
+	# "git rev-list --indexed-objects" adds index objects to the
+	# pending list. Sparse directory entries are added as tree objects
+	# instead of expanding to individual blobs.
+	ensure_not_expanded rev-list --indexed-objects --objects HEAD
 '
 
 test_expect_success 'sparse-index is expanded: checkout-index --all outside cone' '

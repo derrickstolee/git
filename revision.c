@@ -1804,21 +1804,33 @@ static void do_add_index_objects_to_pending(struct rev_info *revs,
 {
 	int i;
 
-	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(istate);
 	for (i = 0; i < istate->cache_nr; i++) {
 		struct cache_entry *ce = istate->cache[i];
-		struct blob *blob;
 
 		if (S_ISGITLINK(ce->ce_mode))
 			continue;
 
-		blob = lookup_blob(revs->repo, &ce->oid);
-		if (!blob)
-			die("unable to add index blob to traversal");
-		blob->object.flags |= flags;
-		add_pending_object_with_path(revs, &blob->object, "",
-					     ce->ce_mode, ce->name);
+		if (S_ISSPARSEDIR(ce->ce_mode)) {
+			struct tree *tree;
+
+			tree = lookup_tree(revs->repo, &ce->oid);
+			if (tree) {
+				tree->object.flags |= flags;
+				add_pending_object_with_path(revs,
+							     &tree->object, "",
+							     ce->ce_mode,
+							     ce->name);
+			}
+		} else {
+			struct blob *blob;
+
+			blob = lookup_blob(revs->repo, &ce->oid);
+			if (!blob)
+				die("unable to add index blob to traversal");
+			blob->object.flags |= flags;
+			add_pending_object_with_path(revs, &blob->object, "",
+						     ce->ce_mode, ce->name);
+		}
 	}
 
 	if (istate->cache_tree) {
