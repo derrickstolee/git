@@ -5,6 +5,7 @@
 #include "hash.h"
 #include "merge-ort-wrappers.h"
 #include "object-name.h"
+#include "repo-settings.h"
 
 static const char builtin_merge_recursive_usage[] =
 	"git %s <base>... -- <head> <remote> ...";
@@ -35,6 +36,9 @@ int cmd_merge_recursive(int argc,
 	struct commit *result;
 
 	init_basic_merge_options(&o, the_repository);
+	prepare_repo_settings(the_repository);
+	the_repository->settings.command_requires_full_index = 0;
+
 	if (argv[0] && ends_with(argv[0], "-subtree"))
 		o.subtree_shift = "";
 

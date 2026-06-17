@@ -2657,13 +2657,12 @@ test_expect_success 'sparse-index is expanded: merge-index' '
 	ensure_expanded merge-index /bin/true -a
 '
 
-test_expect_success 'sparse-index is expanded: merge-recursive' '
+test_expect_success 'sparse-index is not expanded: merge-recursive' '
 	init_repos &&
 
 	# "git merge-recursive" delegates to merge_ort_generic() which
-	# is sparse-aware, but the builtin itself has not been marked
-	# as integrated. The catch-all guard expands the sparse index.
-	ensure_expanded ! merge-recursive base -- merge-left merge-right
+	# is already sparse-aware. No expansion is needed.
+	ensure_not_expanded ! merge-recursive base -- merge-left merge-right
 '
 
 test_expect_success 'merge -s ours' '
