@@ -2593,8 +2593,9 @@ test_expect_success 'sparse-index is not expanded: commit on orphan branch' '
 test_expect_success 'sparse-index is expanded: stash push with pathspec' '
 	init_repos &&
 
-	# "git stash push -- <pathspec>" validates the pathspec against
-	# every index entry (builtin/stash.c:1706).
+	# "git stash push -- <pathspec>" still triggers expansion from
+	# internal reset/checkout operations, even though the pathspec
+	# validation itself is now guarded by pathspec_needs_expanded_index().
 	echo change >>sparse-index/deep/a &&
 	ensure_expanded stash push -- deep/a
 '
