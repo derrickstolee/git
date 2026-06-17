@@ -2559,6 +2559,72 @@ test_expect_success 'cat-file --batch' '
 	ensure_expanded cat-file --batch <in
 '
 
+# The remaining tests demonstrate that certain code paths still trigger
+# ensure_full_index(). Each test documents the guard and how to trigger it.
+# As each guard is made sparse-aware, flip ensure_expanded to
+# ensure_not_expanded.
+
+test_expect_success 'sparse-index is expanded: commit --only with pathspec' '
+	init_repos &&
+
+	# "git commit --only -- <path>" takes the COMMIT_PARTIAL path
+	# which calls list_paths(), iterating the full index
+	# (builtin/commit.c:273).
+	echo change >>sparse-index/deep/a &&
+	git -C sparse-index add deep/a &&
+	rm -f trace2.txt &&
+	GIT_TRACE2_EVENT="$(pwd)/trace2.txt" \
+		git -C sparse-index commit -m "partial commit" --only -- deep/a \
+		>sparse-index-out 2>sparse-index-error &&
+	test_region index ensure_full_index trace2.txt
+'
+
+test_expect_success 'sparse-index is expanded: commit on orphan branch' '
+	init_repos &&
+
+	# On an orphan branch HEAD does not resolve, so "git commit"
+	# iterates all index entries to count non-intent-to-add entries
+	# (builtin/commit.c:1042).
+	git -C sparse-index checkout --orphan orphan-test &&
+	ensure_expanded commit -m "orphan commit"
+'
+
+test_expect_success 'sparse-index is expanded: stash push with pathspec' '
+	init_repos &&
+
+	# "git stash push -- <pathspec>" validates the pathspec against
+	# every index entry (builtin/stash.c:1706).
+	echo change >>sparse-index/deep/a &&
+	ensure_expanded stash push -- deep/a
+'
+
+test_expect_success 'sparse-index is expanded: ls-files without --sparse' '
+	init_repos &&
+
+	# "git ls-files" without --sparse hits a sparse directory entry
+	# during iteration and calls ensure_full_index()
+	# (builtin/ls-files.c:431).
+	ensure_expanded ls-files
+'
+
+test_expect_success 'sparse-index is expanded: rev-list --indexed-objects' '
+	init_repos &&
+
+	# "git rev-list --indexed-objects" calls
+	# do_add_index_objects_to_pending() which iterates all index
+	# entries to add blobs (revision.c:1808).
+	ensure_expanded rev-list --indexed-objects --objects HEAD
+'
+
+test_expect_success 'sparse-index is expanded: checkout-index --all outside cone' '
+	init_repos &&
+
+	# "git checkout-index --all" with files outside the sparse cone
+	# and --ignore-skip-worktree-bits will expand the index
+	# (builtin/checkout-index.c:159).
+	ensure_expanded checkout-index --all --ignore-skip-worktree-bits -f
+'
+
 test_expect_success 'merge -s ours' '
 	init_repos &&
 
