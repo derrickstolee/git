@@ -2627,6 +2627,45 @@ test_expect_success 'sparse-index is expanded: checkout-index --all outside cone
 	ensure_expanded checkout-index --all --ignore-skip-worktree-bits -f
 '
 
+test_expect_success 'sparse-index is expanded: check-ignore' '
+	init_repos &&
+
+	# "git check-ignore" reads the index to watch for submodules.
+	# The catch-all guard in repository.c expands the sparse index
+	# because check-ignore has not been integrated.
+	# check-ignore returns 1 when no path is ignored, so use "!".
+	ensure_expanded ! check-ignore deep/a
+'
+
+test_expect_success 'sparse-index is expanded: fsck' '
+	init_repos &&
+
+	# "git fsck" iterates index entries to mark reachable objects.
+	# It calls ensure_full_index() before its loop (builtin/fsck.c:885)
+	# even though sparse directory tree entries could be marked
+	# reachable directly.
+	ensure_expanded fsck
+'
+
+test_expect_success 'sparse-index is expanded: merge-index' '
+	init_repos &&
+
+	# "git merge-index" iterates index entries looking for unmerged
+	# (staged) entries. It calls ensure_full_index() at line 69/101.
+	# Sparse directory entries are always stage 0, so the loop could
+	# skip them without expansion.
+	ensure_expanded merge-index /bin/true -a
+'
+
+test_expect_success 'sparse-index is expanded: merge-recursive' '
+	init_repos &&
+
+	# "git merge-recursive" delegates to merge_ort_generic() which
+	# is sparse-aware, but the builtin itself has not been marked
+	# as integrated. The catch-all guard expands the sparse index.
+	ensure_expanded ! merge-recursive base -- merge-left merge-right
+'
+
 test_expect_success 'merge -s ours' '
 	init_repos &&
 
