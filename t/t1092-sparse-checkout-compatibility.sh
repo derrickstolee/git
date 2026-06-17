@@ -2579,14 +2579,15 @@ test_expect_success 'sparse-index is expanded: commit --only with pathspec' '
 	test_region index ensure_full_index trace2.txt
 '
 
-test_expect_success 'sparse-index is expanded: commit on orphan branch' '
+test_expect_success 'sparse-index is not expanded: commit on orphan branch' '
 	init_repos &&
 
 	# On an orphan branch HEAD does not resolve, so "git commit"
-	# iterates all index entries to count non-intent-to-add entries
-	# (builtin/commit.c:1042).
+	# iterates all index entries to count non-intent-to-add entries.
+	# Sparse directory entries are never intent-to-add, so they
+	# correctly count as committable without expansion.
 	git -C sparse-index checkout --orphan orphan-test &&
-	ensure_expanded commit -m "orphan commit"
+	ensure_not_expanded commit -m "orphan commit"
 '
 
 test_expect_success 'sparse-index is expanded: stash push with pathspec' '

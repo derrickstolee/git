@@ -1038,8 +1038,6 @@ static int prepare_to_commit(const char *index_file, const char *prefix,
 		if (repo_get_oid(the_repository, parent, &oid)) {
 			int i, ita_nr = 0;
 
-			/* TODO: audit for interaction with sparse-index. */
-			ensure_full_index(the_repository->index);
 			for (i = 0; i < the_repository->index->cache_nr; i++)
 				if (ce_intent_to_add(the_repository->index->cache[i]))
 					ita_nr++;
