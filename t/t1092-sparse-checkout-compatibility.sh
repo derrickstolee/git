@@ -2646,14 +2646,13 @@ test_expect_success 'sparse-index is not expanded: fsck' '
 	ensure_not_expanded fsck
 '
 
-test_expect_success 'sparse-index is expanded: merge-index' '
+test_expect_success 'sparse-index is not expanded: merge-index' '
 	init_repos &&
 
-	# "git merge-index" iterates index entries looking for unmerged
-	# (staged) entries. It calls ensure_full_index() at line 69/101.
-	# Sparse directory entries are always stage 0, so the loop could
-	# skip them without expansion.
-	ensure_expanded merge-index /bin/true -a
+	# "git merge-index -a" iterates index entries looking for unmerged
+	# (staged) entries. Sparse directory entries are always stage 0,
+	# so the loop skips them without needing expansion.
+	ensure_not_expanded merge-index /bin/true -a
 '
 
 test_expect_success 'sparse-index is not expanded: merge-recursive' '

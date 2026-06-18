@@ -2,8 +2,10 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "config.h"
 #include "hex.h"
 #include "read-cache-ll.h"
+#include "repo-settings.h"
 #include "run-command.h"
 #include "sparse-index.h"
 
@@ -65,8 +67,6 @@ static void merge_one_path(const char *path)
 static void merge_all(void)
 {
 	int i;
-	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(the_repository->index);
 	for (i = 0; i < the_repository->index->cache_nr; i++) {
 		const struct cache_entry *ce = the_repository->index->cache[i];
 		if (!ce_stage(ce))
@@ -95,10 +95,11 @@ int cmd_merge_index(int argc,
 	if (argc < 3)
 		usage(usage_string);
 
-	repo_read_index(the_repository);
+	repo_config(the_repository, git_default_config, NULL);
+	prepare_repo_settings(the_repository);
+	the_repository->settings.command_requires_full_index = 0;
 
-	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(the_repository->index);
+	repo_read_index(the_repository);
 
 	i = 1;
 	if (!strcmp(argv[i], "-o")) {
