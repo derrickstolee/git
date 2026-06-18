@@ -24,8 +24,8 @@
 #include "parse-options.h"
 #include "path.h"
 #include "read-cache-ll.h"
+#include "repo-settings.h"
 #include "repository.h"
-#include "sparse-index.h"
 #include "strvec.h"
 #include "strbuf.h"
 #include "lockfile.h"
@@ -606,8 +606,11 @@ static int run_dir_diff(struct repository *repo,
 	strvec_pushl(&cmd.args, ldir.buf, rdir.buf, NULL);
 	ret = run_command(&cmd);
 
-	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(&wtindex);
+	/*
+	 * wtindex is built from scratch via add_index_entry() with entries
+	 * from the diff output, so it can never contain sparse directory
+	 * entries. No expansion is needed.
+	 */
 
 	/*
 	 * If the diff includes working copy files and those
@@ -755,6 +758,9 @@ int cmd_difftool(int argc,
 
 	repo_config(repo, difftool_config, &dt_options);
 	dt_options.symlinks = dt_options.has_symlinks;
+
+	prepare_repo_settings(repo);
+	repo->settings.command_requires_full_index = 0;
 
 	argc = parse_options(argc, argv, prefix, builtin_difftool_options,
 			     builtin_difftool_usage, PARSE_OPT_KEEP_UNKNOWN_OPT |

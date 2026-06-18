@@ -2663,6 +2663,14 @@ test_expect_success 'sparse-index is not expanded: merge-recursive' '
 	ensure_not_expanded ! merge-recursive base -- merge-left merge-right
 '
 
+test_expect_success 'sparse-index is not expanded: difftool' '
+	init_repos &&
+
+	# "git difftool" runs "git diff --raw" as a child process and
+	# never reads the index itself, so no expansion is needed.
+	ensure_not_expanded difftool --no-prompt --extcmd true base update-folder1
+'
+
 test_expect_success 'merge -s ours' '
 	init_repos &&
 
