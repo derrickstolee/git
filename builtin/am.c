@@ -29,6 +29,7 @@
 #include "branch.h"
 #include "object-name.h"
 #include "preload-index.h"
+#include "repo-settings.h"
 #include "sequencer.h"
 #include "revision.h"
 #include "merge-ort-wrappers.h"
@@ -2448,6 +2449,9 @@ int cmd_am(int argc,
 	show_usage_with_options_if_asked(argc, argv, usage, options);
 
 	repo_config(the_repository, git_default_config, NULL);
+
+	prepare_repo_settings(the_repository);
+	the_repository->settings.command_requires_full_index = 0;
 
 	am_state_init(&state);
 

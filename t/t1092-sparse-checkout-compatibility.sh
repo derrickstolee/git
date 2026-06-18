@@ -2671,12 +2671,14 @@ test_expect_success 'sparse-index is not expanded: difftool' '
 	ensure_not_expanded difftool --no-prompt --extcmd true base update-folder1
 '
 
-test_expect_success 'sparse-index is expanded: am' '
+test_expect_success 'sparse-index is not expanded: am' '
 	init_repos &&
 
 	# Create a patch that modifies a file inside the sparse cone.
+	# The apply machinery, merge-ort, and cache-tree are all
+	# already sparse-aware, so no expansion is needed.
 	git -C sparse-index format-patch -1 update-deep -o "$(pwd)/am-patches" &&
-	ensure_expanded am "$(pwd)/am-patches/0001-update-deep.patch"
+	ensure_not_expanded am "$(pwd)/am-patches/0001-update-deep.patch"
 '
 
 test_expect_success 'merge -s ours' '
