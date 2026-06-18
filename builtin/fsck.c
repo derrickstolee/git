@@ -881,21 +881,23 @@ static void fsck_index(struct index_state *istate, const char *index_path,
 {
 	unsigned int i;
 
-	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(istate);
 	for (i = 0; i < istate->cache_nr; i++) {
 		unsigned int mode;
-		struct blob *blob;
 		struct object *obj;
 
 		mode = istate->cache[i]->ce_mode;
 		if (S_ISGITLINK(mode))
 			continue;
-		blob = lookup_blob(istate->repo,
-				   &istate->cache[i]->oid);
-		if (!blob)
-			continue;
-		obj = &blob->object;
+		if (S_ISSPARSEDIR(mode)) {
+			obj = &lookup_tree(istate->repo,
+					   &istate->cache[i]->oid)->object;
+		} else {
+			struct blob *blob = lookup_blob(istate->repo,
+							&istate->cache[i]->oid);
+			if (!blob)
+				continue;
+			obj = &blob->object;
+		}
 		obj->flags |= USED;
 		fsck_put_object_name(&fsck_walk_options, &obj->oid,
 				     "%s:%s",
@@ -1050,6 +1052,7 @@ int cmd_fsck(int argc,
 
 	repo_config(repo, git_fsck_config, &fsck_obj_options);
 	prepare_repo_settings(repo);
+	repo->settings.command_requires_full_index = 0;
 
 	if (check_references)
 		fsck_refs(repo);

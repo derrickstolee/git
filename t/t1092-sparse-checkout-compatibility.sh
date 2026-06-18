@@ -2637,14 +2637,13 @@ test_expect_success 'sparse-index is not expanded: check-ignore' '
 	ensure_not_expanded ! check-ignore deep/a
 '
 
-test_expect_success 'sparse-index is expanded: fsck' '
+test_expect_success 'sparse-index is not expanded: fsck' '
 	init_repos &&
 
 	# "git fsck" iterates index entries to mark reachable objects.
-	# It calls ensure_full_index() before its loop (builtin/fsck.c:885)
-	# even though sparse directory tree entries could be marked
-	# reachable directly.
-	ensure_expanded fsck
+	# Sparse directory entries store tree OIDs, so they are added
+	# as tree objects and walked to discover contained blobs.
+	ensure_not_expanded fsck
 '
 
 test_expect_success 'sparse-index is expanded: merge-index' '
