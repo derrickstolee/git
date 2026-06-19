@@ -2788,4 +2788,101 @@ test_expect_success 'sparse-index is not expanded: restore --source --staged' '
 	ensure_not_expanded restore --source update-folder1 --staged .
 '
 
+test_expect_success 'mv: file in-cone to in-cone' '
+	init_repos &&
+
+	# Moving a file within the sparse cone should work identically
+	# across all three repo types.
+	test_all_match git mv deep/a deep/moved-a &&
+	test_all_match git status --porcelain=v2 &&
+	test_all_match git diff --cached --name-status
+'
+
+test_expect_success 'mv: directory in-cone to in-cone' '
+	init_repos &&
+
+	# Moving an in-cone directory to another in-cone location.
+	test_all_match git mv deep/deeper1 deep/new-deeper &&
+	test_all_match git status --porcelain=v2 &&
+	test_all_match git diff --cached --name-status
+'
+
+test_expect_success 'mv: file in-cone to out-of-cone' '
+	init_repos &&
+
+	# Moving a file from inside the cone to outside requires --sparse.
+	# Without --sparse, it should fail.
+	test_sparse_match test_must_fail git mv deep/a folder1/z &&
+
+	# With --sparse, the file is moved and gets skip-worktree set.
+	test_all_match git mv --sparse deep/a folder1/z &&
+	test_all_match git status --porcelain=v2 &&
+	test_sparse_match git ls-files -t &&
+	git -C sparse-index ls-files -t >actual &&
+	grep "S folder1/z" actual
+'
+
+test_expect_success 'mv: file out-of-cone to in-cone' '
+	init_repos &&
+
+	# Moving a file from outside the cone to inside requires --sparse.
+	# Without --sparse, it should fail.
+	test_sparse_match test_must_fail git mv folder1/a deep/from-ooc &&
+
+	# With --sparse, the file is moved and skip-worktree is cleared.
+	test_all_match git mv --sparse folder1/a deep/from-ooc &&
+	test_all_match git status --porcelain=v2 &&
+	test_sparse_match git ls-files -t &&
+	git -C sparse-index ls-files -t >actual &&
+	grep "H deep/from-ooc" actual
+'
+
+test_expect_success 'mv: file out-of-cone to out-of-cone' '
+	init_repos &&
+
+	# Moving a file between out-of-cone locations requires --sparse.
+	test_sparse_match test_must_fail git mv folder1/a folder2/z &&
+
+	# With --sparse, the move succeeds and skip-worktree stays set.
+	test_all_match git mv --sparse folder1/a folder2/z &&
+	test_all_match git status --porcelain=v2 &&
+	test_sparse_match git ls-files -t &&
+	git -C sparse-index ls-files -t >actual &&
+	grep "S folder2/z" actual
+'
+
+test_expect_success 'mv: directory in-cone to out-of-cone' '
+	init_repos &&
+
+	# Moving an in-cone directory to outside the cone requires --sparse.
+	test_sparse_match test_must_fail git mv deep/deeper1 folder1/moved &&
+
+	# With --sparse, all entries get skip-worktree set.
+	test_all_match git mv --sparse deep/deeper1 folder1/moved &&
+	test_all_match git status --porcelain=v2 &&
+	test_sparse_match git ls-files -t &&
+	git -C sparse-index ls-files -t >actual &&
+	grep "S folder1/moved/a" actual &&
+	grep "S folder1/moved/deepest" actual
+'
+
+test_expect_success 'mv: in-cone to existing file collision' '
+	init_repos &&
+
+	# Moving to an existing in-cone file should fail without --force.
+	test_all_match test_must_fail git mv deep/a deep/e &&
+	test_all_match git mv -f deep/a deep/e &&
+	test_all_match git status --porcelain=v2 &&
+	test_all_match git diff --cached --name-status
+'
+
+test_expect_success 'sparse-index is expanded: mv with out-of-cone source' '
+	init_repos &&
+
+	# "git mv --sparse" from an out-of-cone path requires
+	# expanding the index to access individual file entries
+	# within the sparse directory.
+	ensure_expanded mv --sparse folder1/a deep/from-ooc
+'
+
 test_done
