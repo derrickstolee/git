@@ -3810,9 +3810,15 @@ void overlay_tree_on_index(struct index_state *istate,
 	if (!tree)
 		die("bad tree-ish %s", tree_name);
 
-	/* Hoist the unmerged entries up to stage #3 to make room */
-	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(istate);
+	/*
+	 * Hoist the unmerged entries up to stage #3 to make room.
+	 *
+	 * This is safe with a sparse index: sparse directory entries
+	 * are always at stage 0, so the loop below will skip them.
+	 * The subsequent read_tree() adds entries from the named tree
+	 * at stage 1, which will not conflict with sparse directory
+	 * entries (different names — files vs. directories with '/').
+	 */
 	for (i = 0; i < istate->cache_nr; i++) {
 		struct cache_entry *ce = istate->cache[i];
 		if (!ce_stage(ce))

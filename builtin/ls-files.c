@@ -760,6 +760,7 @@ int cmd_ls_files(int argc,
 		 */
 		if (show_stage || show_unmerged)
 			die(_("options '%s' and '%s' cannot be used together"), "ls-files --with-tree", "-s/-u");
+		ensure_full_index(repo->index);
 		overlay_tree_on_index(repo->index, with_tree, max_prefix);
 	}
 

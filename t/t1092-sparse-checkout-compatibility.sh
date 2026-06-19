@@ -2578,25 +2578,26 @@ test_expect_success 'commit --only with in-cone pathspec' '
 	test_all_match git diff-tree --no-commit-id -r HEAD
 '
 
-test_expect_success 'sparse-index is expanded: commit --only with pathspec' '
+test_expect_success 'sparse-index is not expanded: commit --only with pathspec' '
 	init_repos &&
 
 	# "git commit --only -- <path>" takes the COMMIT_PARTIAL path
-	# which calls list_paths() and overlay_tree_on_index(),
-	# both of which currently expand the sparse index
-	# (builtin/commit.c:273, read-cache.c:3815).
+	# which calls list_paths() and overlay_tree_on_index().
+	# When the pathspec is within the sparse cone, no expansion
+	# is needed: sparse directory entries are always stage 0 and
+	# cannot match file pathspecs.
 	test_sparse_match git checkout -b commit-only-expand base &&
 	echo change >>sparse-index/deep/a &&
 	git -C sparse-index add deep/a &&
-	ensure_expanded commit --only -m "partial commit" -- deep/a
+	ensure_not_expanded commit --only -m "partial commit" -- deep/a
 '
 
 test_expect_success 'sparse-index is expanded: commit --only with magic pathspec' '
 	init_repos &&
 
 	# When the pathspec uses magic (e.g., :(glob)), the index
-	# is expanded because pathspec_needs_expanded_index() returns
-	# true for any magic pathspec.
+	# is expanded because pathspec_needs_expanded_index() conservatively
+	# returns true for any magic pathspec.
 	test_sparse_match git checkout -b commit-only-magic base &&
 	echo change >>sparse-index/deep/a &&
 	git -C sparse-index add deep/a &&

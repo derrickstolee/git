@@ -38,6 +38,7 @@
 #include "sequencer.h"
 #include "sparse-index.h"
 #include "mailmap.h"
+#include "pathspec.h"
 #include "help.h"
 #include "commit-reach.h"
 #include "commit-graph.h"
@@ -269,8 +270,15 @@ static int list_paths(struct string_list *list, const char *with_tree,
 		free(max_prefix);
 	}
 
-	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(the_repository->index);
+	/*
+	 * If the pathspec might match entries inside a sparse directory,
+	 * we need to expand the index.  Otherwise, sparse directory entries
+	 * are always stage 0 and have names ending in '/', so they cannot
+	 * match file pathspecs and will be naturally skipped by
+	 * ce_path_match() in the loop below.
+	 */
+	if (pathspec_needs_expanded_index(the_repository->index, pattern))
+		ensure_full_index(the_repository->index);
 	for (i = 0; i < the_repository->index->cache_nr; i++) {
 		const struct cache_entry *ce = the_repository->index->cache[i];
 		struct string_list_item *item;
