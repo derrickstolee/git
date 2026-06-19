@@ -14,8 +14,8 @@
 #include "preload-index.h"
 #include "dir.h"
 #include "read-cache.h"
+#include "repo-settings.h"
 #include "setup.h"
-#include "sparse-index.h"
 #include "submodule.h"
 #include "submodule-config.h"
 #include "string-list.h"
@@ -3601,8 +3601,14 @@ static void die_on_index_match(const char *path, int force)
 	if (ps.nr) {
 		char *ps_matched = xcalloc(ps.nr, 1);
 
-		/* TODO: audit for interaction with sparse-index. */
-		ensure_full_index(the_repository->index);
+		/*
+		 * Cone-mode sparse-checkout never collapses directories
+		 * that contain submodules, so gitlink entries are always
+		 * visible. Non-gitlink entries inside sparse directories
+		 * won't match this single-path pathspec, which is correct:
+		 * we can only add submodules where the worktree exists
+		 * (inside the cone).
+		 */
 
 		/*
 		 * Since there is only one pathspec, we just need to
@@ -3831,6 +3837,10 @@ int cmd_submodule__helper(int argc,
 		OPT_END()
 	};
 	argc = parse_options(argc, argv, prefix, options, usage, 0);
+
+	repo_config(the_repository, git_default_config, NULL);
+	prepare_repo_settings(the_repository);
+	the_repository->settings.command_requires_full_index = 0;
 
 	return fn(argc, argv, prefix, repo);
 }

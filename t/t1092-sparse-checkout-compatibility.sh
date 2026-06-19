@@ -2681,7 +2681,7 @@ test_expect_success 'sparse-index is not expanded: am' '
 	ensure_not_expanded am "$(pwd)/am-patches/0001-update-deep.patch"
 '
 
-test_expect_success 'sparse-index is expanded: submodule status' '
+test_expect_success 'sparse-index is not expanded: submodule status' '
 	init_repos &&
 
 	# Add a submodule so there is something for "submodule status"
@@ -2696,7 +2696,7 @@ test_expect_success 'sparse-index is expanded: submodule status' '
 	# gitlinks. Since cone-mode sparse-checkout never collapses
 	# directories containing submodules, the gitlink entries are
 	# always visible and no expansion should be needed.
-	ensure_expanded submodule status
+	ensure_not_expanded submodule status
 '
 
 test_expect_success 'merge -s ours' '
