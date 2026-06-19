@@ -2564,19 +2564,43 @@ test_expect_success 'cat-file --batch' '
 # As each guard is made sparse-aware, flip ensure_expanded to
 # ensure_not_expanded.
 
+test_expect_success 'commit --only with in-cone pathspec' '
+	init_repos &&
+
+	# Stage a change and also make a working-tree change to a
+	# different file.  "git commit --only -- deep/a" should
+	# commit only the staged change to deep/a.
+	test_all_match git checkout -b commit-only-test base &&
+	run_on_all sh -c "echo change >>deep/a && git add deep/a" &&
+	run_on_all sh -c "echo other >>deep/deeper1/a && git add deep/deeper1/a" &&
+	test_all_match git commit --only -m "partial commit" -- deep/a &&
+	test_all_match git rev-parse HEAD^{tree} &&
+	test_all_match git diff-tree --no-commit-id -r HEAD
+'
+
 test_expect_success 'sparse-index is expanded: commit --only with pathspec' '
 	init_repos &&
 
 	# "git commit --only -- <path>" takes the COMMIT_PARTIAL path
-	# which calls list_paths(), iterating the full index
-	# (builtin/commit.c:273).
+	# which calls list_paths() and overlay_tree_on_index(),
+	# both of which currently expand the sparse index
+	# (builtin/commit.c:273, read-cache.c:3815).
+	test_sparse_match git checkout -b commit-only-expand base &&
 	echo change >>sparse-index/deep/a &&
 	git -C sparse-index add deep/a &&
-	rm -f trace2.txt &&
-	GIT_TRACE2_EVENT="$(pwd)/trace2.txt" \
-		git -C sparse-index commit -m "partial commit" --only -- deep/a \
-		>sparse-index-out 2>sparse-index-error &&
-	test_region index ensure_full_index trace2.txt
+	ensure_expanded commit --only -m "partial commit" -- deep/a
+'
+
+test_expect_success 'sparse-index is expanded: commit --only with magic pathspec' '
+	init_repos &&
+
+	# When the pathspec uses magic (e.g., :(glob)), the index
+	# is expanded because pathspec_needs_expanded_index() returns
+	# true for any magic pathspec.
+	test_sparse_match git checkout -b commit-only-magic base &&
+	echo change >>sparse-index/deep/a &&
+	git -C sparse-index add deep/a &&
+	ensure_expanded commit --only -m "partial magic" -- ":(glob)deep/a"
 '
 
 test_expect_success 'sparse-index is not expanded: commit on orphan branch' '
