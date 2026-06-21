@@ -2876,6 +2876,15 @@ test_expect_success 'mv: in-cone to existing file collision' '
 	test_all_match git diff --cached --name-status
 '
 
+test_expect_success 'sparse-index is not expanded: mv in-cone' '
+	init_repos &&
+
+	# Moving a file within the sparse-checkout cone does not
+	# require expanding the index since those entries are
+	# already individual in the sparse index.
+	ensure_not_expanded mv deep/a deep/moved-a
+'
+
 test_expect_success 'sparse-index is expanded: mv with out-of-cone source' '
 	init_repos &&
 

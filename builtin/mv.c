@@ -24,9 +24,11 @@
 #include "read-cache-ll.h"
 
 #include "setup.h"
+#include "sparse-index.h"
 #include "strvec.h"
 #include "submodule.h"
 #include "entry.h"
+#include "repository.h"
 
 static const char * const builtin_mv_usage[] = {
 	N_("git mv [-v] [-f] [-n] [-k] <source> <destination>"),
@@ -149,19 +151,25 @@ static int empty_dir_has_sparse_contents(const char *name)
 	char *with_slash = add_slash(name);
 	int length = strlen(with_slash);
 
-	int pos = index_name_pos(the_repository->index, with_slash, length);
+	int pos = index_name_pos_sparse(the_repository->index, with_slash, length);
 	const struct cache_entry *ce;
 
-	if (pos < 0) {
-		pos = -pos - 1;
-		if (pos >= the_repository->index->cache_nr)
-			goto free_return;
+	if (pos >= 0) {
+		/* Exact match: sparse directory entry in a sparse index */
 		ce = the_repository->index->cache[pos];
-		if (strncmp(with_slash, ce->name, length))
-			goto free_return;
-		if (ce_skip_worktree(ce))
+		if (S_ISSPARSEDIR(ce->ce_mode))
 			ret = 1;
+		goto free_return;
 	}
+
+	pos = -pos - 1;
+	if (pos >= the_repository->index->cache_nr)
+		goto free_return;
+	ce = the_repository->index->cache[pos];
+	if (strncmp(with_slash, ce->name, length))
+		goto free_return;
+	if (ce_skip_worktree(ce))
+		ret = 1;
 
 free_return:
 	free(with_slash);
@@ -241,6 +249,8 @@ int cmd_mv(int argc,
 	struct repo_config_values *cfg = repo_config_values(the_repository);
 
 	repo_config(the_repository, git_default_config, NULL);
+	prepare_repo_settings(the_repository);
+	the_repository->settings.command_requires_full_index = 0;
 
 	argc = parse_options(argc, argv, prefix, builtin_mv_options,
 			     builtin_mv_usage, 0);
@@ -250,6 +260,16 @@ int cmd_mv(int argc,
 	repo_hold_locked_index(the_repository, &lock_file, LOCK_DIE_ON_ERROR);
 	if (repo_read_index(the_repository) < 0)
 		die(_("index file corrupt"));
+
+	/*
+	 * When --sparse is used, we may need to operate on entries outside
+	 * the sparse-checkout cone which requires a full index. Expand now
+	 * so that the rest of the command works on individual file entries.
+	 * Without --sparse, only in-cone moves are allowed, and those
+	 * entries are already expanded in the sparse index.
+	 */
+	if (ignore_sparse)
+		ensure_full_index(the_repository->index);
 
 	internal_prefix_pathspec(&sources, prefix, argv, argc, 0);
 	CALLOC_ARRAY(modes, argc);
