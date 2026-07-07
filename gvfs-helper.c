@@ -390,6 +390,7 @@ static struct gh__global {
 	unsigned long connect_timeout_ms;
 
 	int prefetch_threads;
+	int post_threads;
 } gh__global;
 
 enum gh__server_type {
@@ -3920,8 +3921,142 @@ cleanup:
 }
 
 /*
+ * Context for parallel POST workers.  Each worker is a child
+ * `gvfs-helper post` process that handles a subset of OIDs.
+ */
+struct post_parallel_ctx {
+	/*
+	 * All OIDs flattened into an array of hex strings so that we
+	 * can partition them across workers without an iterator.
+	 */
+	struct strbuf *oid_hex_array;
+	unsigned long nr_oids;
+
+	/* Per-worker partitioning */
+	int nr_workers;
+	int next_worker;
+
+	/* Shared state for results */
+	struct string_list *result_list;
+	struct gh__response_status *status;
+	int had_404;
+	struct strbuf err404;
+
+	struct progress *progress;
+	int nr_finished;
+};
+
+struct post_worker_task {
+	unsigned long oid_start;
+	unsigned long oid_count;
+	int worker_id;
+};
+
+static int post_get_next_task(struct child_process *cp,
+			      struct strbuf *out UNUSED,
+			      void *pp_cb,
+			      void **pp_task_cb)
+{
+	struct post_parallel_ctx *ctx = pp_cb;
+	struct post_worker_task *task;
+	unsigned long per_worker, start;
+
+	if (ctx->next_worker >= ctx->nr_workers)
+		return 0;
+
+	per_worker = (ctx->nr_oids + ctx->nr_workers - 1) / ctx->nr_workers;
+	start = (unsigned long)ctx->next_worker * per_worker;
+	if (start >= ctx->nr_oids)
+		return 0;
+
+	CALLOC_ARRAY(task, 1);
+	task->oid_start = start;
+	task->oid_count = MY_MIN(per_worker, ctx->nr_oids - start);
+	task->worker_id = ctx->next_worker;
+	*pp_task_cb = task;
+	ctx->next_worker++;
+
+	cp->git_cmd = 1;
+	strvec_push(&cp->args, "gvfs-helper");
+	if (gh__cmd_opts.remote_name)
+		strvec_pushf(&cp->args, "--remote=%s",
+			     gh__cmd_opts.remote_name);
+	if (gh__cmd_opts.try_fallback)
+		strvec_push(&cp->args, "--fallback");
+	if (gh__global.buf_odb_path.len)
+		strvec_pushf(&cp->args, "--shared-cache=%s",
+			     gh__global.buf_odb_path.buf);
+	strvec_push(&cp->args, "--no-progress");
+	strvec_push(&cp->args, "post");
+	strvec_pushf(&cp->args, "--block-size=%u", gh__cmd_opts.block_size);
+	strvec_pushf(&cp->args, "--depth=%d", gh__cmd_opts.depth);
+	strvec_pushf(&cp->args, "--max-retries=%d", gh__cmd_opts.max_retries);
+
+	cp->in = -1;
+
+	return 1;
+}
+
+static int post_feed_pipe(int child_in, void *pp_cb, void *pp_task_cb)
+{
+	struct post_parallel_ctx *ctx = pp_cb;
+	struct post_worker_task *task = pp_task_cb;
+	unsigned long k;
+
+	for (k = task->oid_start; k < task->oid_start + task->oid_count; k++)
+		write_in_full(child_in, ctx->oid_hex_array[k].buf,
+			      ctx->oid_hex_array[k].len);
+
+	/* Signal EOF to the child */
+	return 1;
+}
+
+static int post_task_finished(int result,
+			      struct strbuf *out,
+			      void *pp_cb,
+			      void *pp_task_cb)
+{
+	struct post_parallel_ctx *ctx = pp_cb;
+	struct post_worker_task *task = pp_task_cb;
+
+	ctx->nr_finished++;
+	display_progress(ctx->progress, ctx->nr_finished);
+
+	if (result) {
+		if (ctx->status->ec == GH__ERROR_CODE__OK) {
+			strbuf_addf(&ctx->status->error_message,
+				    "post worker %d failed (exit %d)",
+				    task->worker_id, result);
+			ctx->status->ec = GH__ERROR_CODE__INDEX_PACK_FAILED;
+		}
+	} else if (out && out->len) {
+		/*
+		 * Parse stdout from child.  Each line is either a result
+		 * message (e.g. "packfile ...") or empty.
+		 */
+		struct string_list lines = STRING_LIST_INIT_DUP;
+		size_t i;
+
+		string_list_split(&lines, out->buf, "\n", -1);
+		for (i = 0; i < lines.nr; i++) {
+			if (lines.items[i].string[0])
+				string_list_append(ctx->result_list,
+						   lines.items[i].string);
+		}
+		string_list_clear(&lines, 0);
+	}
+
+	free(task);
+	return 0;
+}
+
+/*
  * Drive one or more HTTP POST requests to bulk fetch the objects in
  * the given OIDSET.  Create one or more packfiles and/or loose objects.
+ *
+ * When gvfs.postThreads > 1, spawn that many child gvfs-helper processes
+ * to do the downloads in parallel.  Each child handles a partition of the
+ * OID set and runs its own HTTP + index-pack pipeline.
  *
  * Accumulate results for each request in `result_list` until we get a
  * hard error and have to stop.
@@ -3942,6 +4077,69 @@ static void do__http_post__fetch_oidset(struct gh__response_status *status,
 	gh__response_status__zero(status);
 	if (!nr_oid_total)
 		return;
+
+	if (gh__global.post_threads > 1 && nr_oid_total > 1) {
+		const struct object_id *oid;
+		struct strbuf *oid_hex_array;
+		int nr_workers;
+		struct post_parallel_ctx pctx;
+		struct run_process_parallel_opts pp_opts;
+
+		trace2_data_intmax(TR2_CAT, NULL,
+				   "post/parallel_mode",
+				   gh__global.post_threads);
+
+		/*
+		 * Drain the oidset into a flat array so we can
+		 * partition it across workers.
+		 */
+		CALLOC_ARRAY(oid_hex_array, nr_oid_total);
+		oidset_iter_init(oids, &iter);
+		for (k = 0; (oid = oidset_iter_next(&iter)); k++) {
+			strbuf_init(&oid_hex_array[k],
+				    the_hash_algo->hexsz + 1);
+			strbuf_addf(&oid_hex_array[k], "%s\n",
+				    oid_to_hex(oid));
+		}
+
+		nr_workers = MY_MIN((int)nr_oid_total,
+				    gh__global.post_threads);
+
+		memset(&pctx, 0, sizeof(pctx));
+		pctx.oid_hex_array = oid_hex_array;
+		pctx.nr_oids = nr_oid_total;
+		pctx.nr_workers = nr_workers;
+		pctx.next_worker = 0;
+		pctx.result_list = result_list;
+		pctx.status = status;
+		pctx.had_404 = 0;
+		strbuf_init(&pctx.err404, 0);
+		pctx.nr_finished = 0;
+
+		memset(&pp_opts, 0, sizeof(pp_opts));
+		pp_opts.tr2_category = TR2_CAT;
+		pp_opts.tr2_label = "post/parallel";
+		pp_opts.processes = nr_workers;
+		pp_opts.get_next_task = post_get_next_task;
+		pp_opts.feed_pipe = post_feed_pipe;
+		pp_opts.task_finished = post_task_finished;
+		pp_opts.data = &pctx;
+
+		if (gh__cmd_opts.show_progress)
+			pctx.progress = start_progress(
+				the_repository,
+				"Fetching objects (parallel)", nr_workers);
+
+		run_processes_parallel(&pp_opts);
+
+		stop_progress(&pctx.progress);
+
+		for (k = 0; k < nr_oid_total; k++)
+			strbuf_release(&oid_hex_array[k]);
+		free(oid_hex_array);
+		strbuf_release(&pctx.err404);
+		return;
+	}
 
 	oidset_iter_init(oids, &iter);
 
@@ -4690,6 +4888,16 @@ int cmd_main(int argc, const char **argv)
 			    &gh__global.prefetch_threads);
 	if (gh__global.prefetch_threads < 1)
 		gh__global.prefetch_threads = 1;
+
+	/*
+	 * Read gvfs.postThreads to control parallel POST requests.
+	 * Default to 1 (sequential) for backward compatibility.
+	 */
+	gh__global.post_threads = 1;
+	repo_config_get_int(the_repository, "gvfs.postthreads",
+			    &gh__global.post_threads);
+	if (gh__global.post_threads < 1)
+		gh__global.post_threads = 1;
 
 	argc = parse_options(argc, argv, NULL, main_options, main_usage,
 			     PARSE_OPT_STOP_AT_NON_OPTION);
