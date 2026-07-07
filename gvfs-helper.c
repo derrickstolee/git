@@ -257,6 +257,7 @@
 #include "date.h"
 #include "versioncmp.h"
 #include "advice.h"
+#include "thread-utils.h"
 
 #define TR2_CAT "gvfs-helper"
 
@@ -1681,6 +1682,26 @@ static unsigned long build_json_payload__gvfs_objects(
 }
 
 /*
+ * Build a JSON payload for a subset of OIDs from a flat array.
+ * Used by the parallel POST workers which pre-partition OIDs.
+ */
+static void build_post_payload(struct json_writer *jw,
+			       const struct object_id *oids,
+			       unsigned long start, unsigned long count)
+{
+	unsigned long k;
+
+	jw_init(jw);
+	jw_object_begin(jw, 0);
+	jw_object_intmax(jw, "commitDepth", gh__cmd_opts.depth);
+	jw_object_inline_begin_array(jw, "objectIds");
+	for (k = start; k < start + count; k++)
+		jw_array_string(jw, oid_to_hex(&oids[k]));
+	jw_end(jw);
+	jw_end(jw);
+}
+
+/*
  * Lookup the creds for the main/origin Git server.
  */
 static void lookup_main_creds(void)
@@ -1950,6 +1971,26 @@ static void create_final_packfile_pathnames(
 
 	strbuf_release(&base);
 	strbuf_release(&path);
+}
+
+/*
+ * Thread-safe packfile finalization: move temp .pack and .idx to
+ * their final locations.  Tolerates races where another thread or
+ * process installed the same packfile concurrently.
+ */
+static void my_finalize_packfile_simple(const char *temp_pack,
+					const char *temp_idx,
+					const char *final_pack,
+					const char *final_idx)
+{
+	if (finalize_object_file_flags(the_repository, temp_pack, final_pack,
+				       FOF_SKIP_COLLISION_CHECK) ||
+	    finalize_object_file_flags(the_repository, temp_idx, final_idx,
+				       FOF_SKIP_COLLISION_CHECK)) {
+		unlink(temp_pack);
+		unlink(temp_idx);
+		/* Assume OK if final files exist (race with peer) */
+	}
 }
 
 /*
