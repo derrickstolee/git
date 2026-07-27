@@ -66,3 +66,10 @@ gvfs.postThreads::
 	downloads multiple batches of objects concurrently when the POST
 	block size is at least `100`. Values less than `1` are treated as
 	`1`.
+
+gvfs.prefetchScope::
+	If set to a string, then the value is sent as the `scope` parameter
+	on `gvfs/prefetch` REST API requests. This corresponds to a
+	sparse-checkout scope for which the server has precomputed a
+	restricted prefetch packfile set that excludes trees outside of
+	that sparse-checkout cone.
