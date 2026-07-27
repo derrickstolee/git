@@ -390,6 +390,7 @@ static struct gh__global {
 	unsigned long connect_timeout_ms;
 
 	int prefetch_threads;
+	char *prefetch_scope;
 } gh__global;
 
 enum gh__server_type {
@@ -3817,6 +3818,12 @@ static void do__http_get__gvfs_prefetch(struct gh__response_status *status,
 		strbuf_addf(&component_url, "?lastPackTimestamp=%"PRItime,
 			    seconds_since_epoch);
 
+	if (gh__global.prefetch_scope && *gh__global.prefetch_scope)
+		strbuf_addf(&component_url, "%cscope=%s",
+			    component_url.len > strlen("gvfs/prefetch") ?
+			    '&' : '?',
+			    gh__global.prefetch_scope);
+
 	trace2_data_intmax(TR2_CAT, the_repository,
 			   "prefetch/since",
 			   seconds_since_epoch);
@@ -4690,6 +4697,14 @@ int cmd_main(int argc, const char **argv)
 			    &gh__global.prefetch_threads);
 	if (gh__global.prefetch_threads < 1)
 		gh__global.prefetch_threads = 1;
+
+	/*
+	 * Read gvfs.prefetchScope to request a restricted prefetch
+	 * packfile set corresponding to a sparse-checkout scope
+	 * precomputed by the server.
+	 */
+	repo_config_get_string(the_repository, "gvfs.prefetchscope",
+				&gh__global.prefetch_scope);
 
 	argc = parse_options(argc, argv, NULL, main_options, main_usage,
 			     PARSE_OPT_STOP_AT_NON_OPTION);
