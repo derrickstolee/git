@@ -11,7 +11,7 @@ SYNOPSIS
 scalar clone [--single-branch] [--branch <main-branch>] [--full-clone]
 	[--[no-]src] [--[no-]tags] [--[no-]maintenance]
 	[--cache-server-url <url>] [--[verb]-cache-server-url <url>]
-	[--local-cache-path <path>] <url> [<enlistment>]
+	[--local-cache-path <path>] [--scope <scope>] <url> [<enlistment>]
 scalar list
 scalar register [--[no-]maintenance] [<enlistment>]
 scalar unregister [<enlistment>]
@@ -125,6 +125,13 @@ clone), and `~/.scalarCache` on macOS.
 	Set the appropriate `gvfs.<verb>.cache-server` config value that overrides
 	the provided `--cache-server-url` or the dynamically discovered URL. The
 	list of allowed verbs is `prefetch`, `get`, and `post`.
+
+--scope <scope>::
+	Set the `gvfs.prefetchScope` config value, which is sent as the
+	`scope` parameter on `gvfs/prefetch` requests. This corresponds to a
+	sparse-checkout scope for which the server has precomputed a
+	restricted prefetch packfile set that excludes trees outside of
+	that sparse-checkout cone.
 
 --gvfs-protocol::
 --no-gvfs-protocol::

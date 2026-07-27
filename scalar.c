@@ -786,6 +786,7 @@ static int cmd_clone(int argc, const char **argv)
 	const char *prefetch_server = NULL, *get_server = NULL, *post_server = NULL;
 	int gvfs_protocol = -1;
 	const char *ref_format = NULL;
+	const char *scope = NULL;
 
 	struct option clone_options[] = {
 		OPT_STRING('b', "branch", &branch, N_("<branch>"),
@@ -820,6 +821,9 @@ static int cmd_clone(int argc, const char **argv)
 			   N_("override the path for the local Scalar cache")),
 		OPT_STRING(0, "ref-format", &ref_format, N_("format"),
 			   N_("specify the reference format to use")),
+		OPT_STRING(0, "scope", &scope, N_("<scope>"),
+			   N_("restrict prefetch packfiles to this "
+			      "sparse-checkout scope")),
 		OPT_HIDDEN_BOOL(0, "no-fetch-commits-and-trees",
 				&dummy, N_("no longer used")),
 		OPT_END(),
@@ -828,7 +832,8 @@ static int cmd_clone(int argc, const char **argv)
 		N_("scalar clone [--single-branch] [--branch <main-branch>] [--full-clone]\n"
 		   "\t[--[no-]src] [--[no-]tags] [--[no-]maintenance] [--ref-format <format>]\n"
 		   "\t[--cache-server-url <url>] [--[verb]-cache-server-url <url>]\n"
-		   "\t[--local-cache-path <path>] <url> [<enlistment>]"),
+		   "\t[--local-cache-path <path>] [--scope <scope>]\n"
+		   "\t<url> [<enlistment>]"),
 		NULL
 	};
 	const char *url;
@@ -1017,6 +1022,13 @@ static int cmd_clone(int argc, const char **argv)
 		if (post_server)
 			fprintf(stderr, "Objects POST cache server URL: %s\n",
 				post_server);
+
+		if (scope && set_config("gvfs.prefetchScope=%s", scope)) {
+			res = error(_("could not configure prefetch scope"));
+			goto cleanup;
+		}
+		if (scope)
+			fprintf(stderr, "Prefetch scope: %s\n", scope);
 	} else {
 		if (set_config("core.useGVFSHelper=false") ||
 		    set_config("remote.origin.promisor=true") ||
