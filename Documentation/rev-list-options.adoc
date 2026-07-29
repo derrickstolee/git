@@ -1000,6 +1000,17 @@ specification contained in the blob (or blob-expression) _<blob-ish>_
 to omit blobs that would not be required for a sparse checkout on
 the requested refs.
 +
+The form `--filter=treesparse:oid=<blob-ish>` uses a cone-mode
+sparse-checkout specification contained in the blob (or
+blob-expression) _<blob-ish>_ to omit tree objects (and their
+descendant blobs) that lie outside of the sparse-checkout cone. Unlike
+`sparse:oid`, which only omits blobs, `treesparse:oid` also omits
+trees, producing a smaller object set for commands that only need
+objects within a given cone. This filter can only be used together
+with `--path-walk` (see linkgit:git-pack-objects[1]), and it can be
+combined with `blob:none` (e.g. via `--filter=combine:` or by
+repeating `--filter=`) to omit blobs entirely as well.
++
 The form `--filter=tree:<depth>` omits all blobs and trees whose depth
 from the root tree is >= _<depth>_ (minimum depth if an object is located
 at multiple depths in the commits traversed). _<depth>_=0 will not include

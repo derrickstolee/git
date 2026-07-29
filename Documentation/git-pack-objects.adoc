@@ -406,9 +406,12 @@ When `--use-bitmap-index` is specified with `--path-walk`, a successful
 bitmap traversal is used for object enumeration, with path-walk
 remaining as the fallback traversal when the bitmap cannot satisfy the
 request. The `--path-walk` option supports the `--filter=<spec>` forms
-`blob:none`, `blob:limit=<n>`, `tree:0`, `object:type=<type>`, and
-`sparse:<oid>`. These supported filter types can be combined with the
-`combine:<spec>+<spec>` form.
+`blob:none`, `blob:limit=<n>`, `tree:0`, `object:type=<type>`,
+`sparse:<oid>`, and `treesparse:<oid>`.
+These supported filter types can be combined with the
+`combine:<spec>+<spec>` form. The `treesparse:<oid>` filter (see
+linkgit:git-rev-list[1]) requires `--path-walk` and will cause an
+error if `--path-walk` is not in effect.
 
 
 DELTA ISLANDS

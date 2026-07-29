@@ -30,6 +30,8 @@ const char *list_object_filter_config_name(enum list_objects_filter_choice c)
 		return "tree";
 	case LOFC_SPARSE_OID:
 		return "sparse:oid";
+	case LOFC_TREE_SPARSE_OID:
+		return "treesparse:oid";
 	case LOFC_OBJECT_TYPE:
 		return "object:type";
 	case LOFC_COMBINE:
@@ -84,6 +86,11 @@ int gently_parse_list_objects_filter(
 	} else if (skip_prefix(arg, "sparse:oid=", &v0)) {
 		filter_options->sparse_oid_name = xstrdup(v0);
 		filter_options->choice = LOFC_SPARSE_OID;
+		return 0;
+
+	} else if (skip_prefix(arg, "treesparse:oid=", &v0)) {
+		filter_options->sparse_oid_name = xstrdup(v0);
+		filter_options->choice = LOFC_TREE_SPARSE_OID;
 		return 0;
 
 	} else if (skip_prefix(arg, "sparse:path=", &v0)) {
@@ -437,6 +444,21 @@ void list_objects_filter_copy(
 	ALLOC_ARRAY(dest->sub, dest->sub_alloc);
 	for (size_t i = 0; i < src->sub_nr; i++)
 		list_objects_filter_copy(&dest->sub[i], &src->sub[i]);
+}
+
+int list_objects_filter_choice_contains(
+	const struct list_objects_filter_options *filter_options,
+	enum list_objects_filter_choice choice)
+{
+	if (filter_options->choice == choice)
+		return 1;
+	if (filter_options->choice == LOFC_COMBINE) {
+		for (size_t i = 0; i < filter_options->sub_nr; i++)
+			if (list_objects_filter_choice_contains(
+				    &filter_options->sub[i], choice))
+				return 1;
+	}
+	return 0;
 }
 
 void list_objects_filter_init(struct list_objects_filter_options *filter_options)

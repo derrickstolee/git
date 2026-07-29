@@ -37,6 +37,10 @@ void test_list_objects_filter_options__regular_filters(void)
 	check_gentle_parse("blob:limit=5k", 1, 1, LOFC_BLOB_LIMIT);
 	check_gentle_parse("combine:blob:none+tree:0", 1, 0, LOFC_COMBINE);
 	check_gentle_parse("combine:blob:none+tree:0", 1, 1, LOFC_COMBINE);
+	check_gentle_parse("sparse:oid=abcd", 1, 0, LOFC_SPARSE_OID);
+	check_gentle_parse("treesparse:oid=abcd", 1, 0, LOFC_TREE_SPARSE_OID);
+	check_gentle_parse("combine:treesparse:oid=abcd+blob:none", 1, 0,
+			   LOFC_COMBINE);
 }
 
 void test_list_objects_filter_options__auto_allowed(void)

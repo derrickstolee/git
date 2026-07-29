@@ -752,6 +752,13 @@ static void filter_auto__init(
 	BUG("LOFC_AUTO should have been resolved before initializing the filter");
 }
 
+static void filter_tree_sparse_oid__init(
+	struct list_objects_filter_options *filter_options UNUSED,
+	struct filter *filter UNUSED)
+{
+	die(_("filter 'treesparse:oid' requires --path-walk"));
+}
+
 typedef void (*filter_init_fn)(
 	struct list_objects_filter_options *filter_options,
 	struct filter *filter);
@@ -765,6 +772,7 @@ static filter_init_fn s_filters[] = {
 	filter_blobs_limit__init,
 	filter_trees_depth__init,
 	filter_sparse_oid__init,
+	filter_tree_sparse_oid__init,
 	filter_object_type__init,
 	filter_combine__init,
 	filter_auto__init,
