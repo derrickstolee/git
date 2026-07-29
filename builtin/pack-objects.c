@@ -5213,6 +5213,10 @@ int cmd_pack_objects(int argc,
 			path_walk = 0;
 		}
 	}
+	if (!path_walk &&
+	    list_objects_filter_choice_contains(&filter_options,
+						LOFC_TREE_SPARSE_OID))
+		die(_("--filter=treesparse:oid=<oid> requires --path-walk"));
 	if (path_walk) {
 		strvec_push(&rp, "--boundary");
 		strvec_push(&rp, "--objects");

@@ -16,6 +16,7 @@ enum list_objects_filter_choice {
 	LOFC_BLOB_LIMIT,
 	LOFC_TREE_DEPTH,
 	LOFC_SPARSE_OID,
+	LOFC_TREE_SPARSE_OID,
 	LOFC_OBJECT_TYPE,
 	LOFC_COMBINE,
 	LOFC_AUTO,
@@ -167,5 +168,13 @@ void partial_clone_get_default_filter_spec(
 void list_objects_filter_copy(
 	struct list_objects_filter_options *dest,
 	const struct list_objects_filter_options *src);
+
+/*
+ * Returns 1 if 'filter_options' uses the given 'choice', either directly
+ * or as one of the sub-filters of a "combine:" filter spec.
+ */
+int list_objects_filter_choice_contains(
+	const struct list_objects_filter_options *filter_options,
+	enum list_objects_filter_choice choice);
 
 #endif /* LIST_OBJECTS_FILTER_OPTIONS_H */

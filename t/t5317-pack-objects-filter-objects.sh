@@ -603,4 +603,62 @@ test_expect_success 'shared tree OID: --path-walk blobs match standard' '
 	test_cmp shared_std_blobs shared_pw_blobs
 '
 
+# Test the treesparse:oid=<oid> filter, which (unlike sparse:oid) also
+# excludes trees (and their contained blobs) that fall outside of the
+# cone-mode sparse-checkout definition.
+
+test_expect_success 'treesparse:oid= requires --path-walk' '
+	oid=$(cat sparse_oid) &&
+	test_must_fail git -C pw_sparse pack-objects --revs --stdout \
+		--filter=treesparse:oid=$oid \
+		>treesparse_err.pack 2>err <<-EOF &&
+	HEAD
+	EOF
+	test_grep "requires --path-walk" err
+'
+
+test_expect_success 'treesparse:oid= excludes out-of-cone trees and blobs' '
+	oid=$(cat sparse_oid) &&
+	inc_tree=$(git -C pw_sparse rev-parse HEAD:inc) &&
+	inc_blob=$(git -C pw_sparse rev-parse HEAD:inc/file1) &&
+	exc_tree=$(git -C pw_sparse rev-parse HEAD:exc) &&
+	exc_blob=$(git -C pw_sparse rev-parse HEAD:exc/file1) &&
+
+	git -C pw_sparse pack-objects --revs --stdout \
+		--path-walk --filter=treesparse:oid=$oid \
+		>treesparse.pack <<-EOF &&
+	HEAD
+	EOF
+	git -C pw_sparse index-pack ../treesparse.pack &&
+	git -C pw_sparse verify-pack -v ../treesparse.pack \
+		>treesparse_verify &&
+
+	test_grep "$inc_tree" treesparse_verify &&
+	test_grep "$inc_blob" treesparse_verify &&
+	test_grep ! "$exc_tree" treesparse_verify &&
+	test_grep ! "$exc_blob" treesparse_verify
+'
+
+test_expect_success 'combine:treesparse:oid=+blob:none excludes all blobs' '
+	oid=$(cat sparse_oid) &&
+	inc_tree=$(git -C pw_sparse rev-parse HEAD:inc) &&
+	inc_blob=$(git -C pw_sparse rev-parse HEAD:inc/file1) &&
+	exc_tree=$(git -C pw_sparse rev-parse HEAD:exc) &&
+
+	git -C pw_sparse pack-objects --revs --stdout \
+		--path-walk \
+		--filter=combine:treesparse:oid=$oid+blob:none \
+		>treesparse_noblob.pack <<-EOF &&
+	HEAD
+	EOF
+	git -C pw_sparse index-pack ../treesparse_noblob.pack &&
+	git -C pw_sparse verify-pack -v ../treesparse_noblob.pack \
+		>treesparse_noblob_verify &&
+
+	test_grep "$inc_tree" treesparse_noblob_verify &&
+	test_grep ! "$inc_blob" treesparse_noblob_verify &&
+	test_grep ! "$exc_tree" treesparse_noblob_verify &&
+	test_grep ! " blob " treesparse_noblob_verify
+'
+
 test_done

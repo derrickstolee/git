@@ -571,6 +571,59 @@ static int setup_pending_objects(struct path_walk_info *info,
 	return 0;
 }
 
+/*
+ * Load the cone-mode sparse-checkout patterns stored in the blob named by
+ * 'options->sparse_oid_name' into 'info->pl'. When 'sparse_trees' is
+ * nonzero, out-of-cone tree objects are pruned from the walk in addition
+ * to out-of-cone blobs (see 'pl_sparse_trees' in path-walk.h).
+ */
+static int load_sparse_oid_filter(struct path_walk_info *info,
+				  struct list_objects_filter_options *options,
+				  int sparse_trees)
+{
+	if (info) {
+		struct object_id sparse_oid;
+		struct repository *repo = info->revs->repo;
+
+		if (info->pl) {
+			warning(_("sparse filter cannot be combined with "
+				  "existing sparse patterns"));
+			return 0;
+		}
+
+		if (repo_get_oid_with_flags(repo,
+					    options->sparse_oid_name,
+					    &sparse_oid,
+					    GET_OID_BLOB)) {
+			error(_("unable to access sparse blob in '%s'"),
+			      options->sparse_oid_name);
+			return 0;
+		}
+
+		CALLOC_ARRAY(info->pl, 1);
+		info->pl->use_cone_patterns = 1;
+
+		if (add_patterns_from_blob_to_list(&sparse_oid, "", 0,
+						   info->pl) < 0) {
+			clear_pattern_list(info->pl);
+			FREE_AND_NULL(info->pl);
+			error(_("unable to parse sparse filter data in '%s'"),
+			      oid_to_hex(&sparse_oid));
+			return 0;
+		}
+
+		if (!info->pl->use_cone_patterns) {
+			clear_pattern_list(info->pl);
+			FREE_AND_NULL(info->pl);
+			warning(_("sparse filter is not cone-mode compatible"));
+			return 0;
+		}
+
+		info->pl_sparse_trees = sparse_trees;
+	}
+	return 1;
+}
+
 static int prepare_filters_one(struct path_walk_info *info,
 			       struct list_objects_filter_options *options)
 {
@@ -620,44 +673,10 @@ static int prepare_filters_one(struct path_walk_info *info,
 		return 1;
 
 	case LOFC_SPARSE_OID:
-		if (info) {
-			struct object_id sparse_oid;
-			struct repository *repo = info->revs->repo;
+		return load_sparse_oid_filter(info, options, 0);
 
-			if (info->pl) {
-				warning(_("sparse filter cannot be combined with existing sparse patterns"));
-				return 0;
-			}
-
-			if (repo_get_oid_with_flags(repo,
-						    options->sparse_oid_name,
-						    &sparse_oid,
-						    GET_OID_BLOB)) {
-				error(_("unable to access sparse blob in '%s'"),
-				      options->sparse_oid_name);
-				return 0;
-			}
-
-			CALLOC_ARRAY(info->pl, 1);
-			info->pl->use_cone_patterns = 1;
-
-			if (add_patterns_from_blob_to_list(&sparse_oid, "", 0,
-							   info->pl) < 0) {
-				clear_pattern_list(info->pl);
-				FREE_AND_NULL(info->pl);
-				error(_("unable to parse sparse filter data in '%s'"),
-				      oid_to_hex(&sparse_oid));
-				return 0;
-			}
-
-			if (!info->pl->use_cone_patterns) {
-				clear_pattern_list(info->pl);
-				FREE_AND_NULL(info->pl);
-				warning(_("sparse filter is not cone-mode compatible"));
-				return 0;
-			}
-		}
-		return 1;
+	case LOFC_TREE_SPARSE_OID:
+		return load_sparse_oid_filter(info, options, 1);
 
 	case LOFC_COMBINE:
 		for (size_t i = 0; i < options->sub_nr; i++) {
