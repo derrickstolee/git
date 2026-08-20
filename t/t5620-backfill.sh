@@ -58,6 +58,20 @@ test_expect_success 'setup bare clone for server' '
 	git -C srv.bare config --local uploadpack.allowanysha1inwant 1
 '
 
+test_expect_success 'backfill progress' '
+	git clone --no-checkout --filter=blob:none \
+		--single-branch --branch=main \
+		"file://$(pwd)/srv.bare" backfill-progress &&
+
+	GIT_PROGRESS_DELAY=0 git -C backfill-progress \
+		backfill --progress 2>err &&
+	test_grep "Exploring objects: 48, done." err &&
+
+	GIT_PROGRESS_DELAY=0 git -C backfill-progress \
+		backfill --no-progress 2>err &&
+	test_must_be_empty err
+'
+
 # Create a version of the repo with branches for testing revision
 # arguments like --all, --first-parent, and --since.
 #
