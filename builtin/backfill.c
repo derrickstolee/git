@@ -26,16 +26,21 @@
 #include "path-walk.h"
 
 static const char * const builtin_backfill_usage[] = {
-	N_("git backfill [--min-batch-size=<n>] [--[no-]sparse] [--[no-]include-edges] [<revision-range>]"),
+	N_("git backfill [--min-batch-size=<n>] [--[no-]sparse]\n"
+	   "             [--[no-]include-edges] [--[no-]progress]\n"
+	   "             [<revision-range>]"),
 	NULL
 };
 
 struct backfill_context {
 	struct repository *repo;
 	struct oid_array current_batch;
+	struct progress *progress;
+	uint64_t progress_nr;
 	size_t min_batch_size;
 	int sparse;
 	int include_edges;
+	int show_progress;
 	struct rev_info revs;
 };
 
@@ -67,6 +72,9 @@ static int fill_missing_blobs(const char *path UNUSED,
 
 	if (type != OBJ_BLOB)
 		return 0;
+
+	ctx->progress_nr += list->nr;
+	display_progress(ctx->progress, ctx->progress_nr);
 
 	for (size_t i = 0; i < list->nr; i++) {
 		if (!odb_has_object(ctx->repo->objects, &list->oid[i], 0))
@@ -129,7 +137,12 @@ static int do_backfill(struct backfill_context *ctx)
 	info.path_fn = fill_missing_blobs;
 	info.path_fn_data = ctx;
 
+	if (ctx->show_progress)
+		ctx->progress = start_delayed_progress(ctx->repo,
+						       _("Exploring objects"),
+						       0);
 	ret = walk_objects_by_path(&info);
+	stop_progress(&ctx->progress);
 
 	/* Download the objects that did not fill a batch. */
 	if (!ret)
@@ -149,6 +162,7 @@ int cmd_backfill(int argc, const char **argv, const char *prefix, struct reposit
 		.sparse = -1,
 		.revs = REV_INFO_INIT,
 		.include_edges = 1,
+		.show_progress = -1,
 	};
 	struct option options[] = {
 		OPT_UNSIGNED(0, "min-batch-size", &ctx.min_batch_size,
@@ -157,6 +171,8 @@ int cmd_backfill(int argc, const char **argv, const char *prefix, struct reposit
 			 N_("Restrict the missing objects to the current sparse-checkout")),
 		OPT_BOOL(0, "include-edges", &ctx.include_edges,
 			 N_("Include blobs from boundary commits in the backfill")),
+		OPT_BOOL(0, "progress", &ctx.show_progress,
+			 N_("show progress")),
 		OPT_END(),
 	};
 	struct repo_config_values *cfg = repo_config_values(the_repository);
@@ -180,6 +196,8 @@ int cmd_backfill(int argc, const char **argv, const char *prefix, struct reposit
 
 	if (ctx.sparse < 0)
 		ctx.sparse = cfg->apply_sparse_checkout;
+	if (ctx.show_progress < 0)
+		ctx.show_progress = isatty(2);
 
 	result = do_backfill(&ctx);
 	backfill_context_clear(&ctx);
