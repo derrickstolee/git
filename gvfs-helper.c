@@ -3984,6 +3984,18 @@ struct post_thread_ctx {
 	unsigned long nr_oids_total;
 	unsigned long block_size;
 	pthread_mutex_t work_mutex;
+
+	/*
+	 * Serializes start_command() across workers.  run-command.c creates
+	 * its pipes with plain pipe(), i.e. without O_CLOEXEC, so a fork()
+	 * racing with another thread's start_command() leaks that thread's
+	 * pipe fds into the wrong child.  The write end of a worker's
+	 * index-pack stdin then stays open in its sibling index-pack
+	 * processes, that child never sees EOF, and both it and the worker
+	 * waiting on it hang forever.  Holding this across the spawn *and*
+	 * the set_cloexec() calls closes the window.
+	 */
+	pthread_mutex_t spawn_mutex;
 	unsigned long next_block_start;
 
 	/* Shared read-only state (set before threads launch) */
@@ -4101,6 +4113,41 @@ static void cleanup_tmp_pack_files(void)
 }
 
 /*
+ * Spawn a child while holding ctx->spawn_mutex, then immediately mark the
+ * parent's pipe ends close-on-exec.
+ *
+ * run-command.c builds its pipes with plain pipe() (run-command.c:692,706,720)
+ * rather than pipe2(O_CLOEXEC), so every fd open in the process at fork() time
+ * is inherited by the new child.  With several workers spawning concurrently,
+ * worker A's index-pack inherits worker B's index-pack stdin write end.  B then
+ * closes its own copy, but A (and every other sibling) still holds one, so B's
+ * index-pack never sees EOF on stdin: it blocks in read() forever, and B blocks
+ * forever in finish_command() waiting for it to exit.
+ *
+ * Taking the mutex across both the spawn and the fcntl() calls means no other
+ * thread can fork between pipe creation and the fds being marked CLOEXEC.
+ */
+static int start_command_cloexec(struct post_thread_ctx *ctx,
+				 struct child_process *cp)
+{
+	int ret;
+
+	pthread_mutex_lock(&ctx->spawn_mutex);
+	ret = start_command(cp);
+	if (!ret) {
+		if (cp->in > 0)
+			fcntl(cp->in, F_SETFD,
+			      fcntl(cp->in, F_GETFD) | FD_CLOEXEC);
+		if (cp->out > 0)
+			fcntl(cp->out, F_SETFD,
+			      fcntl(cp->out, F_GETFD) | FD_CLOEXEC);
+	}
+	pthread_mutex_unlock(&ctx->spawn_mutex);
+
+	return ret;
+}
+
+/*
  * Worker thread: streams HTTP POST response directly into an
  * index-pack --stdin child process, then renames the resulting
  * pack-<hash>.{pack,idx} to vfs-<hash>.{pack,idx}.
@@ -4158,7 +4205,7 @@ retry_block:
 		ip.out = -1;
 		ip.no_stderr = 1;
 
-		if (start_command(&ip)) {
+		if (start_command_cloexec(ctx, &ip)) {
 			strbuf_addf(&td->error_message,
 				    "cannot start index-pack (worker %d)",
 				    td->thread_id);
@@ -4443,6 +4490,7 @@ static void do__http_post__fetch_oidset(struct gh__response_status *status,
 		ctx.block_size = gh__cmd_opts.block_size;
 		ctx.next_block_start = 0;
 		pthread_mutex_init(&ctx.work_mutex, NULL);
+		pthread_mutex_init(&ctx.spawn_mutex, NULL);
 
 		if (gh__cmd_opts.show_progress) {
 			int total_blocks = (int)((nr_oid_total +
@@ -4521,6 +4569,7 @@ thread_cleanup:
 		stop_progress(&ctx.progress);
 		pthread_mutex_destroy(&ctx.progress_mutex);
 		pthread_mutex_destroy(&ctx.work_mutex);
+		pthread_mutex_destroy(&ctx.spawn_mutex);
 		curl_slist_free_all(ctx.common_headers);
 		free((char *)ctx.fallback_url);
 		strbuf_release(&url);
