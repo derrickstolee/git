@@ -9,7 +9,8 @@ git-backfill - Download missing objects in a partial clone
 SYNOPSIS
 --------
 [synopsis]
-git backfill [--min-batch-size=<n>] [--[no-]sparse] [--[no-]include-edges]
+git backfill [--min-batch-size=<n>] [--timeout=<seconds>]
+	     [--[no-]sparse] [--[no-]include-edges]
 	     [--[no-]progress] [<revision-range>]
 
 DESCRIPTION
@@ -57,6 +58,13 @@ OPTIONS
 	from the server. This size may be exceeded by the last set of
 	blobs seen at a given path. The default minimum batch size is
 	50,000.
+
+`--timeout=<seconds>`::
+	Stop the backfill after the specified number of seconds have
+	elapsed. The timeout is checked after each batch finishes
+	downloading, allowing the process to stop without leaving a
+	partial packfile. A later `git backfill` invocation can continue
+	downloading the remaining objects.
 
 `--sparse`::
 `--no-sparse`::
