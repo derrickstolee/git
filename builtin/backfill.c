@@ -20,13 +20,15 @@
 #include "strmap.h"
 #include "string-list.h"
 #include "revision.h"
+#include "trace.h"
 #include "trace2.h"
 #include "progress.h"
 #include "packfile.h"
 #include "path-walk.h"
 
 static const char * const builtin_backfill_usage[] = {
-	N_("git backfill [--min-batch-size=<n>] [--[no-]sparse]\n"
+	N_("git backfill [--min-batch-size=<n>] [--timeout=<seconds>]\n"
+	   "             [--[no-]sparse]\n"
 	   "             [--[no-]include-edges] [--[no-]progress]\n"
 	   "             [<revision-range>]"),
 	NULL
@@ -38,6 +40,9 @@ struct backfill_context {
 	struct progress *progress;
 	uint64_t progress_nr;
 	size_t min_batch_size;
+	uint64_t start_time;
+	int timeout;
+	int timed_out;
 	int sparse;
 	int include_edges;
 	int show_progress;
@@ -49,7 +54,7 @@ static void backfill_context_clear(struct backfill_context *ctx)
 	oid_array_clear(&ctx->current_batch);
 }
 
-static void download_batch(struct backfill_context *ctx)
+static int download_batch(struct backfill_context *ctx, int check_timeout)
 {
 	promisor_remote_get_direct(ctx->repo,
 				   ctx->current_batch.oid,
@@ -61,6 +66,16 @@ static void download_batch(struct backfill_context *ctx)
 	 * avoid possible duplicate downloads of the same objects.
 	 */
 	odb_reprepare(ctx->repo->objects);
+
+	if (check_timeout &&
+	    ctx->timeout >= 0 &&
+	    getnanotime() - ctx->start_time >=
+		    (uint64_t)ctx->timeout * 1000000000) {
+		ctx->timed_out = 1;
+		return 1;
+	}
+
+	return 0;
 }
 
 static int fill_missing_blobs(const char *path UNUSED,
@@ -82,7 +97,7 @@ static int fill_missing_blobs(const char *path UNUSED,
 	}
 
 	if (ctx->current_batch.nr >= ctx->min_batch_size)
-		download_batch(ctx);
+		return download_batch(ctx, 1);
 
 	return 0;
 }
@@ -146,7 +161,12 @@ static int do_backfill(struct backfill_context *ctx)
 
 	/* Download the objects that did not fill a batch. */
 	if (!ret)
-		download_batch(ctx);
+		ret = download_batch(ctx, 0);
+
+	if (ctx->timed_out) {
+		warning(_("backfill stopped due to timeout before completing"));
+		ret = 0;
+	}
 
 	path_walk_info_clear(&info);
 	return ret;
@@ -159,6 +179,8 @@ int cmd_backfill(int argc, const char **argv, const char *prefix, struct reposit
 		.repo = repo,
 		.current_batch = OID_ARRAY_INIT,
 		.min_batch_size = 50000,
+		.start_time = getnanotime(),
+		.timeout = -1,
 		.sparse = -1,
 		.revs = REV_INFO_INIT,
 		.include_edges = 1,
@@ -167,6 +189,9 @@ int cmd_backfill(int argc, const char **argv, const char *prefix, struct reposit
 	struct option options[] = {
 		OPT_UNSIGNED(0, "min-batch-size", &ctx.min_batch_size,
 			     N_("Minimum number of objects to request at a time")),
+		OPT_INTEGER_F(0, "timeout", &ctx.timeout,
+			      N_("Stop after the given number of seconds"),
+			      PARSE_OPT_NONEG),
 		OPT_BOOL(0, "sparse", &ctx.sparse,
 			 N_("Restrict the missing objects to the current sparse-checkout")),
 		OPT_BOOL(0, "include-edges", &ctx.include_edges,
