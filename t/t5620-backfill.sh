@@ -155,6 +155,29 @@ test_expect_success 'do partial clone 2, backfill min batch size' '
 	test_line_count = 0 revs2
 '
 
+test_expect_success 'backfill timeout stops after a completed batch' '
+	git clone --no-checkout --filter=blob:none	\
+		--single-branch --branch=main		\
+		"file://$(pwd)/srv.bare" backfill-timeout &&
+
+	GIT_TRACE2_EVENT="$(pwd)/timeout-trace" git \
+		-C backfill-timeout backfill \
+		--min-batch-size=20 --timeout=0 2>err &&
+	test_grep "warning: backfill stopped due to timeout" err &&
+
+	test_trace2_data promisor fetch_count 20 <timeout-trace >matches &&
+	test_line_count = 1 matches &&
+
+	git -C backfill-timeout rev-list --quiet --objects \
+		--missing=print HEAD >missing &&
+	test_line_count = 28 missing &&
+
+	git -C backfill-timeout backfill --min-batch-size=20 &&
+	git -C backfill-timeout rev-list --quiet --objects \
+		--missing=print HEAD >missing &&
+	test_line_count = 0 missing
+'
+
 test_expect_success 'backfill --sparse without sparse-checkout fails' '
 	git init not-sparse &&
 	test_must_fail git -C not-sparse backfill --sparse 2>err &&
