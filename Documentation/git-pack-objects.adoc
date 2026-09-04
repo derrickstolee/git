@@ -10,7 +10,8 @@ SYNOPSIS
 --------
 [verse]
 'git pack-objects' [-q | --progress | --all-progress] [--all-progress-implied]
-		   [--no-reuse-delta] [--delta-base-offset] [--non-empty]
+		   [--no-reuse-delta | --improve-reused-deltas]
+		   [--delta-base-offset] [--non-empty]
 		   [--local] [--incremental] [--window=<n>] [--depth=<n>]
 		   [--revs [--unpacked | --all]] [--keep-pack=<pack-name>]
 		   [--cruft] [--cruft-expiration=<time>]
@@ -238,6 +239,12 @@ depth is 4095.
 	This sometimes results in a slightly suboptimal pack.
 	This flag tells the command not to reuse existing deltas
 	but compute them from scratch.
+
+--improve-reused-deltas::
+	When reusing an existing delta, also search for a better delta using
+	the configured window and depth. The existing delta is retained unless
+	the search finds a smaller delta, or one of the same size with a
+	shallower depth. This option is incompatible with `--no-reuse-delta`.
 
 --no-reuse-object::
 	This flag tells the command not to reuse existing object data at all,

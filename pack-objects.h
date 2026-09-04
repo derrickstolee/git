@@ -105,6 +105,7 @@ struct object_entry {
 	unsigned z_delta_size:OE_Z_DELTA_BITS;
 	unsigned type_valid:1;
 	unsigned no_try_delta:1;
+	unsigned reused_delta:1;
 	unsigned type_:TYPE_BITS;
 	unsigned in_pack_type:TYPE_BITS; /* could be delta */
 
