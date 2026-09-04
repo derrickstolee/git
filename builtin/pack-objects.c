@@ -99,6 +99,7 @@ static inline void oe_set_delta(struct packing_data *pack,
 				struct object_entry *e,
 				struct object_entry *delta)
 {
+	e->ext_base = 0;
 	if (delta)
 		e->delta_idx = (delta - pack->objects) + 1;
 	else
@@ -190,7 +191,8 @@ static inline void oe_set_delta_size(struct packing_data *pack,
 
 static const char *const pack_usage[] = {
 	N_("git pack-objects [-q | --progress | --all-progress] [--all-progress-implied]\n"
-	   "                 [--no-reuse-delta] [--delta-base-offset] [--non-empty]\n"
+	   "                 [--no-reuse-delta | --improve-reused-deltas]\n"
+	   "                 [--delta-base-offset] [--non-empty]\n"
 	   "                 [--local] [--incremental] [--window=<n>] [--depth=<n>]\n"
 	   "                 [--revs [--unpacked | --all]] [--keep-pack=<pack-name>]\n"
 	   "                 [--cruft] [--cruft-expiration=<time>]\n"
@@ -206,7 +208,7 @@ static struct bitmap_index *bitmap_git;
 static uint32_t write_layer;
 
 static int non_empty;
-static int reuse_delta = 1, reuse_object = 1;
+static int reuse_delta = 1, reuse_object = 1, improve_reused_deltas;
 static int keep_unreachable, unpack_unreachable, include_tag;
 static timestamp_t unpack_unreachable_expiration;
 static int pack_loose_unreachable;
@@ -755,6 +757,8 @@ static off_t write_object(struct hashfile *f,
 		to_reuse = 0;	/* explicit */
 	else if (!IN_PACK(entry))
 		to_reuse = 0;	/* can't reuse what we don't have */
+	else if (entry->reused_delta)
+		to_reuse = usable_delta;
 	else if (oe_type(entry) == OBJ_REF_DELTA ||
 		 oe_type(entry) == OBJ_OFS_DELTA)
 				/* check_object() decided it for us ... */
@@ -2433,23 +2437,11 @@ static int pack_offset_sort(const void *_a, const void *_b)
  *
  *   3. Resetting our delta depth, as we are now a base object.
  */
-static void drop_reused_delta(struct object_entry *entry)
+static void set_canonical_object_info(struct object_entry *entry)
 {
-	unsigned *idx = &to_pack.objects[entry->delta_idx - 1].delta_child_idx;
 	struct object_info oi = OBJECT_INFO_INIT;
 	enum object_type type;
 	size_t size;
-
-	while (*idx) {
-		struct object_entry *oe = &to_pack.objects[*idx - 1];
-
-		if (oe == entry)
-			*idx = oe->delta_sibling_idx;
-		else
-			idx = &oe->delta_sibling_idx;
-	}
-	SET_DELTA(entry, NULL);
-	entry->depth = 0;
 
 	oi.sizep = &size;
 	oi.typep = &type;
@@ -2467,6 +2459,30 @@ static void drop_reused_delta(struct object_entry *entry)
 		oe_set_type(entry, type);
 	}
 	SET_SIZE(entry, size);
+}
+
+static void drop_reused_delta(struct object_entry *entry)
+{
+	unsigned *idx = &to_pack.objects[entry->delta_idx - 1].delta_child_idx;
+
+	while (*idx) {
+		struct object_entry *oe = &to_pack.objects[*idx - 1];
+
+		if (oe == entry)
+			*idx = oe->delta_sibling_idx;
+		else
+			idx = &oe->delta_sibling_idx;
+	}
+	SET_DELTA(entry, NULL);
+	entry->depth = 0;
+
+	set_canonical_object_info(entry);
+}
+
+static void prepare_reused_delta_for_search(struct object_entry *entry)
+{
+	set_canonical_object_info(entry);
+	entry->reused_delta = 1;
 }
 
 /*
@@ -2625,6 +2641,15 @@ static void get_object_details(void)
 	 */
 	for (i = 0; i < to_pack.nr_objects; i++)
 		break_delta_chains(&to_pack.objects[i]);
+
+	if (improve_reused_deltas) {
+		for (i = 0; i < to_pack.nr_objects; i++) {
+			struct object_entry *entry = &to_pack.objects[i];
+
+			if (DELTA(entry))
+				prepare_reused_delta_for_search(entry);
+		}
+	}
 
 	free(sorted_by_offset);
 }
@@ -2792,6 +2817,14 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 		return -1;
 
 	/*
+	 * A reused delta may depend on an object later in the delta-search
+	 * order. Do not use it as a new base until it has been replaced by a
+	 * delta whose base appeared earlier in the window.
+	 */
+	if (src_entry->reused_delta)
+		return 0;
+
+	/*
 	 * We do not bother to try a delta that we discarded on an
 	 * earlier try, but only when reusing delta data.  Note that
 	 * src_entry that is marked as the preferred_base should always
@@ -2821,6 +2854,9 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 	}
 	max_size = (uint64_t)max_size * (max_depth - src->depth) /
 						(max_depth - ref_depth + 1);
+	if (trg_entry->reused_delta &&
+	    max_size > DELTA_SIZE(trg_entry))
+		max_size = DELTA_SIZE(trg_entry);
 	if (max_size == 0)
 		return 0;
 	src_size = SIZE(src_entry);
@@ -2894,6 +2930,10 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 		return 0;
 
 	if (DELTA(trg_entry)) {
+		if (delta_size > DELTA_SIZE(trg_entry)) {
+			free(delta_buf);
+			return 0;
+		}
 		/* Prefer only shallower same-sized deltas. */
 		if (delta_size == DELTA_SIZE(trg_entry) &&
 		    src->depth + 1 >= trg->depth) {
@@ -2924,6 +2964,7 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 
 	SET_DELTA(trg_entry, src_entry);
 	SET_DELTA_SIZE(trg_entry, delta_size);
+	trg_entry->reused_delta = 0;
 	trg->depth = src->depth + 1;
 
 	return 1;
@@ -2985,6 +3026,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 
 		mem_usage -= free_unpacked(n);
 		n->entry = entry;
+		n->depth = entry->depth;
 
 		while (window_memory_limit &&
 		       mem_usage > window_memory_limit &&
@@ -3071,7 +3113,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 * currently deltified object, to keep it longer.  It will
 		 * be the first base object to be attempted next.
 		 */
-		if (DELTA(entry)) {
+		if (best_base >= 0) {
 			struct unpacked swap = array[best_base];
 			int dist = (window + idx - best_base) % window;
 			int dst = best_base;
@@ -3362,9 +3404,10 @@ static int add_ref_tag(const struct reference *ref, void *cb_data UNUSED)
 
 static int should_attempt_deltas(struct object_entry *entry)
 {
-	if (DELTA(entry))
-		/* This happens if we decided to reuse existing
-		 * delta from a pack. "reuse_delta &&" is implied.
+	if (DELTA(entry) && !entry->reused_delta)
+		/*
+		 * This happens if we decided to reuse an existing delta
+		 * without attempting to improve it.
 		 */
 		return 0;
 
@@ -5057,6 +5100,8 @@ int cmd_pack_objects(int argc,
 			    N_("maximum length of delta chain allowed in the resulting pack")),
 		OPT_BOOL(0, "reuse-delta", &reuse_delta,
 			 N_("reuse existing deltas")),
+		OPT_BOOL(0, "improve-reused-deltas", &improve_reused_deltas,
+			 N_("attempt to improve reused deltas")),
 		OPT_BOOL(0, "reuse-object", &reuse_object,
 			 N_("reuse existing objects")),
 		OPT_BOOL(0, "delta-base-offset", &allow_ofs_delta,
@@ -5269,6 +5314,9 @@ int cmd_pack_objects(int argc,
 
 	if (!reuse_object)
 		reuse_delta = 0;
+	if (improve_reused_deltas && !reuse_delta)
+		die(_("options '--improve-reused-deltas' and "
+		      "'--no-reuse-delta' cannot be used together"));
 	if (cfg->pack_compression_level == -1)
 		cfg->pack_compression_level = Z_DEFAULT_COMPRESSION;
 	else if (cfg->pack_compression_level < 0 || cfg->pack_compression_level > Z_BEST_COMPRESSION)

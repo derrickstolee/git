@@ -12,6 +12,11 @@ packed_objects () {
 	rm tmp-object-list
  }
 
+delta_base () {
+	git verify-pack -v "$1" |
+	awk -v oid="$2" '$1 == oid { print $7 }'
+}
+
 test_expect_success 'setup for --stdin-packs tests' '
 	git init stdin-packs &&
 	git -C stdin-packs config set maintenance.auto false &&
@@ -145,6 +150,104 @@ test_expect_success '--stdin-packs with broken links' '
 		cut -d" " -f2 <expect.raw | sort >expect &&
 		cut -d" " -f2 <actual.raw | sort >actual &&
 		test_cmp expect actual
+	)
+'
+
+test_expect_success 'setup for --improve-reused-deltas' '
+	git init improve-reused-deltas &&
+	git -C improve-reused-deltas config set maintenance.auto false &&
+	(
+		cd improve-reused-deltas &&
+
+		test-tool genrandom left 24576 >left &&
+		test-tool genrandom middle 16384 >middle &&
+		test-tool genrandom other 16384 >other &&
+		test-tool genrandom right 24576 >right &&
+
+		cat left other right >file &&
+		git add file &&
+		test_tick &&
+		git commit -m worse &&
+		worse_commit=$(git rev-parse HEAD) &&
+		worse_oid=$(git rev-parse HEAD:file) &&
+
+		cat left middle right >file &&
+		git add file &&
+		test_tick &&
+		git commit -m target &&
+		target_tree=$(git rev-parse HEAD^{tree}) &&
+		target_oid=$(git rev-parse HEAD:file) &&
+
+		cp file better &&
+		echo x >>better &&
+		better_oid=$(git hash-object -w better) &&
+
+		{
+			echo "-$worse_commit" &&
+			echo "$target_tree" &&
+			echo "$target_oid file"
+		} |
+		git pack-objects --stdout >thin.pack &&
+		git index-pack --stdin --fix-thin <thin.pack >base.hash &&
+		sed "s/^pack[	 ]*//" <base.hash >base.hash.only &&
+
+		echo "$better_oid better" |
+		git pack-objects .git/objects/pack/pack-better \
+			--window=0 >better.hash &&
+
+		echo "pack-$(cat base.hash.only).pack" >input-packs &&
+		echo "pack-better-$(cat better.hash).pack" >>input-packs &&
+		echo "$target_oid" >target-oid &&
+		echo "$worse_oid" >worse-oid &&
+		echo "$better_oid" >better-oid
+	)
+'
+
+test_expect_success '--improve-reused-deltas finds a better delta' '
+	(
+		cd improve-reused-deltas &&
+
+		git pack-objects reused --stdin-packs \
+			--window=10 --depth=50 <input-packs >reused.hash &&
+		delta_base reused-$(cat reused.hash).idx \
+			$(cat target-oid) >actual &&
+		test_cmp worse-oid actual &&
+
+		git pack-objects improved --stdin-packs \
+			--window=10 --depth=50 --improve-reused-deltas \
+			<input-packs >improved.hash &&
+		git verify-pack improved-$(cat improved.hash).idx &&
+		delta_base improved-$(cat improved.hash).idx \
+			$(cat target-oid) >actual &&
+		test_cmp better-oid actual &&
+		reused_size=$(test_file_size reused-$(cat reused.hash).pack) &&
+		improved_size=$(test_file_size improved-$(cat improved.hash).pack) &&
+		test "$improved_size" -le "$reused_size"
+	)
+'
+
+test_expect_success '--improve-reused-deltas retains the existing delta' '
+	(
+		cd improve-reused-deltas &&
+
+		head -n 1 input-packs >base-pack &&
+		git pack-objects retained --stdin-packs \
+			--window=0 --improve-reused-deltas \
+			<base-pack >retained.hash &&
+		delta_base retained-$(cat retained.hash).idx \
+			$(cat target-oid) >actual &&
+		test_cmp worse-oid actual
+	)
+'
+
+test_expect_success '--improve-reused-deltas requires delta reuse' '
+	(
+		cd improve-reused-deltas &&
+
+		test_must_fail git pack-objects rejected --stdin-packs \
+			--no-reuse-delta --improve-reused-deltas \
+			<input-packs 2>err &&
+		test_grep "options .--improve-reused-deltas. and .--no-reuse-delta. cannot be used together" err
 	)
 '
 
