@@ -439,6 +439,23 @@ static int inherit_handle_child(void)
 	return 0;
 }
 
+static int print_pid_and_wait(int argc, const char **argv)
+{
+	if (argc != 2)
+		die("usage: test-tool run-command print-pid-and-wait <path>");
+
+	printf("%"PRIuMAX"\n", (uintmax_t)getpid());
+	fflush(stdout);
+
+	while (access(argv[1], F_OK) < 0) {
+		if (errno != ENOENT)
+			die_errno("could not access '%s'", argv[1]);
+		sleep_millisec(10);
+	}
+
+	return 0;
+}
+
 int cmd__run_command(int argc, const char **argv)
 {
 	struct child_process proc = CHILD_PROCESS_INIT;
@@ -450,6 +467,8 @@ int cmd__run_command(int argc, const char **argv)
 
 	if (argc > 1 && !strcmp(argv[1], "testsuite"))
 		return testsuite(argc - 1, argv + 1);
+	if (argc > 1 && !strcmp(argv[1], "print-pid-and-wait"))
+		return print_pid_and_wait(argc - 1, argv + 1);
 	if (!strcmp(argv[1], "inherited-handle"))
 		return inherit_handle(argv[0]);
 	if (!strcmp(argv[1], "inherited-handle-child"))
