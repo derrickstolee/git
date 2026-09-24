@@ -1159,22 +1159,22 @@ test_expect_success PERL 'pack-aggregate survives through MIDX bitmap write' '
 		test_path_is_file \
 			.git/objects/pack/multi-pack-index-*.bitmap &&
 		git rev-list --test-bitmap HEAD &&
-		# Match child start and exit events by session ID.
-		# Compare the child exit events recorded by the parent.
+		# Match child start and exit events by child ID.
 		perl -ne '\''
-			my ($sid)  = /"sid":"([^"]+)"/ or next;
 			my ($time) = /"time":"([^"]+)"/;
-			if (/"event":"start"/) {
+			if (/"event":"child_start"/) {
+				my ($id) = /"child_id":([0-9]+)/ or next;
 				# Match the subcommand, not a path containing
 				# pack-aggregate.
 				my ($argv) = /"argv":\["[^"]*","([^"]+)"/;
 				if (defined($argv) && $argv eq "multi-pack-index") {
-					$kind{$sid} = "midx";
+					$kind{$id} = "midx";
 				} elsif (defined($argv) && $argv eq "pack-aggregate") {
-					$kind{$sid} = "agg";
+					$kind{$id} = "agg";
 				}
-			} elsif (/"event":"exit"/ && $kind{$sid}) {
-				$exit{$kind{$sid}} //= $time;
+			} elsif (/"event":"child_exit"/) {
+				my ($id) = /"child_id":([0-9]+)/ or next;
+				$exit{$kind{$id}} //= $time if $kind{$id};
 			}
 			END {
 				die "missing midx exit\n" unless $exit{midx};
