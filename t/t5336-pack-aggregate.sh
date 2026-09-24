@@ -259,22 +259,27 @@ test_expect_success '--exclude-pack-file protects listed packs' '
 	)
 '
 
-test_expect_success 'sidecar-marked packs are skipped' '
+test_expect_success 'packs with protective sidecars are skipped' '
 	test_when_finished "rm -fr work" &&
-	cp -R repo work &&
-	(
-		cd work &&
-		build_n_packs 6 >packs.txt &&
-		first=$(head -n 1 packs.txt) &&
-		>.git/objects/pack/${first}.keep &&
-		git pack-aggregate --once \
-			--min-loose=1000 --min-packs=4 &&
-		test_path_is_file .git/objects/pack/${first}.pack &&
-		test_path_is_file .git/objects/pack/${first}.keep &&
-		# 1 kept + 1 aggregate = 2 packs total.
-		test 2 -eq "$(count_packs)" &&
-		git fsck
-	)
+	for sidecar in keep promisor mtimes bitmap
+	do
+		rm -fr work &&
+		cp -R repo work &&
+		(
+			cd work &&
+			build_n_packs 6 >packs.txt &&
+			first=$(head -n 1 packs.txt) &&
+			>.git/objects/pack/${first}.$sidecar &&
+			git pack-aggregate --once \
+				--min-loose=1000 --min-packs=4 &&
+			test_path_is_file .git/objects/pack/${first}.pack &&
+			test_path_is_file .git/objects/pack/${first}.$sidecar &&
+			# 1 protected + 1 aggregate = 2 packs total.
+			test 2 -eq "$(count_packs)" &&
+			rm .git/objects/pack/${first}.$sidecar &&
+			git fsck
+		) || return 1
+	done
 '
 
 test_expect_success '--max-objects skips packs above the object-count limit' '
