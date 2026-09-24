@@ -109,6 +109,45 @@ test_expect_success 'aggregation modes and intervals are validated' '
 	)
 '
 
+test_expect_success !MINGW 'loop exits when the parent pipe closes' '
+	test_when_finished "rm -fr work" &&
+	cp -R repo work &&
+	(
+		cd work &&
+		: | git pack-aggregate --loop --interval=60 \
+			--parent-pipe-fd=0
+	)
+'
+
+test_expect_success !MINGW 'loop exits when signaled' '
+	test_when_finished "
+		test ! -f aggregate.pid ||
+			kill \"\$(cat aggregate.pid)\" 2>/dev/null || :
+		rm -fr work aggregate.pid
+	" &&
+	cp -R repo work &&
+	(
+		cd work &&
+		{
+			GIT_TRACE2_EVENT="$PWD/trace.txt" \
+				git pack-aggregate --loop --interval=60 &
+			aggregate_pid=$! &&
+			echo "$aggregate_pid" >../aggregate.pid
+		} &&
+		i=0 &&
+		while ! test_grep "\"label\":\"cycle\"" trace.txt &&
+			test $i -lt 100
+		do
+			sleep 0.1 &&
+			i=$((i + 1)) || return 1
+		done &&
+		test_grep "\"label\":\"cycle\"" trace.txt &&
+		kill "$aggregate_pid" &&
+		wait "$aggregate_pid" &&
+		rm ../aggregate.pid
+	)
+'
+
 test_expect_success '--once below --min-packs is a no-op for packs' '
 	test_when_finished "rm -fr work" &&
 	cp -R repo work &&
