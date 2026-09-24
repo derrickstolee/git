@@ -367,7 +367,8 @@ static int set_cloexec_or_error(int fd, const char *description)
 	return 0;
 }
 
-static int run_pack_aggregate_once(const struct string_list *keep_pack_list)
+static int run_pack_aggregate_once(const struct string_list *keep_pack_list,
+				   int show_progress)
 {
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	struct string_list_item *item;
@@ -375,6 +376,8 @@ static int run_pack_aggregate_once(const struct string_list *keep_pack_list)
 	strvec_pushl(&cmd.args, "pack-aggregate", "--once", NULL);
 	for_each_string_list_item(item, keep_pack_list)
 		strvec_pushf(&cmd.args, "--keep-pack=%s", item->string);
+	if (show_progress)
+		strvec_push(&cmd.args, "--progress");
 	cmd.git_cmd = 1;
 
 	if (run_command(&cmd))
@@ -783,7 +786,8 @@ int cmd_repack(int argc,
 		    config_ctx.midx_new_layer_threshold);
 
 	if (aggregate_once_opt > 0 &&
-	    run_pack_aggregate_once(&keep_pack_list)) {
+	    run_pack_aggregate_once(&keep_pack_list,
+				    !po_args.quiet && isatty(2))) {
 		ret = 1;
 		goto cleanup;
 	}
