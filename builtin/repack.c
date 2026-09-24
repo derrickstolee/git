@@ -194,8 +194,12 @@ static void clean_stale_aggregate_keeps(const char *packdir)
 	struct dirent *ent;
 	struct strbuf path = STRBUF_INIT;
 
-	if (!dir)
+	if (!dir) {
+		if (errno != ENOENT)
+			warning_errno(_("could not open pack directory '%s'"),
+				      packdir);
 		return;
+	}
 
 	while ((ent = readdir(dir))) {
 		const char *p;
@@ -212,11 +216,19 @@ static void clean_stale_aggregate_keeps(const char *packdir)
 		strbuf_addf(&path, "%s/%s", packdir, ent->d_name);
 
 		fd = open(path.buf, O_RDONLY);
-		if (fd < 0)
+		if (fd < 0) {
+			warning_errno(_("could not open aggregate .keep marker "
+					"'%s'"), path.buf);
 			continue;
+		}
 		n = read_in_full(fd, buf, sizeof(buf) - 1);
 		close(fd);
-		if (n <= 0)
+		if (n < 0) {
+			warning_errno(_("could not read aggregate .keep marker "
+					"'%s'"), path.buf);
+			continue;
+		}
+		if (!n)
 			continue;
 		buf[n] = '\0';
 
@@ -435,7 +447,9 @@ static int stop_pack_aggregate(struct pack_aggregate_process *agg)
 	if (agg->tmpdir) {
 		struct strbuf path = STRBUF_INIT;
 		strbuf_addstr(&path, agg->tmpdir);
-		remove_dir_recursively(&path, 0);
+		if (remove_dir_recursively(&path, 0))
+			warning_errno(_("could not remove pack-aggregate "
+					"temporary directory '%s'"), path.buf);
 		strbuf_release(&path);
 		FREE_AND_NULL(agg->tmpdir);
 	}
