@@ -98,7 +98,9 @@ static int idx_file_size(const char *packdir, const char *basename,
 
 /*
  * Convert the object-count cap to a v2 index size for comparison with
- * idx_file_size().  For N objects:
+ * idx_file_size(). Version 2 is the default index format, but a legacy or
+ * explicitly configured v1 index may admit modestly more objects than the
+ * requested heuristic limit. For N objects:
  *
  *   size = 8 (header) + 1024 (fanout) + N*(rawsz + 8) + 2*rawsz (trailer)
  *

@@ -146,9 +146,12 @@ OPTIONS
 	or 100000 if that is unset.  A value of `0` disables the limit.
 
 --max-objects=<n>::
-	Skip any pack that contains more than `<n>` objects, leaving it
-	untouched by step 2.  The object count is estimated cheaply from
-	the size of the pack's `.idx` file rather than by opening it.
+	Skip packs estimated to contain more than `<n>` objects, leaving
+	them untouched by step 2.  The object count is estimated cheaply
+	from the size of the pack's `.idx` file rather than by opening it.
+	The estimate assumes the version 2 index format, which is Git's
+	default. Legacy version 1 indexes are smaller and may therefore
+	admit modestly more objects than the requested limit.
 	This keeps `git pack-aggregate` focused on rolling up the small
 	packs it is meant for, instead of repacking a large base pack
 	(which would amount to a near-full repack).  Defaults to the
