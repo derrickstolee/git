@@ -134,6 +134,11 @@ OPTIONS
 	internal plumbing option used by `git repack` to keep its
 	companion aggregator from outliving it.
 
+--[no-]progress::
+	Show progress while creating packs. The default is to show progress
+	for `--once` when standard error is connected to a terminal, and to
+	suppress progress for `--loop`.
+
 --max-loose-objects=<n>::
 	Process at most `<n>` loose objects per batch.  All output packs
 	are installed and the loose copies are removed before the next

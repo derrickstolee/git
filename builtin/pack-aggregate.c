@@ -34,6 +34,7 @@ static const char *const pack_aggregate_usage[] = {
 	   "                  [--keep-pack=<pack-name>]\n"
 	   "                  [--exclude-pack-file=<path>]\n"
 	   "                  [--exclude-loose-file=<path>]\n"
+	   "                  [--[no-]progress]\n"
 	   "                  [--parent-pipe-fd=<n>]"),
 	NULL
 };
@@ -235,7 +236,8 @@ static int loose_scan_cb(const struct object_id *oid, const char *path,
 
 static int run_pack_objects(const char *packtmp, int stdin_packs,
 			    const struct strbuf *input,
-			    struct string_list *out_hashes)
+			    struct string_list *out_hashes,
+			    int show_progress)
 {
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	struct strbuf output = STRBUF_INIT;
@@ -250,9 +252,9 @@ static int run_pack_objects(const char *packtmp, int stdin_packs,
 		     "--mark-bad-deltas",
 		     "--delta-base-offset",
 		     "--no-write-bitmap-index",
-		     "--quiet",
-		     packtmp,
 		     NULL);
+	strvec_push(&cmd.args, show_progress ? "--progress" : "--quiet");
+	strvec_push(&cmd.args, packtmp);
 	cmd.git_cmd = 1;
 	cmd.clean_on_exit = 1;
 
@@ -273,7 +275,8 @@ static int run_pack_objects(const char *packtmp, int stdin_packs,
 }
 
 static int run_pack_objects_loose(const char *packtmp, struct oid_array *oids,
-				  struct string_list *out_hashes)
+				  struct string_list *out_hashes,
+				  int show_progress)
 {
 	struct strbuf input = STRBUF_INIT;
 	size_t i;
@@ -281,7 +284,7 @@ static int run_pack_objects_loose(const char *packtmp, struct oid_array *oids,
 
 	for (i = 0; i < oids->nr; i++)
 		strbuf_addf(&input, "%s\n", oid_to_hex(&oids->oid[i]));
-	ret = run_pack_objects(packtmp, 0, &input, out_hashes);
+	ret = run_pack_objects(packtmp, 0, &input, out_hashes, show_progress);
 	strbuf_release(&input);
 	return ret;
 }
@@ -349,7 +352,8 @@ static void collect_pack_candidates(struct repository *repo,
 static int run_pack_objects_packs(const char *packtmp,
 				  const struct string_list *bases,
 				  size_t begin, size_t count,
-				  struct string_list *out_hashes)
+				  struct string_list *out_hashes,
+				  int show_progress)
 {
 	struct strbuf input = STRBUF_INIT;
 	size_t i;
@@ -357,7 +361,7 @@ static int run_pack_objects_packs(const char *packtmp,
 
 	for (i = begin; i < begin + count; i++)
 		strbuf_addf(&input, "%s.pack\n", bases->items[i].string);
-	ret = run_pack_objects(packtmp, 1, &input, out_hashes);
+	ret = run_pack_objects(packtmp, 1, &input, out_hashes, show_progress);
 	strbuf_release(&input);
 	return ret;
 }
@@ -511,7 +515,8 @@ static int do_one_cycle(struct repository *repo, const char *packdir,
 			struct strset *midx_exclude,
 			int min_loose, int min_packs,
 			int max_loose_objects, int max_objects,
-			int max_packs, unsigned long max_input_pack_size)
+			int max_packs, unsigned long max_input_pack_size,
+			int show_progress)
 {
 	struct oid_array loose_oids = OID_ARRAY_INIT;
 	struct string_list loose_paths = STRING_LIST_INIT_DUP;
@@ -544,7 +549,8 @@ static int do_one_cycle(struct repository *repo, const char *packdir,
 		while (loose_oids.nr && !stop_signaled) {
 			string_list_clear(&output_hashes, 0);
 			if (run_pack_objects_loose(packtmp_loose, &loose_oids,
-						   &output_hashes)) {
+						   &output_hashes,
+						   show_progress)) {
 				ret = error(_("pack-objects failed during "
 					      "loose-object rollup"));
 				goto out;
@@ -624,7 +630,8 @@ static int do_one_cycle(struct repository *repo, const char *packdir,
 			string_list_clear(&output_hashes, 0);
 			strset_clear(&output_bases);
 			if (run_pack_objects_packs(packtmp_packs, &candidates,
-						   start, count, &output_hashes)) {
+						   start, count, &output_hashes,
+						   show_progress)) {
 				ret = error(_("pack-objects failed during "
 					      "pack aggregation"));
 				goto out;
@@ -725,6 +732,7 @@ int cmd_pack_aggregate(int argc, const char **argv,
 	struct string_list keep_pack_list = STRING_LIST_INIT_NODUP;
 	int once = 0;
 	int loop = 0;
+	int show_progress = -1;
 	uintmax_t cycle_count = 0;
 	struct option options[] = {
 		OPT_BOOL(0, "once", &once,
@@ -763,6 +771,8 @@ int cmd_pack_aggregate(int argc, const char **argv,
 			   N_("file"),
 			   N_("file listing loose object OIDs never to "
 			      "touch")),
+		OPT_BOOL(0, "progress", &show_progress,
+			 N_("show progress for pack creation")),
 		OPT_INTEGER(0, "parent-pipe-fd", &parent_pipe_fd,
 			    N_("inherited fd of a pipe whose write end "
 			       "the parent holds; EOF triggers exit")),
@@ -790,6 +800,8 @@ int cmd_pack_aggregate(int argc, const char **argv,
 		die(_("--min-loose must be at least 1"));
 	if (min_packs < 1)
 		die(_("--min-packs must be at least 1"));
+	if (show_progress < 0)
+		show_progress = once && isatty(2);
 
 	if (max_loose_objects < 0 &&
 	    repo_config_get_int(repo, "pack.aggregatemaxlooseobjects",
@@ -846,7 +858,8 @@ int cmd_pack_aggregate(int argc, const char **argv,
 				   &pack_exclude, &loose_exclude, &midx_exclude,
 				   min_loose, min_packs,
 				   max_loose_objects, max_objects,
-				   max_packs, max_input_pack_size);
+				   max_packs, max_input_pack_size,
+				   show_progress);
 		trace2_data_intmax("pack-aggregate", repo, "cycle-num",
 				   ++cycle_count);
 		trace2_region_leave("pack-aggregate", "cycle", repo);
