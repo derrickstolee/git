@@ -1046,6 +1046,19 @@ test_expect_success 'repack --aggregate-loop spawns and reaps pack-aggregate' '
 	)
 '
 
+test_expect_success 'repack reports a failed background aggregation' '
+	test_when_finished "rm -fr work" &&
+	cp -R repo work &&
+	(
+		cd work &&
+		build_n_packs 5 >/dev/null &&
+		test_must_fail git -c pack.aggregateMaxObjects=-1 \
+			repack -d --geometric=2 --aggregate-loop 2>err &&
+		test_grep "pack.aggregateMaxObjects cannot be negative" err &&
+		test_grep "git pack-aggregate --loop failed" err
+	)
+'
+
 test_expect_success 'repack --aggregate-loop aggregates new packs' '
 	test_when_finished "
 		test ! -f repack.pid ||
@@ -1147,8 +1160,7 @@ test_expect_success PERL 'pack-aggregate survives through MIDX bitmap write' '
 			.git/objects/pack/multi-pack-index-*.bitmap &&
 		git rev-list --test-bitmap HEAD &&
 		# Match child start and exit events by session ID.
-		# Direct waitpid() teardown omits the child_exit event in the
-		# parent trace, so compare the child exit events.
+		# Compare the child exit events recorded by the parent.
 		perl -ne '\''
 			my ($sid)  = /"sid":"([^"]+)"/ or next;
 			my ($time) = /"time":"([^"]+)"/;
