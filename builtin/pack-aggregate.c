@@ -368,8 +368,14 @@ static int run_pack_objects_packs(const char *packtmp,
 static int install_pack(struct repository *repo, const char *packtmp,
 			const char *packdir, const char *hash)
 {
-	static const char *exts[] = {
-		".pack", ".rev", ".baddeltas", ".idx"
+	static const struct {
+		const char *name;
+		unsigned optional:1;
+	} exts[] = {
+		{ ".pack" },
+		{ ".rev", 1 },
+		{ ".baddeltas", 1 },
+		{ ".idx" },
 	};
 	struct tempfile *files[ARRAY_SIZE(exts)] = { 0 };
 	size_t i;
@@ -378,7 +384,7 @@ static int install_pack(struct repository *repo, const char *packtmp,
 		struct strbuf src = STRBUF_INIT;
 		struct stat st;
 
-		strbuf_addf(&src, "%s-%s%s", packtmp, hash, exts[i]);
+		strbuf_addf(&src, "%s-%s%s", packtmp, hash, exts[i].name);
 		if (!stat(src.buf, &st)) {
 			files[i] = register_tempfile(src.buf);
 			if (adjust_shared_perm(repo, src.buf)) {
@@ -387,6 +393,11 @@ static int install_pack(struct repository *repo, const char *packtmp,
 				strbuf_release(&src);
 				goto cleanup;
 			}
+		} else if (errno == ENOENT && !exts[i].optional) {
+			error(_("pack-objects did not write a '%s' file for "
+				"pack %s-%s"), exts[i].name, packtmp, hash);
+			strbuf_release(&src);
+			goto cleanup;
 		} else if (errno != ENOENT) {
 			error_errno(_("could not stat '%s'"), src.buf);
 			strbuf_release(&src);
@@ -401,7 +412,8 @@ static int install_pack(struct repository *repo, const char *packtmp,
 		if (!files[i])
 			continue;
 
-		strbuf_addf(&dst, "%s/pack-%s%s", packdir, hash, exts[i]);
+		strbuf_addf(&dst, "%s/pack-%s%s", packdir, hash,
+			    exts[i].name);
 		if (rename_tempfile(&files[i], dst.buf)) {
 			error_errno(_("renaming pack to '%s' failed"), dst.buf);
 			strbuf_release(&dst);
