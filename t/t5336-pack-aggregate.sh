@@ -92,6 +92,22 @@ test_expect_success 'an aggregation mode is required' '
 	)
 '
 
+test_expect_success 'aggregation modes and intervals are validated' '
+	test_when_finished "rm -fr work" &&
+	cp -R repo work &&
+	(
+		cd work &&
+		test_must_fail git pack-aggregate --once --loop 2>err &&
+		test_grep "exactly one of --once or --loop" err &&
+		test_must_fail git pack-aggregate --loop --interval=0 2>err &&
+		test_grep -- "--interval must be at least 1" err &&
+		test_must_fail git pack-aggregate --once --min-loose=0 2>err &&
+		test_grep -- "--min-loose must be at least 1" err &&
+		test_must_fail git pack-aggregate --once --min-packs=0 2>err &&
+		test_grep -- "--min-packs must be at least 1" err
+	)
+'
+
 test_expect_success '--once below --min-packs is a no-op for packs' '
 	test_when_finished "rm -fr work" &&
 	cp -R repo work &&
