@@ -34,6 +34,42 @@ test_expect_success 'setup for --stdin-packs tests' '
 	)
 '
 
+test_expect_success 'pack-objects emits local input snapshots' '
+	(
+		cd stdin-packs &&
+		for pack in .git/objects/pack/pack-*.pack
+		do
+			basename "$pack" || return 1
+		done | sort >expect-packs &&
+		find .git/objects -type f |
+			sed -n "s#^.git/objects/\\([0-9a-f][0-9a-f]\\)/\\([0-9a-f]*\\)\$#\\1\\2#p" |
+			sort >expect-loose &&
+		echo stale >actual-packs &&
+		echo stale >actual-loose &&
+		git pack-objects --all \
+			--emit-input-packs=actual-packs \
+			--emit-input-loose=actual-loose generated >hash &&
+		sort actual-packs >actual-packs.sorted &&
+		sort actual-loose >actual-loose.sorted &&
+		test_cmp expect-packs actual-packs.sorted &&
+		test_cmp expect-loose actual-loose.sorted &&
+		test_path_is_missing actual-packs.tmp &&
+		test_path_is_missing actual-loose.tmp
+	)
+'
+
+test_expect_success 'pack-objects reports input snapshot write failures' '
+	(
+		cd stdin-packs &&
+		test_must_fail git pack-objects --all \
+			--emit-input-packs=missing/packs generated 2>err &&
+		test_grep "unable to write.*missing/packs.tmp" err &&
+		test_must_fail git pack-objects --all \
+			--emit-input-loose=missing/loose generated 2>err &&
+		test_grep "unable to write.*missing/loose.tmp" err
+	)
+'
+
 test_expect_success '--stdin-packs with excluded packs' '
 	(
 		cd stdin-packs &&
@@ -202,7 +238,12 @@ test_expect_success 'pack-objects --stdin with packfiles from alternate object d
 	# repository has no objects on its own, but we still expect to be able
 	# to pack objects from its alternate.
 	git clone --shared shared member &&
-	git -C member pack-objects --stdin-packs generated-pack <packfile &&
+	git -C member pack-objects --stdin-packs \
+		--emit-input-packs=actual-packs \
+		--emit-input-loose=actual-loose \
+		generated-pack <packfile &&
+	test_must_be_empty member/actual-packs &&
+	test_must_be_empty member/actual-loose &&
 	test_cmp shared/.git/objects/pack/pack-*.pack member/generated-pack-*.pack
 '
 
