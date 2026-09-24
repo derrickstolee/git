@@ -21,6 +21,7 @@
 #include "strmap.h"
 #include "strvec.h"
 #include "tempfile.h"
+#include "trace.h"
 #include "trace2.h"
 #include "wrapper.h"
 
@@ -653,19 +654,19 @@ out:
 	return ret;
 }
 
-static void interruptible_sleep(unsigned int seconds)
+static int interruptible_sleep(unsigned int seconds)
 {
 	struct pollfd pfd;
-	int timeout_ms;
+	uint64_t deadline;
 
 	if (stop_signaled)
-		return;
+		return 0;
 
 	if (parent_pipe_fd < 0) {
 		unsigned int remaining = seconds;
 		while (remaining > 0 && !stop_signaled)
 			remaining = sleep(remaining);
-		return;
+		return 0;
 	}
 
 	/*
@@ -677,17 +678,26 @@ static void interruptible_sleep(unsigned int seconds)
 	 */
 	pfd.fd = parent_pipe_fd;
 	pfd.events = 0;
-	timeout_ms = (seconds > INT_MAX / 1000) ? INT_MAX
-					       : (int)(seconds * 1000);
+	deadline = getnanotime() + seconds * 1000000000ULL;
 
 	while (!stop_signaled) {
+		uint64_t now = getnanotime();
+		uint64_t remaining_ms;
+		int timeout_ms;
 		int ret;
+
+		if (now >= deadline)
+			break;
+		remaining_ms = DIV_ROUND_UP(deadline - now, 1000000);
+		timeout_ms = remaining_ms > INT_MAX ? INT_MAX :
+			     (int)remaining_ms;
+
 		pfd.revents = 0;
 		ret = poll(&pfd, 1, timeout_ms);
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
-			break;
+			return error_errno(_("poll on parent pipe failed"));
 		}
 		if (ret == 0)
 			break;
@@ -696,6 +706,7 @@ static void interruptible_sleep(unsigned int seconds)
 			break;
 		}
 	}
+	return 0;
 }
 
 int cmd_pack_aggregate(int argc, const char **argv,
@@ -841,7 +852,10 @@ int cmd_pack_aggregate(int argc, const char **argv,
 		trace2_region_leave("pack-aggregate", "cycle", repo);
 		if (ret || once || stop_signaled)
 			break;
-		interruptible_sleep((unsigned int)interval);
+		if (interruptible_sleep((unsigned int)interval)) {
+			ret = -1;
+			break;
+		}
 	} while (!stop_signaled);
 
 	string_list_clear(&keep_pack_list, 0);
