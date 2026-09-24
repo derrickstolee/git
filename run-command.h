@@ -224,6 +224,12 @@ int start_command(struct child_process *);
  */
 int finish_command(struct child_process *);
 
+/**
+ * Ask a sub-process to terminate, wait up to timeout_ms for it to exit,
+ * and then kill it before completing the normal finish_command() cleanup.
+ */
+int terminate_command(struct child_process *, unsigned int timeout_ms);
+
 int finish_command_in_signal(struct child_process *);
 
 /**

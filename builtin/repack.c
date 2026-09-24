@@ -421,34 +421,8 @@ static void stop_pack_aggregate(struct pack_aggregate_process *agg)
 	}
 	if (agg->started) {
 		agg->started = 0;
-		if (agg->cmd.pid > 0) {
-			pid_t pid = agg->cmd.pid;
-			int waited_ms = 0;
-			int status;
-			pid_t r;
-
-			kill(pid, SIGTERM);
-			/*
-			 * Wait briefly for graceful exit before reaping;
-			 * pack-aggregate is expected to finish quite quickly,
-			 * so a few seconds should be plenty.
-			 */
-			while (waited_ms < 5000) {
-				r = waitpid(pid, &status, WNOHANG);
-				if (r == pid || (r < 0 && errno != EINTR))
-					break;
-				sleep_millisec(50);
-				waited_ms += 50;
-			}
-			if (r != pid) {
-				kill(pid, SIGKILL);
-				while (waitpid(pid, &status, 0) < 0 &&
-				       errno == EINTR)
-					; /* nothing */
-			}
-			agg->cmd.pid = -1;
-			child_process_clear(&agg->cmd);
-		}
+		if (agg->cmd.pid > 0)
+			terminate_command(&agg->cmd, 5000);
 	}
 	if (agg->tmpdir) {
 		struct strbuf path = STRBUF_INIT;

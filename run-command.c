@@ -555,6 +555,30 @@ static inline void set_cloexec(int fd)
 		fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
+static int child_process_status(int status, const char *argv0, int in_signal)
+{
+	int code = -1;
+
+	if (WIFSIGNALED(status)) {
+		code = WTERMSIG(status);
+		if (!in_signal && code != SIGINT && code != SIGQUIT && code != SIGPIPE)
+			error("%s died of signal %d", argv0, code);
+		/*
+		 * This return value is chosen so that code & 0xff
+		 * mimics the exit code that a POSIX shell would report for
+		 * a program that died from this signal.
+		 */
+		code += 128;
+	} else if (WIFEXITED(status)) {
+		code = WEXITSTATUS(status);
+	} else {
+		if (!in_signal)
+			error("waitpid is confused (%s)", argv0);
+	}
+
+	return code;
+}
+
 static int wait_or_whine(pid_t pid, const char *argv0, int in_signal)
 {
 	int status, code = -1;
@@ -571,21 +595,8 @@ static int wait_or_whine(pid_t pid, const char *argv0, int in_signal)
 	} else if (waiting != pid) {
 		if (!in_signal)
 			error("waitpid is confused (%s)", argv0);
-	} else if (WIFSIGNALED(status)) {
-		code = WTERMSIG(status);
-		if (!in_signal && code != SIGINT && code != SIGQUIT && code != SIGPIPE)
-			error("%s died of signal %d", argv0, code);
-		/*
-		 * This return value is chosen so that code & 0xff
-		 * mimics the exit code that a POSIX shell would report for
-		 * a program that died from this signal.
-		 */
-		code += 128;
-	} else if (WIFEXITED(status)) {
-		code = WEXITSTATUS(status);
 	} else {
-		if (!in_signal)
-			error("waitpid is confused (%s)", argv0);
+		code = child_process_status(status, argv0, in_signal);
 	}
 
 	if (!in_signal)
@@ -1004,6 +1015,41 @@ end_of_spawn:
 int finish_command(struct child_process *cmd)
 {
 	int ret = wait_or_whine(cmd->pid, cmd->args.v[0], 0);
+	trace2_child_exit(cmd, ret);
+	child_process_clear(cmd);
+	invalidate_lstat_cache();
+	return ret;
+}
+
+int terminate_command(struct child_process *cmd, unsigned int timeout_ms)
+{
+	uint64_t deadline = getnanotime() + timeout_ms * 1000000ULL;
+	int status, ret;
+	pid_t waiting;
+
+	kill(cmd->pid, SIGTERM);
+
+	for (;;) {
+		waiting = waitpid(cmd->pid, &status, WNOHANG);
+		if (waiting == cmd->pid)
+			break;
+		if (waiting < 0 && errno != EINTR) {
+			error_errno("waitpid for %s failed", cmd->args.v[0]);
+			ret = -1;
+			goto cleanup;
+		}
+		if (getnanotime() >= deadline) {
+			kill(cmd->pid, SIGKILL);
+			ret = wait_or_whine(cmd->pid, cmd->args.v[0], 0);
+			goto cleanup;
+		}
+		sleep_millisec(50);
+	}
+
+	clear_child_for_cleanup(cmd->pid);
+	ret = child_process_status(status, cmd->args.v[0], 0);
+
+cleanup:
 	trace2_child_exit(cmd, ret);
 	child_process_clear(cmd);
 	invalidate_lstat_cache();
