@@ -41,8 +41,8 @@ test_expect_success 'pack-objects emits local input snapshots' '
 		do
 			basename "$pack" || return 1
 		done | sort >expect-packs &&
-		find .git/objects -type f |
-			sed -n "s#^.git/objects/\\([0-9a-f][0-9a-f]\\)/\\([0-9a-f]*\\)\$#\\1\\2#p" |
+		find .git/objects/[0-9a-f][0-9a-f] -type f |
+			sed -e "s#^.git/objects/##" -e "s#/##" |
 			sort >expect-loose &&
 		echo stale >actual-packs &&
 		echo stale >actual-loose &&
