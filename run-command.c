@@ -561,7 +561,8 @@ static int child_process_status(int status, const char *argv0, int in_signal)
 
 	if (WIFSIGNALED(status)) {
 		code = WTERMSIG(status);
-		if (!in_signal && code != SIGINT && code != SIGQUIT && code != SIGPIPE)
+		if (!in_signal &&
+		    code != SIGINT && code != SIGQUIT && code != SIGPIPE)
 			error("%s died of signal %d", argv0, code);
 		/*
 		 * This return value is chosen so that code & 0xff

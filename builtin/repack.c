@@ -218,7 +218,7 @@ static void clean_stale_aggregate_keeps(const char *packdir)
 		fd = open(path.buf, O_RDONLY);
 		if (fd < 0) {
 			if (errno != ENOENT)
-				warning_errno(_("could not open aggregate .keep "
+				warning_errno(_("could not open aggregate "
 						"marker '%s'"), path.buf);
 			continue;
 		}
@@ -447,7 +447,8 @@ static int stop_pack_aggregate(struct pack_aggregate_process *agg)
 			ret = terminate_command(&agg->cmd, 5000);
 			if (ret && ret != 128 + SIGTERM &&
 			    ret != 128 + SIGKILL)
-				ret = error(_("git pack-aggregate --loop failed"));
+				ret = error(_("git pack-aggregate "
+					      "--loop failed"));
 			else
 				ret = 0;
 		}
