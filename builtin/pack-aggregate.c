@@ -61,7 +61,7 @@ static int has_sidecar(const char *packdir, const char *basename,
 	int ret;
 
 	strbuf_addf(&buf, "%s/%s.%s", packdir, basename, ext);
-	ret = !lstat(buf.buf, &st);
+	ret = !stat(buf.buf, &st);
 	strbuf_release(&buf);
 	return ret;
 }

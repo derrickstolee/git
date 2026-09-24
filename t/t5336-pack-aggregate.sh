@@ -363,6 +363,24 @@ test_expect_success '--max-objects skips packs above the object-count limit' '
 	)
 '
 
+test_expect_success SYMLINKS '--max-objects follows index symlinks' '
+	test_when_finished "rm -fr work" &&
+	cp -R repo work &&
+	(
+		cd work &&
+		big=$(build_big_pack 2) &&
+		mv .git/objects/pack/${big}.idx \
+			.git/objects/pack/${big}.idx.real &&
+		ln -s ${big}.idx.real .git/objects/pack/${big}.idx &&
+		git pack-aggregate --once \
+			--min-loose=1000 --min-packs=1 --max-objects=1 &&
+		test_path_is_file .git/objects/pack/${big}.pack &&
+		test_path_is_file .git/objects/pack/${big}.idx &&
+		test 0 -eq "$(count_baddeltas)" &&
+		git fsck
+	)
+'
+
 test_expect_success '--max-objects=0 disables the object-count limit' '
 	test_when_finished "rm -fr work" &&
 	cp -R repo work &&
