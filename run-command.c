@@ -1040,14 +1040,15 @@ int terminate_command(struct child_process *cmd, unsigned int timeout_ms)
 		}
 		if (getnanotime() >= deadline) {
 			kill(cmd->pid, SIGKILL);
-			ret = wait_or_whine(cmd->pid, cmd->args.v[0], 0);
+			ret = wait_or_whine(cmd->pid, cmd->args.v[0], 1);
+			clear_child_for_cleanup(cmd->pid);
 			goto cleanup;
 		}
 		sleep_millisec(50);
 	}
 
 	clear_child_for_cleanup(cmd->pid);
-	ret = child_process_status(status, cmd->args.v[0], 0);
+	ret = child_process_status(status, cmd->args.v[0], 1);
 
 cleanup:
 	trace2_child_exit(cmd, ret);

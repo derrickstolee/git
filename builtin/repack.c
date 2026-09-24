@@ -412,8 +412,10 @@ static int start_pack_aggregate(struct pack_aggregate_process *agg,
 	return 0;
 }
 
-static void stop_pack_aggregate(struct pack_aggregate_process *agg)
+static int stop_pack_aggregate(struct pack_aggregate_process *agg)
 {
+	int ret = 0;
+
 	/* Wake the aggregator if it is polling between cycles. */
 	if (agg->parent_pipe_write_fd >= 0) {
 		close(agg->parent_pipe_write_fd);
@@ -421,8 +423,14 @@ static void stop_pack_aggregate(struct pack_aggregate_process *agg)
 	}
 	if (agg->started) {
 		agg->started = 0;
-		if (agg->cmd.pid > 0)
-			terminate_command(&agg->cmd, 5000);
+		if (agg->cmd.pid > 0) {
+			ret = terminate_command(&agg->cmd, 5000);
+			if (ret && ret != 128 + SIGTERM &&
+			    ret != 128 + SIGKILL)
+				ret = error(_("git pack-aggregate --loop failed"));
+			else
+				ret = 0;
+		}
 	}
 	if (agg->tmpdir) {
 		struct strbuf path = STRBUF_INIT;
@@ -435,6 +443,7 @@ static void stop_pack_aggregate(struct pack_aggregate_process *agg)
 	FREE_AND_NULL(agg->exclude_loose_path);
 
 	remove_aggregate_keep_markers(agg);
+	return ret;
 }
 
 static int init_pack_aggregate(struct repository *repo,
@@ -1104,7 +1113,9 @@ int cmd_repack(int argc,
 	 * Stop aggregation before refreshing the object store or deleting
 	 * redundant packs and objects, which could race with it.
 	 */
-	stop_pack_aggregate(&aggregate);
+	ret = stop_pack_aggregate(&aggregate);
+	if (ret)
+		goto cleanup;
 
 	odb_reprepare(repo->objects);
 
@@ -1145,7 +1156,8 @@ int cmd_repack(int argc,
 	}
 
 cleanup:
-	stop_pack_aggregate(&aggregate);
+	if (stop_pack_aggregate(&aggregate) && !ret)
+		ret = -1;
 	string_list_clear(&keep_pack_list, 0);
 	string_list_clear(&names, 1);
 	oidset_clear(&drop_oids);
