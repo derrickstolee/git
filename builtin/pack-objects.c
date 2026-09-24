@@ -30,6 +30,7 @@
 #include "strvec.h"
 #include "strmap.h"
 #include "list.h"
+#include "wrapper.h"
 #include "packfile.h"
 #include "object-file.h"
 #include "object-file-convert.h"
@@ -5295,6 +5296,29 @@ static void emit_input_loose_to_file(const char *path)
 	strbuf_release(&tmp);
 }
 
+static void wait_for_test_input_snapshot(void)
+{
+	const char *path = getenv("GIT_TEST_PACK_OBJECTS_WAIT_AFTER_INPUT");
+	struct strbuf waiting_path = STRBUF_INIT;
+	int waited_ms = 0;
+
+	if (!path || (!emit_input_packs_path && !emit_input_loose_path))
+		return;
+
+	strbuf_addf(&waiting_path, "%s.waiting", path);
+	write_file(waiting_path.buf, "%s", "");
+	while (access(path, F_OK) < 0) {
+		if (errno != ENOENT)
+			die_errno(_("could not access '%s'"), path);
+		if (waited_ms >= 30000)
+			die(_("timed out waiting for test synchronization file "
+			      "'%s'"), path);
+		sleep_millisec(10);
+		waited_ms += 10;
+	}
+	strbuf_release(&waiting_path);
+}
+
 int cmd_pack_objects(int argc,
 		     const char **argv,
 		     const char *prefix,
@@ -5666,6 +5690,7 @@ int cmd_pack_objects(int argc,
 		emit_input_packs_to_file(emit_input_packs_path);
 	if (emit_input_loose_path)
 		emit_input_loose_to_file(emit_input_loose_path);
+	wait_for_test_input_snapshot();
 
 	if (progress && !cruft)
 		progress_state = start_progress(the_repository,

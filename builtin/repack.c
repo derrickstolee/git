@@ -388,6 +388,8 @@ static int run_pack_aggregate_once(const struct string_list *keep_pack_list,
 static int start_pack_aggregate(struct pack_aggregate_process *agg,
 				int pack_objects_out_fd)
 {
+	const char *test_interval =
+		getenv("GIT_TEST_PACK_AGGREGATE_INTERVAL");
 	int pp[2];
 
 	if (wait_for_emit_files(agg->exclude_packs_path,
@@ -415,6 +417,8 @@ static int start_pack_aggregate(struct pack_aggregate_process *agg,
 	strvec_pushf(&agg->cmd.args, "--exclude-loose-file=%s",
 		     agg->exclude_loose_path);
 	strvec_pushf(&agg->cmd.args, "--parent-pipe-fd=%d", pp[0]);
+	if (test_interval)
+		strvec_pushf(&agg->cmd.args, "--interval=%s", test_interval);
 	agg->cmd.git_cmd = 1;
 	if (start_command(&agg->cmd)) {
 		close(pp[0]);

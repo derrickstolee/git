@@ -8,11 +8,12 @@ test_description='`git pack-aggregate` rolls up small packs and loose objects'
 # blob.  Echoes the basenames (without .pack) one per line.
 build_n_packs () {
 	n=$1 &&
+	salt=${2-$$} &&
 	mkdir -p .git/objects/pack &&
 	i=0 &&
 	while test $i -lt "$n"
 	do
-		blob=$(echo "content-$i-$$" | git hash-object -w --stdin) &&
+		blob=$(echo "content-$i-$salt" | git hash-object -w --stdin) &&
 		echo "$blob" |
 		git pack-objects --window=0 .git/objects/pack/pack \
 			>pack_hash &&
@@ -1001,6 +1002,47 @@ test_expect_success 'repack --aggregate-loop spawns and reaps pack-aggregate' '
 			git repack -d --geometric=2 --aggregate-loop &&
 		test_grep "\"argv\":.*\"pack-aggregate\",\"--loop\"" trace.txt &&
 		# Tempdir should be cleaned up.
+		test -z "$(ls .git/objects | grep pack-aggregate)" &&
+		git fsck
+	)
+'
+
+test_expect_success 'repack --aggregate-loop aggregates new packs' '
+	test_when_finished "
+		test ! -f repack.pid ||
+			kill \"\$(cat repack.pid)\" 2>/dev/null || :
+		rm -fr work repack.pid
+	" &&
+	cp -R repo work &&
+	(
+		cd work &&
+		build_n_packs 5 initial >/dev/null &&
+		{
+			GIT_TEST_PACK_OBJECTS_WAIT_AFTER_INPUT="$PWD/gate" \
+			GIT_TEST_PACK_AGGREGATE_INTERVAL=1 \
+				git repack -d --geometric=2 \
+					--aggregate-loop &
+			repack_pid=$! &&
+			echo "$repack_pid" >../repack.pid
+		} &&
+		i=0 &&
+		while test ! -f gate.waiting && test $i -lt 100
+		do
+			sleep 0.1 &&
+			i=$((i + 1)) || return 1
+		done &&
+		test_path_is_file gate.waiting &&
+		build_n_packs 5 concurrent >/dev/null &&
+		i=0 &&
+		while test "$(count_baddeltas)" -eq 0 && test $i -lt 100
+		do
+			sleep 0.1 &&
+			i=$((i + 1)) || return 1
+		done &&
+		test 1 -eq "$(count_baddeltas)" &&
+		>gate &&
+		wait "$repack_pid" &&
+		rm ../repack.pid &&
 		test -z "$(ls .git/objects | grep pack-aggregate)" &&
 		git fsck
 	)
