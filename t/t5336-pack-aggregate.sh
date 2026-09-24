@@ -259,15 +259,20 @@ test_expect_success '--exclude-pack-file protects listed packs' '
 	(
 		cd work &&
 		build_n_packs 6 >packs.txt &&
-		head -n 2 packs.txt >exclude.txt &&
+		first=$(sed -n 1p packs.txt) &&
+		second=$(sed -n 2p packs.txt) &&
+		cat >exclude.txt <<-EOF &&
+		# pack exclusions may use either recognized suffix
+
+		  $first.pack
+		$second.idx
+		pack-does-not-exist
+		EOF
 		git pack-aggregate --once \
 			--min-loose=1000 --min-packs=4 \
 			--exclude-pack-file=exclude.txt &&
-		while read name
-		do
-			test_path_is_file \
-				.git/objects/pack/${name}.pack || return 1
-		done <exclude.txt &&
+		test_path_is_file .git/objects/pack/${first}.pack &&
+		test_path_is_file .git/objects/pack/${second}.pack &&
 		# 2 excluded + 1 aggregate = 3 packs total.
 		test 3 -eq "$(count_packs)" &&
 		test 1 -eq "$(count_baddeltas)" &&
@@ -695,16 +700,22 @@ test_expect_success '--exclude-loose-file protects listed loose objects' '
 	(
 		cd work &&
 		build_n_loose 5 >loose.txt &&
-		head -n 2 loose.txt >exclude.txt &&
+		first=$(sed -n 1p loose.txt) &&
+		second=$(sed -n 2p loose.txt) &&
+		cat >exclude.txt <<-EOF &&
+		# loose exclusions are full object IDs
+
+		  $first
+		$second
+		not-an-object-id
+		EOF
 		git pack-aggregate --once \
 			--min-loose=1 --min-packs=1000 \
 			--exclude-loose-file=exclude.txt &&
-		while read oid
-		do
-			test_path_is_file \
-				".git/objects/$(test_oid_to_path "$oid")" ||
-				return 1
-		done <exclude.txt &&
+		test_path_is_file \
+			".git/objects/$(test_oid_to_path "$first")" &&
+		test_path_is_file \
+			".git/objects/$(test_oid_to_path "$second")" &&
 		test 2 -eq "$(count_loose)" &&
 		test 1 -eq "$(count_packs)" &&
 		git fsck
