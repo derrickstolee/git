@@ -217,8 +217,9 @@ static void clean_stale_aggregate_keeps(const char *packdir)
 
 		fd = open(path.buf, O_RDONLY);
 		if (fd < 0) {
-			warning_errno(_("could not open aggregate .keep marker "
-					"'%s'"), path.buf);
+			if (errno != ENOENT)
+				warning_errno(_("could not open aggregate .keep "
+						"marker '%s'"), path.buf);
 			continue;
 		}
 		n = read_in_full(fd, buf, sizeof(buf) - 1);
