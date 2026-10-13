@@ -34,6 +34,7 @@
 #include "strvec.h"
 #include "submodule.h"
 #include "symlinks.h"
+#include "trace.h"
 #include "trace2.h"
 #include "tree.h"
 #include "tree-walk.h"
@@ -43,6 +44,8 @@
 #include "entry.h"
 #include "parallel-checkout.h"
 #include "add-interactive.h"
+
+#define ORPHAN_DELAY_WARNING_IN_MS (2 * 1000)
 
 struct checkout_opts {
 	int patch_mode;
@@ -1077,6 +1080,7 @@ static void orphaned_commit_warning(struct commit *old_commit, struct commit *ne
 {
 	struct rev_info revs;
 	struct object *object = &old_commit->object;
+	uint64_t t_begin = getnanotime();
 
 	repo_init_revisions(the_repository, &revs, NULL);
 	setup_revisions(0, NULL, &revs, NULL);
@@ -1101,6 +1105,15 @@ static void orphaned_commit_warning(struct commit *old_commit, struct commit *ne
 	/* Clean up objects used, as they will be reused. */
 	repo_clear_commit_marks(the_repository, ALL_REV_FLAGS);
 	release_revisions(&revs);
+
+	if (advice_enabled(ADVICE_CHECKOUT_ORPHANED_COMMIT_WARNING)) {
+		uint64_t t_delta_in_ms = (getnanotime() - t_begin) / 1000000;
+		if (t_delta_in_ms > ORPHAN_DELAY_WARNING_IN_MS)
+			advise_if_enabled(ADVICE_CHECKOUT_ORPHANED_COMMIT_WARNING,
+					  _("It took %.2f seconds to warn about orphaned commits. To avoid this in the\n"
+					    "future, use --no-orphan-warning or 'git config checkout.orphanWarning false'."),
+					  t_delta_in_ms / 1000.0);
+	}
 }
 
 static int switch_branches(const struct checkout_opts *opts,
