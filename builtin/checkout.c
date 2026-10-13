@@ -76,6 +76,7 @@ struct checkout_opts {
 	int ignore_unmerged;
 	int pathspec_file_nul;
 	char *pathspec_from_file;
+	int orphan_warning;
 
 	const char *new_branch;
 	const char *new_branch_force;
@@ -98,6 +99,7 @@ struct checkout_opts {
 	.patch_context = -1, \
 	.patch_interhunk_context = -1, \
 	.auto_advance = 1, \
+	.orphan_warning = -1, \
 }
 
 #define MERGE_WORKING_TREE_UNPACK_FAILED (-2)
@@ -1196,8 +1198,15 @@ static int switch_branches(const struct checkout_opts *opts,
 		}
 	}
 
-	if (!opts->quiet && !old_branch_info.path && old_branch_info.commit && new_branch_info->commit != old_branch_info.commit)
-		orphaned_commit_warning(old_branch_info.commit, new_branch_info->commit);
+	if (!opts->quiet &&
+	    !old_branch_info.path && old_branch_info.commit &&
+	    new_branch_info->commit != old_branch_info.commit) {
+		if (opts->orphan_warning)
+			orphaned_commit_warning(old_branch_info.commit, new_branch_info->commit);
+		else
+			describe_detached_head(_("Previous HEAD position was"),
+					       old_branch_info.commit);
+	}
 
 	update_refs_for_switch(opts, &old_branch_info, new_branch_info);
 
@@ -1234,6 +1243,10 @@ static int git_checkout_config(const char *var, const char *value,
 	}
 	if (!strcmp(var, "checkout.guess")) {
 		opts->dwim_new_local_branch = git_config_bool(var, value);
+		return 0;
+	}
+	if (!strcmp(var, "checkout.orphanwarning")) {
+		opts->orphan_warning = git_config_bool(var, value);
 		return 0;
 	}
 
@@ -1721,6 +1734,8 @@ static struct option *add_common_options(struct checkout_opts *opts,
 		OPT_CALLBACK(0, "conflict", opts, N_("style"),
 			     N_("conflict style (merge, diff3, or zdiff3)"),
 			     parse_opt_conflict),
+		OPT_BOOL(0, "orphan-warning", &opts->orphan_warning,
+			 N_("provide a detailed warning when leaving detached HEAD")),
 		OPT_END()
 	};
 	struct option *newopts = parse_options_concat(prevopts, options);

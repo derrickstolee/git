@@ -164,6 +164,24 @@ test_expect_success 'checkout does not warn leaving reachable commit' '
 	check_no_orphan_warning stderr
 '
 
+test_expect_success 'checkout does not warn with --no-orphan-warning' '
+	reset &&
+	git checkout --detach two &&
+	echo content >orphan &&
+	git add orphan &&
+	git commit -a -m orphan1 &&
+	echo new content >orphan &&
+	git commit -a -m orphan2 &&
+	orphan2=$(git rev-parse HEAD) &&
+
+	git checkout --no-orphan-warning main 2>stderr &&
+	check_no_orphan_warning stderr "2 commits" &&
+
+	git checkout - &&
+	git -c checkout.orphanWarning=false checkout main 2>stderr &&
+	check_no_orphan_warning stderr "2 commits"
+'
+
 cat >expect <<'EOF'
 Your branch is behind 'main' by 1 commit, and can be fast-forwarded.
   (use "git pull" to update your local branch)
