@@ -87,9 +87,20 @@ Predecessors outside the requested or unpruned object set are not expanded
 as dependencies. A cyclic tree predecessor chain, possible when earlier
 commits are excluded, is broken by leaving one tree without a predecessor.
 +
-The experimental `pack-objects` consumer uses this order and predecessor
-selection only for trees and blobs. Commits retain size-based delta
-selection; their discovery order is still needed to assign tree orders.
+The experimental `pack-objects` consumer independently enables chronological
+delta ordering and predecessor-first search per object type through
+`GIT_TEST_PACK_PATH_WALK_ORDER` and `GIT_TEST_PACK_PATH_WALK_PREVIOUS`.
+Each accepts a comma-separated subset of `commit,tree,blob`, or `none`.
+Chronological ordering requires all tracked delta bases to have smaller,
+positive IDs. Predecessor-only search retains size-based ordering and
+tries the predecessor only if it has already been processed in the same
+packing region. Shared topology metadata is collected whenever either
+control is enabled.
++
+The earlier `GIT_TEST_PACK_PATH_WALK_VERSIONS` modes remain defaults for
+controls not explicitly set: mode 0 changes nothing, mode 1 orders trees
+and blobs, and mode 2 also searches their predecessors. Tags always retain
+size-based selection.
 
 `prune_all_uninteresting`::
 	By default, all reachable paths are emitted by the path-walk API.

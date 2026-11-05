@@ -235,7 +235,7 @@ static int pack_to_stdout;
 static int sparse;
 static int thin;
 static int path_walk = -1;
-static unsigned long path_walk_version_mode;
+static unsigned path_walk_order_types, path_walk_previous_types;
 static struct path_walk_info path_versions = PATH_WALK_INFO_INIT;
 static uintmax_t version_base_attempts, version_base_matches;
 static int num_preferred_base;
@@ -2719,7 +2719,7 @@ static uint64_t object_version_order(const struct object_entry *entry)
 {
 	const struct path_walk_object_version *version;
 
-	if (oe_type(entry) != OBJ_TREE && oe_type(entry) != OBJ_BLOB)
+	if (!(path_walk_order_types & (1U << oe_type(entry))))
 		return 0;
 	version = path_walk_get_object_version(&path_versions, &entry->idx.oid);
 	return version ? version->order : 0;
@@ -3079,7 +3079,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		}
 		progress_unlock();
 
-		order = path_walk_version_mode ? object_version_order(entry) : 0;
+		order = object_version_order(entry);
 		mem_usage -= free_unpacked(n);
 		n->entry = entry;
 		n->depth = entry->depth;
@@ -3113,7 +3113,8 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 				goto next;
 		}
 
-		if (search && order && path_walk_version_mode > 1) {
+		if (search &&
+		    (path_walk_previous_types & (1U << oe_type(entry)))) {
 			const struct path_walk_object_version *version =
 				path_walk_get_object_version(&path_versions,
 							     &entry->idx.oid);
@@ -3125,8 +3126,9 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 			    base >= to_pack.objects + search->region->start &&
 			    base < to_pack.objects + search->region->start +
 					    search->region->nr &&
-			    object_version_order(base) &&
-			    object_version_order(base) < version->order) {
+			    (!order ||
+			     (object_version_order(base) &&
+			      object_version_order(base) < order))) {
 				unsigned base_depth =
 					search->depths[base - to_pack.objects -
 						       search->region->start];
@@ -3550,9 +3552,9 @@ static void find_deltas_for_region(struct object_entry *list,
 			delta_list[delta_list_nr++] = entry;
 	}
 
-	versioned = path_walk_version_mode && delta_list_nr &&
-		    (oe_type(*delta_list) == OBJ_TREE ||
-		     oe_type(*delta_list) == OBJ_BLOB);
+	versioned = delta_list_nr &&
+		    ((path_walk_order_types | path_walk_previous_types) &
+		     (1U << oe_type(*delta_list)));
 	if (versioned) {
 		ALLOC_ARRAY(search.depths, region->nr);
 		for (size_t i = 0; i < region->nr; i++)
@@ -3786,7 +3788,7 @@ static void prepare_pack(int window, int depth)
 		ll_find_deltas_by_region(to_pack.objects, to_pack.regions,
 					 0, to_pack.nr_regions);
 
-	if (path_walk_version_mode) {
+	if (path_walk_order_types || path_walk_previous_types) {
 		/*
 		 * The fallback search can deltify bases used by the path
 		 * search. Account for their newly created descendants when
@@ -3828,7 +3830,7 @@ static void prepare_pack(int window, int depth)
 			progress_state = start_progress(the_repository,
 							_("Compressing objects"),
 							nr_deltas);
-		QSORT(delta_list, n, path_walk_version_mode ? version_size_sort : type_size_sort);
+		QSORT(delta_list, n, path_walk_order_types ? version_size_sort : type_size_sort);
 		ll_find_deltas(delta_list, n, window+1, depth, &nr_done);
 		stop_progress(&progress_state);
 		if (nr_done != nr_deltas)
@@ -4958,7 +4960,8 @@ static int add_objects_by_path(const char *path,
 		struct object_id *oid = &oids->oid[i];
 
 		/* Keep commit packing and island propagation newest-first. */
-		if (path_walk_version_mode && type == OBJ_COMMIT)
+		if ((path_walk_order_types || path_walk_previous_types) &&
+		    type == OBJ_COMMIT)
 			oid = &oids->oid[oids->nr - i - 1];
 
 		/* Skip objects that do not exist locally. */
@@ -5020,19 +5023,47 @@ static int add_objects_by_path(const char *path,
 	return 0;
 }
 
+static unsigned path_walk_version_types(const char *name, unsigned fallback)
+{
+	const char *value = getenv(name);
+	struct string_list types = STRING_LIST_INIT_DUP;
+	struct string_list_item *item;
+	unsigned result = 0;
+
+	if (!value)
+		return fallback;
+	if (!*value || !strcmp(value, "none"))
+		return 0;
+
+	string_list_split(&types, value, ",", -1);
+	for_each_string_list_item(item, &types) {
+		int type = type_from_string_gently(item->string, -1, 1);
+		if (type != OBJ_COMMIT && type != OBJ_TREE && type != OBJ_BLOB)
+			die("invalid object type '%s' in %s", item->string, name);
+		result |= 1U << type;
+	}
+	string_list_clear(&types, 0);
+	return result;
+}
+
 static int get_object_list_path_walk(struct rev_info *revs)
 {
 	struct path_walk_info info = PATH_WALK_INFO_INIT;
 	unsigned int processed = 0;
+	unsigned long mode =
+		git_env_ulong("GIT_TEST_PACK_PATH_WALK_VERSIONS", 0);
+	unsigned trees_and_blobs = (1U << OBJ_TREE) | (1U << OBJ_BLOB);
 	int result;
 
 	info.revs = revs;
 	info.path_fn = add_objects_by_path;
 	info.path_fn_data = &processed;
-	/* Experimental: 0 = unchanged, 1 = ordering, 2 = predecessor search. */
-	path_walk_version_mode =
-		git_env_ulong("GIT_TEST_PACK_PATH_WALK_VERSIONS", 0);
-	info.track_object_versions = !!path_walk_version_mode;
+	path_walk_order_types = path_walk_version_types(
+		"GIT_TEST_PACK_PATH_WALK_ORDER", mode ? trees_and_blobs : 0);
+	path_walk_previous_types = path_walk_version_types(
+		"GIT_TEST_PACK_PATH_WALK_PREVIOUS", mode > 1 ? trees_and_blobs : 0);
+	info.track_object_versions =
+		!!(path_walk_order_types || path_walk_previous_types);
 
 	/*
 	 * Path-walk needs boundary commits to discover thin-pack bases, but
@@ -5671,7 +5702,7 @@ int cmd_pack_objects(int argc,
 		trace2_region_enter("pack-objects", "prepare-pack",
 				    the_repository);
 		prepare_pack(window, depth);
-		if (path_walk_version_mode) {
+		if (path_walk_order_types || path_walk_previous_types) {
 			trace2_data_intmax("pack-objects", the_repository,
 					   "version-base/attempts", version_base_attempts);
 			trace2_data_intmax("pack-objects", the_repository,
