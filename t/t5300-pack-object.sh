@@ -766,4 +766,107 @@ test_expect_success '--path-walk thin pack' '
 	git -C server index-pack --fix-thin --stdin <out.pack
 '
 
+test_expect_success 'path-walk ordering uses older tree and blob bases' '
+	git init version-pack &&
+	(
+		cd version-pack &&
+		test-tool genrandom predecessor 4096 >file &&
+		git add file &&
+		git commit -m first &&
+		git tag first &&
+		git checkout -b side &&
+		for i in 1 2 3 4
+		do
+			test-tool genrandom side-$i 4096 >file &&
+			git commit -am side-$i || return 1
+		done &&
+		git checkout -b main first &&
+		git merge -s ours --no-ff side -m merge &&
+		echo appended >>file &&
+		cp file another &&
+		echo more >>another &&
+		git add another &&
+		git commit -am last &&
+		target=$(git rev-parse HEAD:file) &&
+		GIT_TEST_PACK_PATH_WALK_VERSIONS=1 \
+			git pack-objects --all --path-walk --window=2 \
+			--depth=3 --threads=2 --no-reuse-delta \
+			--no-reuse-object mode-1 >hash &&
+		hash=$(cat hash) &&
+		git verify-pack -v mode-1-$hash.idx >pack-1 &&
+		awk -v oid="$target" "\$1 == oid {print NF}" pack-1 >actual &&
+		echo 5 >expect &&
+		test_cmp expect actual &&
+		test-tool path-walk --versions -- --all >versions &&
+		awk -F: "
+			\$1 == \"version\" && (\$2 == \"tree\" || \$2 == \"blob\") {
+				print \$4, \$5
+			}
+		" versions >orders &&
+		awk "
+			NR == FNR {order[\$1] = \$2; next}
+			NF == 7 && order[\$1] &&
+				order[\$7] >= order[\$1] {exit 1}
+			NF == 7 && \$6 > 3 {exit 1}
+		" orders pack-1
+	)
+'
+
+test_expect_success 'path-walk ordering rejects bases with the same discovery ID' '
+	git init shared-versions &&
+	(
+		cd shared-versions &&
+		mkdir z &&
+		test-tool genrandom shared 4096 >z/file &&
+		git add . &&
+		git commit -m first &&
+		base=$(git rev-parse HEAD:z/file) &&
+		mkdir a &&
+		cp z/file a/file &&
+		echo extra >a/extra &&
+		echo appended >>z/file &&
+		git add . &&
+		git commit -m second &&
+		target=$(git rev-parse HEAD:z/file) &&
+		test-tool path-walk --versions -- HEAD >versions &&
+		test_grep "version:blob:a/file:$base:2:$ZERO_OID" versions &&
+		test_grep "version:blob:z/file:$target:2:$base" versions &&
+		GIT_TEST_PACK_PATH_WALK_VERSIONS=1 \
+			git pack-objects --all --path-walk --threads=1 \
+			--no-reuse-delta --no-reuse-object pack >hash &&
+		hash=$(cat hash) &&
+		git verify-pack -v pack-$hash.idx >actual &&
+		awk -v base="$base" -v target="$target" "
+			(\$1 == base || \$1 == target) && NF == 7 {exit 1}
+		" actual
+	)
+'
+
+test_expect_success 'path-walk version ordering preserves size-based commit deltas' '
+	git init commit-versions &&
+	(
+		cd commit-versions &&
+		tree=$(git mktree </dev/null) &&
+		test_seq 1 2048 >message &&
+		first=$(git commit-tree "$tree" -F message) &&
+		echo appended >>message &&
+		last=$(git commit-tree "$tree" -p "$first" -F message) &&
+		git update-ref refs/heads/main "$last" &&
+		for mode in 0 1
+		do
+			GIT_TEST_PACK_PATH_WALK_VERSIONS=$mode \
+				git pack-objects --all --path-walk --threads=1 \
+				--no-reuse-delta --no-reuse-object mode-$mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v mode-$mode-$hash.idx >pack-$mode &&
+			awk "\$2 == \"commit\" {print \$1, \$7}" pack-$mode |
+				sort >commits-$mode || return 1
+		done &&
+		test_cmp commits-0 commits-1 &&
+		awk -v oid="$first" "\$1 == oid {print \$7}" pack-1 >actual &&
+		echo "$last" >expect &&
+		test_cmp expect actual
+	)
+'
+
 test_done
