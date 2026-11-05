@@ -235,6 +235,7 @@ static int thin;
 static int path_walk = -1;
 static unsigned long path_walk_version_mode;
 static struct path_walk_info path_versions = PATH_WALK_INFO_INIT;
+static uintmax_t version_base_attempts, version_base_matches;
 static int num_preferred_base;
 static struct progress *progress_state;
 
@@ -2693,6 +2694,12 @@ struct unpacked {
 	unsigned depth;
 };
 
+struct path_delta_search {
+	struct packing_region *region;
+	unsigned *depths;
+	uintmax_t attempts, matches;
+};
+
 static uint64_t object_version_order(const struct object_entry *entry)
 {
 	const struct path_walk_object_version *version;
@@ -3018,7 +3025,8 @@ static size_t free_unpacked(struct unpacked *n)
 }
 
 static void find_deltas(struct object_entry **list, unsigned *list_size,
-			int window, int depth, unsigned *processed)
+			int window, int depth, unsigned *processed,
+			struct path_delta_search *search)
 {
 	uint32_t i, idx = 0, count = 0;
 	struct unpacked *array;
@@ -3048,6 +3056,9 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		order = path_walk_version_mode ? object_version_order(entry) : 0;
 		mem_usage -= free_unpacked(n);
 		n->entry = entry;
+		if (search)
+			search->depths[entry - to_pack.objects -
+				       search->region->start] = 0;
 
 		while (window_memory_limit &&
 		       mem_usage > window_memory_limit &&
@@ -3073,6 +3084,37 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 			max_depth -= check_delta_limit(entry, 0);
 			if (max_depth <= 0)
 				goto next;
+		}
+
+		if (search && order && path_walk_version_mode > 1) {
+			const struct path_walk_object_version *version =
+				path_walk_get_object_version(&path_versions,
+							     &entry->idx.oid);
+			struct object_entry *base = NULL;
+
+			if (version && !is_null_oid(&version->previous))
+				base = packlist_find(&to_pack, &version->previous);
+			if (base && base != entry &&
+			    base >= to_pack.objects + search->region->start &&
+			    base < to_pack.objects + search->region->start +
+					    search->region->nr &&
+			    object_version_order(base) &&
+			    object_version_order(base) < version->order) {
+				unsigned base_depth =
+					search->depths[base - to_pack.objects -
+						       search->region->start];
+				if (base_depth != UINT_MAX) {
+					struct unpacked previous = {
+						.entry = base,
+						.depth = base_depth,
+					};
+					search->attempts++;
+					if (try_delta(n, &previous, max_depth,
+						      &mem_usage) > 0)
+						search->matches++;
+					mem_usage -= free_unpacked(&previous);
+				}
+			}
 		}
 
 		j = window;
@@ -3131,6 +3173,10 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 * depth, leaving it in the window is pointless.  we
 		 * should evict it first.
 		 */
+		/* Window rotation below can move the current object out of 'n'. */
+		if (search)
+			search->depths[entry - to_pack.objects -
+				       search->region->start] = n->depth;
 		if (DELTA(entry) && max_depth <= n->depth)
 			continue;
 
@@ -3139,7 +3185,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 * currently deltified object, to keep it longer.  It will
 		 * be the first base object to be attempted next.
 		 */
-		if (DELTA(entry)) {
+		if (DELTA(entry) && best_base >= 0) {
 			struct unpacked swap = array[best_base];
 			int dist = (window + idx - best_base) % window;
 			int dst = best_base;
@@ -3225,7 +3271,7 @@ static void *threaded_find_deltas(void *arg)
 		progress_unlock();
 
 		find_deltas(me->list, &me->remaining,
-			    me->window, me->depth, me->processed);
+			    me->window, me->depth, me->processed, NULL);
 
 		progress_lock();
 		me->working = 0;
@@ -3262,7 +3308,7 @@ static void ll_find_deltas(struct object_entry **list, unsigned list_size,
 	init_threaded_search();
 
 	if (delta_search_threads <= 1) {
-		find_deltas(list, &list_size, window, depth, processed);
+		find_deltas(list, &list_size, window, depth, processed, NULL);
 		cleanup_threaded_search();
 		return;
 	}
@@ -3464,6 +3510,10 @@ static void find_deltas_for_region(struct object_entry *list,
 {
 	struct object_entry **delta_list;
 	unsigned int delta_list_nr = 0;
+	int versioned;
+	struct path_delta_search search = {
+		.region = region,
+	};
 
 	ALLOC_ARRAY(delta_list, region->nr);
 	for (size_t i = 0; i < region->nr; i++) {
@@ -3472,9 +3522,24 @@ static void find_deltas_for_region(struct object_entry *list,
 			delta_list[delta_list_nr++] = entry;
 	}
 
-	QSORT(delta_list, delta_list_nr,
-	      path_walk_version_mode ? version_size_sort : type_size_sort);
-	find_deltas(delta_list, &delta_list_nr, window, depth, processed);
+	versioned = path_walk_version_mode && delta_list_nr &&
+		    (oe_type(*delta_list) == OBJ_TREE ||
+		     oe_type(*delta_list) == OBJ_BLOB);
+	if (versioned) {
+		ALLOC_ARRAY(search.depths, region->nr);
+		for (size_t i = 0; i < region->nr; i++)
+			search.depths[i] = UINT_MAX;
+		QSORT(delta_list, delta_list_nr, version_size_sort);
+	} else {
+		QSORT(delta_list, delta_list_nr, type_size_sort);
+	}
+	find_deltas(delta_list, &delta_list_nr, window, depth, processed,
+		    versioned ? &search : NULL);
+	progress_lock();
+	version_base_attempts += search.attempts;
+	version_base_matches += search.matches;
+	progress_unlock();
+	free(search.depths);
 	free(delta_list);
 }
 
@@ -4936,7 +5001,7 @@ static int get_object_list_path_walk(struct rev_info *revs)
 	info.revs = revs;
 	info.path_fn = add_objects_by_path;
 	info.path_fn_data = &processed;
-	/* Experimental: 0 = unchanged, 1 = tree/blob ordering. */
+	/* Experimental: 0 = unchanged, 1 = ordering, 2 = predecessor search. */
 	path_walk_version_mode =
 		git_env_ulong("GIT_TEST_PACK_PATH_WALK_VERSIONS", 0);
 	info.track_object_versions = !!path_walk_version_mode;
@@ -5573,6 +5638,12 @@ int cmd_pack_objects(int argc,
 		trace2_region_enter("pack-objects", "prepare-pack",
 				    the_repository);
 		prepare_pack(window, depth);
+		if (path_walk_version_mode) {
+			trace2_data_intmax("pack-objects", the_repository,
+					   "version-base/attempts", version_base_attempts);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "version-base/matches", version_base_matches);
+		}
 		trace2_region_leave("pack-objects", "prepare-pack",
 				    the_repository);
 	}
