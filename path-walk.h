@@ -3,10 +3,17 @@
  * by the paths that can reach those objects.
  */
 #include "object.h" /* Required for 'enum object_type'. */
+#include "oidmap.h"
 
 struct rev_info;
 struct oid_array;
 struct pattern_list;
+
+struct path_walk_object_version {
+	struct oidmap_entry entry;
+	struct object_id previous;
+	uint64_t order;
+};
 
 /**
  * The type of a function pointer for the method that is called on a list of
@@ -32,6 +39,15 @@ struct path_walk_info {
 	 */
 	path_fn path_fn;
 	void *path_fn_data;
+
+	/**
+	 * Walk commits in reverse topological order and record the first
+	 * discovery order and previous version of each commit, tree and blob.
+	 * Metadata remains available until path_walk_info_clear(). Objects
+	 * discovered only through pending objects may have no metadata.
+	 */
+	int track_object_versions;
+	struct oidmap object_versions;
 
 	/**
 	 * Initialize which object types the path_fn should be called on. This
@@ -101,6 +117,9 @@ struct path_walk_info {
 
 void path_walk_info_init(struct path_walk_info *info);
 void path_walk_info_clear(struct path_walk_info *info);
+
+const struct path_walk_object_version *path_walk_get_object_version(
+	const struct path_walk_info *info, const struct object_id *oid);
 
 /**
  * Given the configuration of 'info', walk the commits based on 'info->revs' and
