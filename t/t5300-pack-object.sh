@@ -7,6 +7,26 @@ test_description='git pack-object'
 
 . ./test-lib.sh
 
+test_expect_success 'delta hash buckets preserve matching and literal instructions' '
+	test-tool genrandom bucket-base 4096 >bucket-base &&
+	test-tool genrandom bucket-unrelated 4096 >bucket-unrelated &&
+	{
+		cat bucket-unrelated &&
+		dd if=bucket-base bs=1 skip=1024 count=2048 &&
+		printf appended
+	} >bucket-target &&
+	test-tool delta -d bucket-base bucket-target bucket-delta &&
+	test_oid_cache <<-\EOF &&
+	bucket_delta sha1:b6ff404d9db73c8916d6eea3fdc6c69eb7162ca6
+	bucket_delta sha256:d24f0e9f2ddb1cd3d143b93b635e1b0f169af4f99f5522587e509ef89ba910b6
+	EOF
+	git hash-object --no-filters bucket-delta >actual &&
+	test_oid bucket_delta >expect &&
+	test_cmp expect actual &&
+	test-tool delta -p bucket-base bucket-delta bucket-reconstructed &&
+	test_cmp bucket-target bucket-reconstructed
+'
+
 test_expect_success 'setup' '
 	rm -f .git/index* &&
 	test-tool genzeros 4096 | tr "\000" "a" >a &&

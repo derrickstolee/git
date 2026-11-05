@@ -53,6 +53,10 @@ retain ordinary size ordering.
 | Window 50: T/B + P, S=T/B, R off | 159.41 | 177.26 |  |  |  |
 | Size blobs + T/B P: T order, window 10, S=T/B | 144.85 | 186.25 |  |  |  |
 | Size blobs + T/B P: T order, window 50, S=T/B | 136.99 | 167.73 | 803.92 | 1495.72 | 1959.35 |
+| Bucket filter: T order, T/B P+S, window 50 |  |  |  |  |  |
+| Bucket filter: T order, T/B P+S, window 50, memory 1 MiB |  |  |  |  |  |
+| Window 50: T order, T/B P, S off |  |  |  |  |  |
+| Window 50: ordinary size-order baseline, S off |  |  |  |  |  |
 <!-- pack-size-results:end -->
 
 `[A]` predates the tagged-tree correctness fix. Its Linux primary packs omit
@@ -71,7 +75,7 @@ The session-local `pack-size-results.csv` records exact bytes, settings,
 completion state, and the source report for every cell. The generated table
 refreshes when the active benchmark reports publish completed results.
 
-All currently planned runs are complete. The strongest measured common
+The initial benchmark rounds are complete. The strongest measured common
 configuration is chronological trees, predecessor hints and skipping for
 trees/blobs, size-ordered blobs, window 50, and no recompression. This is
 not an ablation proving every component necessary, and its extra CPU cost
@@ -413,6 +417,67 @@ Longer-term
 options are bounded competing trial forests, growth/inclusion and lineage
 sampling, and transactional rewrites with fixed external boundaries.
 
+## 9. Reducing the Linux computation cost
+
+The full Linux hybrid/window-50 trace spends 144.9 seconds enumerating,
+2746.6 seconds preparing deltas, and 237.4 seconds writing. Metadata is
+therefore not the main source of its 3130.1-second runtime. The search
+makes 27,180,615 ancestor attempts for 81,744 matches, but these counts
+alone do not establish where CPU time is spent.
+
+Userspace sampling on `HEAD~500..HEAD` (14,876 Linux commits, 138,066
+packed objects) attributes 89.38% of sampled executable CPU to
+`create_delta()` and 7.06% to index creation. The hottest source lines
+scan Rabin hash buckets and reject unequal full hashes. This is a bounded
+slice, not a profile of the complete repository; shared-library time is
+not attributed by this sampler.
+
+The fingerprint prototype stores a 32-bit mask of the high five Rabin
+bits present in each bucket's first entry. A missing bit proves that the
+bucket cannot contain a matching full hash. Positive tests preserve the
+original scan, including its order and match choices. The field fits
+existing entry padding on this 64-bit build; 32-bit indexes can grow.
+It changes the cost of evaluating candidates, not the delta policy.
+
+Single-threaded runs on that slice, window 50/depth 50, tree ordering,
+tree/blob predecessors and skipping, and recompression disabled:
+
+| Implementation / window-memory budget | Pack MiB | Delta preparation seconds | Total seconds |
+|---|---:|---:|---:|
+| Original, unlimited | 123.40 | 60.61 | 69.80 |
+| Duplicate-incumbent guard, unlimited | 123.40 | 59.96 | 69.13 |
+| Bucket fingerprint, unlimited | 123.40 | 38.84 | 47.99 |
+| Original, 1 MiB | 124.30 | 32.40 | 41.65 |
+| Bucket fingerprint, 1 MiB | 124.30 | 22.37 | 31.72 |
+
+The duplicate-incumbent guard was discarded: its roughly 1% result does
+not materially address the slowdown. The bucket filter reduces delta
+preparation by 35.9% and total time by 31.3% on this slice. Both memory
+settings produce byte-identical packs and identical predecessor/skip
+counters before and after the filter. An additional 384 differential
+delta cases preserve the instruction streams and reconstruct correctly.
+
+A 1 MiB window-memory budget is a separate, existing policy knob: it cuts
+work by evicting large candidates sooner, with a 0.73% pack-size cost on
+this slice. It must not be conflated with the lossless fingerprint
+optimization. Full Linux measurements and matched window/skipping
+ablations remain necessary before claiming that the 5x slowdown is solved.
+
+The full-repository study serializes its repacks to avoid competing Linux
+jobs. Blank cells below are not yet successfully measured. The ordinary
+size baseline can exceed the requested depth through its legacy fallback.
+
+<!-- linux-cost-results:start -->
+| Full Linux run | Pack MiB | Total seconds | Delta preparation seconds | Max depth |
+|---|---:|---:|---:|---:|
+| Original hybrid, window 50 | 1959.35 | 3130.1 | 2746.6 | 50 |
+| Bucket filter, hybrid, window 50 |  |  |  |  |
+| Bucket filter, hybrid, window 50, memory 1 MiB |  |  |  |  |
+| Original hybrid, window 10 |  |  |  |  |
+| Original hybrid, window 50, S off |  |  |  |  |
+| Original size baseline, window 50, S off |  |  |  |  |
+<!-- linux-cost-results:end -->
+
 ## Reports and remaining questions
 
 Raw reports are session-local artifacts, not tracked repository files. Paths
@@ -431,6 +496,8 @@ below are relative to the session's `files/path-walk-benchmark/` directory:
 | `window50/` | Wider-window comparison for size-ordered and chronological blobs. |
 | `size-blob-predecessors-window10/`, `size-blob-predecessors-window50/` | Size-ordered blob predecessor-hint comparisons. |
 | `forest-study/` | Branching, directional probes, small trial forests, and validated mutation simulations. |
+| `linux-cost-profile/` | Userspace sampling, differential delta corpus, and byte-identical Linux-slice timing comparisons. |
+| `linux-cost-ablation/` | Serialized full-Linux cost/quality comparisons; cells remain blank until independently validated. |
 
 These directories contain JSON/CSV results and pinned source provenance;
 diagnostic directories additionally retain their instrumentation and packs.

@@ -117,6 +117,7 @@ static const unsigned int U[256] = {
 struct index_entry {
 	const unsigned char *ptr;
 	unsigned int val;
+	unsigned int value_mask;
 };
 
 struct unpacked_index_entry {
@@ -197,6 +198,7 @@ struct delta_index * create_delta_index(const void *buf, size_t bufsize)
 			i = val & hmask;
 			entry->entry.ptr = data + RABIN_WINDOW;
 			entry->entry.val = val;
+			entry->entry.value_mask = 0;
 			entry->next = hash[i];
 			hash[i] = entry++;
 			hash_count[i]++;
@@ -279,13 +281,20 @@ struct delta_index * create_delta_index(const void *buf, size_t bufsize)
 	packed_entry = mem;
 
 	for (i = 0; i < hsize; i++) {
+		unsigned int value_mask = 0;
+
 		/*
 		 * Coalesce all entries belonging to one linked list
-		 * into consecutive array entries.
+		 * into consecutive array entries. The first entry also
+		 * summarizes the high bits of every hash in the bucket.
 		 */
 		packed_hash[i] = packed_entry;
-		for (entry = hash[i]; entry; entry = entry->next)
+		for (entry = hash[i]; entry; entry = entry->next) {
+			value_mask |= 1U << (entry->entry.val >> 27);
 			*packed_entry++ = entry->entry;
+		}
+		if (packed_hash[i] != packed_entry)
+			packed_hash[i]->value_mask = value_mask;
 	}
 
 	/* Sentinel value to indicate the length of the last hash bucket */
@@ -378,7 +387,11 @@ create_delta(const struct delta_index *index,
 			val ^= U[data[-RABIN_WINDOW]];
 			val = ((val << 8) | *data) ^ T[val >> RABIN_SHIFT];
 			i = val & index->hash_mask;
-			for (entry = index->hash[i]; entry < index->hash[i+1]; entry++) {
+			entry = index->hash[i];
+			if (entry < index->hash[i + 1] &&
+			    !(entry->value_mask & (1U << (val >> 27))))
+				entry = index->hash[i + 1];
+			for (; entry < index->hash[i + 1]; entry++) {
 				const unsigned char *ref = entry->ptr;
 				const unsigned char *src = data;
 				unsigned int ref_size = ref_top - ref;
