@@ -97,6 +97,21 @@ tries the predecessor only if it has already been processed in the same
 packing region. Shared topology metadata is collected whenever either
 control is enabled.
 +
+`GIT_TEST_PACK_PATH_WALK_SKIP` enables delta-base skipping for a
+comma-separated subset of `commit,tree,blob`, or disables it with `none`.
+It defaults to the predecessor-search types. When a predecessor or window
+candidate has exhausted the depth budget, the consumer follows its selected
+delta bases to find an eligible, shallower ancestor. It stops at the first
+accepted delta, after 64 links, or when the accumulated raw delta sizes
+exceed one eighth of the target's size. These sizes guide the search; each
+candidate still requires a new direct delta and the usual depth/size checks.
+Depth-limited window entries remain available as hints to their ancestors.
+All candidates must already be processed in the same packing region, and
+chronologically ordered types still require smaller positive IDs.
+Skipping can also be enabled without predecessor search or chronological
+ordering, using only the preliminary delta graph from the size-ordered
+path search. This does not require topology metadata.
++
 The earlier `GIT_TEST_PACK_PATH_WALK_VERSIONS` modes remain defaults for
 controls not explicitly set: mode 0 changes nothing, mode 1 orders trees
 and blobs, and mode 2 also searches their predecessors. Tags always retain

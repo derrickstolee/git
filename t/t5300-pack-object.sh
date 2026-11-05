@@ -1034,4 +1034,77 @@ test_expect_success 'path-walk predecessor-only search handles reused trees' '
 	)
 '
 
+test_expect_success 'path-walk skips saturated predecessor delta bases' '
+	git init skip-deltas &&
+	(
+		cd skip-deltas &&
+		test-tool genrandom skip-base 4096 >file &&
+		git add file &&
+		git commit -m first &&
+		for i in 1 2 3
+		do
+			test-tool genrandom skip-$i 256 >>file &&
+			git commit -am append-$i || return 1
+		done &&
+		first=$(git rev-parse HEAD~3:file) &&
+		second=$(git rev-parse HEAD~2:file) &&
+		target=$(git rev-parse HEAD:file) &&
+		for skip in none blob
+		do
+			GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			GIT_TEST_PACK_PATH_WALK_SKIP=$skip \
+				git pack-objects --all --path-walk --window=1 \
+				--depth=2 --threads=1 --no-reuse-delta \
+				--no-reuse-object $skip >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $skip-$hash.idx >pack-$skip &&
+			awk "NF == 7 && \$6 > 2 {exit 1}" pack-$skip ||
+				return 1
+		done &&
+		awk -v oid="$target" "\$1 == oid {print \$7}" pack-none >actual &&
+		echo "$first" >expect &&
+		test_cmp expect actual &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-blob >actual &&
+		echo "2 $second" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk can skip size-ordered window bases without predecessors' '
+	git init skip-window &&
+	(
+		cd skip-window &&
+		test-tool genrandom window-base 16384 >file &&
+		git add file &&
+		git commit -m first &&
+		for i in 1 2 3 4 5 6 7 8 9 10
+		do
+			test-tool genrandom window-$i 512 >chunk &&
+			dd if=chunk of=file bs=512 seek=$i conv=notrunc &&
+			test-tool genrandom append-$i 32 >>file &&
+			git commit -am version-$i || return 1
+		done &&
+		for skip in none blob
+		do
+			GIT_TEST_PACK_PATH_WALK_ORDER=none \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=none \
+			GIT_TEST_PACK_PATH_WALK_SKIP=$skip \
+			GIT_TRACE2_EVENT="$PWD/$skip.trace" \
+				git pack-objects --all --path-walk --window=3 \
+				--depth=2 --threads=1 --no-reuse-delta \
+				--no-reuse-object $skip >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $skip-$hash.idx >pack-$skip &&
+			awk "NF == 7 && \$6 > 2 {exit 1}" pack-$skip ||
+				return 1
+		done &&
+		target=$(git rev-parse HEAD~8:file) &&
+		without=$(awk -v oid="$target" "\$1 == oid {print \$3}" pack-none) &&
+		with=$(awk -v oid="$target" "\$1 == oid {print \$3}" pack-blob) &&
+		test "$with" -lt "$without" &&
+		test_grep "\"key\":\"version-base/skip-matches\",\"value\":\"[1-9][0-9]*\"" blob.trace
+	)
+'
+
 test_done

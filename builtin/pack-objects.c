@@ -233,9 +233,10 @@ static int pack_to_stdout;
 static int sparse;
 static int thin;
 static int path_walk = -1;
-static unsigned path_walk_order_types, path_walk_previous_types;
+static unsigned path_walk_order_types, path_walk_previous_types, path_walk_skip_types;
 static struct path_walk_info path_versions = PATH_WALK_INFO_INIT;
 static uintmax_t version_base_attempts, version_base_matches;
+static uintmax_t version_skip_attempts, version_skip_matches;
 static int num_preferred_base;
 static struct progress *progress_state;
 
@@ -2698,6 +2699,7 @@ struct path_delta_search {
 	struct packing_region *region;
 	unsigned *depths;
 	uintmax_t attempts, matches;
+	uintmax_t skip_attempts, skip_matches;
 };
 
 static uint64_t object_version_order(const struct object_entry *entry)
@@ -3024,6 +3026,71 @@ static size_t free_unpacked(struct unpacked *n)
 	return freed_mem;
 }
 
+static int try_delta_with_ancestors(struct unpacked *trg, struct unpacked *src,
+				    unsigned max_depth, size_t *mem_usage,
+				    struct path_delta_search *search,
+				    uint64_t order)
+{
+	struct object_entry *base = src->entry;
+	unsigned base_depth = src->depth;
+	size_t budget = SIZE(trg->entry) / 8;
+	int ret = try_delta(trg, src, max_depth, mem_usage);
+
+	if (ret || base_depth < max_depth || !search ||
+	    !(path_walk_skip_types & (1U << oe_type(trg->entry))))
+		return ret;
+
+	/*
+	 * A saturated base can still lead to a shallow, similar ancestor.
+	 * Bound the walk by both its length and the accumulated raw deltas.
+	 */
+	for (unsigned hops = 0; hops < 64; hops++) {
+		struct unpacked ancestor = { 0 };
+		unsigned ancestor_depth;
+		size_t delta_size;
+
+		if (!DELTA(base) || base->ext_base)
+			break;
+		delta_size = DELTA_SIZE(base);
+		if (delta_size > budget)
+			break;
+		budget -= delta_size;
+		base = DELTA(base);
+		if (base == trg->entry ||
+		    base < to_pack.objects + search->region->start ||
+		    base >= to_pack.objects + search->region->start +
+				    search->region->nr)
+			break;
+		ancestor_depth = search->depths[base - to_pack.objects -
+						search->region->start];
+		if (ancestor_depth == UINT_MAX || ancestor_depth >= base_depth)
+			break;
+		base_depth = ancestor_depth;
+		if (base_depth >= max_depth)
+			continue;
+		if (order) {
+			uint64_t base_order = object_version_order(base);
+			if (!base_order || base_order >= order)
+				continue;
+		}
+		if (DELTA(trg->entry) == base)
+			continue;
+
+		ancestor.entry = base;
+		ancestor.depth = base_depth;
+		search->skip_attempts++;
+		ret = try_delta(trg, &ancestor, max_depth, mem_usage);
+		*mem_usage -= free_unpacked(&ancestor);
+		if (ret > 0) {
+			search->skip_matches++;
+			return ret;
+		}
+		if (ret < 0)
+			break;
+	}
+	return 0;
+}
+
 static void find_deltas(struct object_entry **list, unsigned *list_size,
 			int window, int depth, unsigned *processed,
 			struct path_delta_search *search)
@@ -3111,8 +3178,9 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 						.depth = base_depth,
 					};
 					search->attempts++;
-					if (try_delta(n, &previous, max_depth,
-						      &mem_usage) > 0)
+					if (try_delta_with_ancestors(n, &previous,
+								     max_depth, &mem_usage,
+								     search, order) > 0)
 						search->matches++;
 					mem_usage -= free_unpacked(&previous);
 				}
@@ -3134,7 +3202,8 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 				if (!base_order || base_order >= order)
 					continue;
 			}
-			ret = try_delta(n, m, max_depth, &mem_usage);
+			ret = try_delta_with_ancestors(n, m, max_depth,
+						       &mem_usage, search, order);
 			if (ret < 0)
 				break;
 			else if (ret > 0)
@@ -3171,15 +3240,16 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 			}
 		}
 
-		/* if we made n a delta, and if n is already at max
-		 * depth, leaving it in the window is pointless.  we
-		 * should evict it first.
+		/*
+		 * Evict saturated deltas unless their ancestors can still
+		 * supply usable bases.
 		 */
 		/* Window rotation below can move the current object out of 'n'. */
 		if (search)
 			search->depths[entry - to_pack.objects -
 				       search->region->start] = n->depth;
-		if (DELTA(entry) && max_depth <= n->depth)
+		if (DELTA(entry) && max_depth <= n->depth &&
+		    !(search && (path_walk_skip_types & (1U << oe_type(entry)))))
 			continue;
 
 		/*
@@ -3525,7 +3595,8 @@ static void find_deltas_for_region(struct object_entry *list,
 	}
 
 	versioned = delta_list_nr &&
-		    ((path_walk_order_types | path_walk_previous_types) &
+		    ((path_walk_order_types | path_walk_previous_types |
+		      path_walk_skip_types) &
 		     (1U << oe_type(*delta_list)));
 	if (versioned) {
 		ALLOC_ARRAY(search.depths, region->nr);
@@ -3540,6 +3611,8 @@ static void find_deltas_for_region(struct object_entry *list,
 	progress_lock();
 	version_base_attempts += search.attempts;
 	version_base_matches += search.matches;
+	version_skip_attempts += search.skip_attempts;
+	version_skip_matches += search.skip_matches;
 	progress_unlock();
 	free(search.depths);
 	free(delta_list);
@@ -3760,7 +3833,8 @@ static void prepare_pack(int window, int depth)
 		ll_find_deltas_by_region(to_pack.objects, to_pack.regions,
 					 0, to_pack.nr_regions);
 
-	if (path_walk_order_types || path_walk_previous_types) {
+	if (path_walk_order_types || path_walk_previous_types ||
+	    path_walk_skip_types) {
 		/*
 		 * The fallback search can deltify bases used by the path
 		 * search. Account for their newly created descendants when
@@ -5034,6 +5108,8 @@ static int get_object_list_path_walk(struct rev_info *revs)
 		"GIT_TEST_PACK_PATH_WALK_ORDER", mode ? trees_and_blobs : 0);
 	path_walk_previous_types = path_walk_version_types(
 		"GIT_TEST_PACK_PATH_WALK_PREVIOUS", mode > 1 ? trees_and_blobs : 0);
+	path_walk_skip_types = path_walk_version_types(
+		"GIT_TEST_PACK_PATH_WALK_SKIP", path_walk_previous_types);
 	info.track_object_versions =
 		!!(path_walk_order_types || path_walk_previous_types);
 
@@ -5669,11 +5745,15 @@ int cmd_pack_objects(int argc,
 		trace2_region_enter("pack-objects", "prepare-pack",
 				    the_repository);
 		prepare_pack(window, depth);
-		if (path_walk_order_types || path_walk_previous_types) {
+		if (path_walk_order_types || path_walk_previous_types || path_walk_skip_types) {
 			trace2_data_intmax("pack-objects", the_repository,
 					   "version-base/attempts", version_base_attempts);
 			trace2_data_intmax("pack-objects", the_repository,
 					   "version-base/matches", version_base_matches);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "version-base/skip-attempts", version_skip_attempts);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "version-base/skip-matches", version_skip_matches);
 		}
 		trace2_region_leave("pack-objects", "prepare-pack",
 				    the_repository);
