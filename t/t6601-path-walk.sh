@@ -929,4 +929,247 @@ test_expect_success 'sparse:oid with shared tree OID across cone boundary' '
 	test_cmp_sorted expect out
 '
 
+test_expect_success 'setup version history with skewed dates and repeated trees' '
+	git init versions &&
+	(
+		cd versions &&
+		mkdir dir &&
+		echo first >dir/file &&
+		echo collision >collision &&
+		git add . &&
+		test_tick &&
+		GIT_COMMITTER_DATE="2030-01-01T00:00:00 +0000" \
+			git commit -m first &&
+		git tag first &&
+		git commit --allow-empty -m unchanged &&
+		git tag unchanged &&
+		echo second >dir/file &&
+		git rm collision &&
+		mkdir collision &&
+		echo nested >collision/file &&
+		git add . &&
+		git commit -m second &&
+		git tag second &&
+		git checkout -b side first &&
+		echo side >dir/file &&
+		git commit -am side &&
+		git checkout -b merged second &&
+		git merge -s ours --no-ff side -m merge &&
+		git tag merged
+	)
+'
+
+test_expect_success 'version order is topological and follows first parents' '
+	(
+		cd versions &&
+		test-tool path-walk --versions -- merged >out &&
+		grep "^version:commit:" out >commits &&
+		git rev-list --topo-order --reverse merged >order &&
+		cut -d: -f4 commits >actual &&
+		test_cmp order actual &&
+		awk -F: "{print \$5}" commits >actual &&
+		test_seq 1 5 >expect &&
+		test_cmp expect actual &&
+		while read oid
+		do
+			parent=$(git rev-parse "$oid^" 2>/dev/null) ||
+				parent=$ZERO_OID &&
+			echo "$oid:$parent" || return 1
+		done <order >expect &&
+		cut -d: -f4,6 commits >actual &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'trees and blobs inherit first discovery order and predecessors' '
+	(
+		cd versions &&
+		test-tool path-walk --versions -- second >out &&
+		for type in commit tree blob
+		do
+			case $type in
+			commit) path= && suffix= ;;
+			tree) path=dir/ && suffix=:dir ;;
+			blob) path=dir/file && suffix=:dir/file ;;
+			esac &&
+			cat <<-EOF || return 1
+			version:$type:$path:$(git rev-parse first$suffix):1:$ZERO_OID
+			version:$type:$path:$(git rev-parse second$suffix):3:$(git rev-parse unchanged$suffix)
+			EOF
+		done >expect &&
+		grep -E "^version:(commit::|tree:dir/:|blob:dir/file:)" out |
+			grep -v "^version:commit::$(git rev-parse unchanged):" >actual &&
+		test_cmp_sorted expect actual &&
+		test_grep "version:tree::$(git rev-parse first^{tree}):1:$ZERO_OID" out &&
+		test_grep "version:tree::$(git rev-parse second^{tree}):3:$(git rev-parse first^{tree})" out &&
+		test_grep "version:tree:collision/:$(git rev-parse second:collision):3:$(git rev-parse first:collision)" out &&
+		test-tool path-walk --versions --no-blobs -- second >trees 2>err &&
+		test_must_be_empty err &&
+		test_grep "version:tree:collision/:$(git rev-parse second:collision):3:$(git rev-parse first:collision)" trees
+	)
+'
+
+test_expect_success 'previous versions survive directory-to-file changes' '
+	(
+		cd versions &&
+		git checkout -b type-change second &&
+		git rm -r collision &&
+		echo plain >collision &&
+		git add collision &&
+		git commit -m plain &&
+		test-tool path-walk --versions -- HEAD >out &&
+		test_grep "version:blob:collision:$(git rev-parse HEAD:collision):4:$(git rev-parse second:collision)" out
+	)
+'
+
+test_expect_success 'new names do not reread the predecessor tree for each lookup' '
+	git init new-name-versions &&
+	(
+		cd new-name-versions &&
+		test_seq 1 32 >numbers &&
+		while read i
+		do
+			echo old-$i >a$i || return 1
+		done <numbers &&
+		git add a* &&
+		git commit -m old &&
+		git tag old &&
+		while read i
+		do
+			echo new-$i >z$i || return 1
+		done <numbers &&
+		git add z* &&
+		git commit -m new &&
+		git -c pack.window=0 repack -ad &&
+		old_tree=$(git rev-parse old^{tree}) &&
+		idx=$(echo .git/objects/pack/*.idx) &&
+		git show-index <"$idx" >index &&
+		offset=$(awk -v oid="$old_tree" "\$2 == oid {print \$1}" index) &&
+		test -n "$offset" &&
+		GIT_TRACE_PACK_ACCESS="$PWD/access.trace" \
+			test-tool path-walk --versions -- HEAD >out &&
+		awk -v offset="$offset" "\$NF == offset" access.trace >reads &&
+		test_line_count -le 4 reads &&
+		while read i
+		do
+			test_grep "version:blob:z$i:$(git rev-parse HEAD:z$i):2:$ZERO_OID" out ||
+				return 1
+		done <numbers
+	)
+'
+
+test_expect_success 'tracking versions preserves sparse, filtered, and direct object walks' '
+	for args in \
+		"--all" \
+		"--boundary topic ^base~1" \
+		"--indexed-objects --branches" \
+		"--all -- dir" \
+		"--all -- left/b"
+	do
+		test-tool path-walk -- $args >plain &&
+		test-tool path-walk --versions -- $args >tracked &&
+		sed -n "s/^[0-9]*://p" plain >expect &&
+		sed -n "s/^[0-9]*://p" tracked >actual &&
+		test_cmp_sorted expect actual || return 1
+	done &&
+	test-tool path-walk --filter=blob:limit=3 -- --all >plain &&
+	test-tool path-walk --versions --filter=blob:limit=3 -- --all >tracked &&
+	sed -n "s/^[0-9]*://p" plain >expect &&
+	sed -n "s/^[0-9]*://p" tracked >actual &&
+	test_cmp_sorted expect actual
+'
+
+test_expect_success 'predecessor trees are expanded before successors at other paths' '
+	git init cross-path-versions &&
+	(
+		cd cross-path-versions &&
+		mkdir -p z/dir &&
+		echo original >z/file &&
+		echo nested >z/dir/file &&
+		git add z &&
+		git commit -m first &&
+		git tag first &&
+		cp -R z a &&
+		git add a &&
+		git commit -m copied &&
+		echo extra >a/dir/extra &&
+		git add a/dir/extra &&
+		git commit -m extra &&
+		echo changed >a/file &&
+		git commit -am changed &&
+		test-tool path-walk --versions -- HEAD >out &&
+		test_grep "version:blob:z/file:$(git rev-parse first:z/file):1:$ZERO_OID" out &&
+		test_grep "version:blob:z/dir/file:$(git rev-parse first:z/dir/file):1:$ZERO_OID" out &&
+		test_grep "version:tree:a/dir/:$(git rev-parse HEAD:a/dir):3:$(git rev-parse first:z/dir)" out &&
+		test_grep "version:blob:a/file:$(git rev-parse HEAD:a/file):4:$(git rev-parse first:z/file)" out &&
+		test_grep "version:blob:a/dir/extra:$(git rev-parse HEAD:a/dir/extra):3:$ZERO_OID" out &&
+		awk -F: "\$1 == \"version\" && \$4 == \$6 {exit 1}" out
+	)
+'
+
+test_expect_success 'cross-path dependencies preserve filtered object sets' '
+	(
+		cd cross-path-versions &&
+		git tag direct-tree first:z &&
+		for args in \
+			"--all" \
+			"--boundary HEAD ^HEAD~2" \
+			"--prune --boundary HEAD ^HEAD~2" \
+			"--all -- a"
+		do
+			test-tool path-walk -- $args >plain &&
+			test-tool path-walk --versions -- $args >tracked &&
+			sed -n "s/^[0-9]*:[^:]*:[^:]*://p" plain >expect &&
+			sed -n "s/^[0-9]*:[^:]*:[^:]*://p" tracked >actual &&
+			test_cmp_sorted expect actual || return 1
+		done &&
+		for filter in blob:none blob:limit=8 object:type=tree
+		do
+			test-tool path-walk --filter=$filter -- --all >plain &&
+			test-tool path-walk --versions --filter=$filter -- --all >tracked &&
+			sed -n "s/^[0-9]*:[^:]*:[^:]*://p" plain >expect &&
+			sed -n "s/^[0-9]*:[^:]*:[^:]*://p" tracked >actual &&
+			test_cmp_sorted expect actual || return 1
+		done &&
+		cat >patterns <<-\EOF &&
+		/*
+		!/*/
+		/a/
+		EOF
+		for sparse_trees in --pl-sparse-trees --no-pl-sparse-trees
+		do
+			test-tool path-walk --stdin-pl \
+				$sparse_trees -- HEAD <patterns >plain &&
+			test-tool path-walk --versions --stdin-pl \
+				$sparse_trees -- HEAD <patterns >tracked &&
+			sed -n "s/^[0-9]*:[^:]*:[^:]*://p" plain |
+				sort -u >expect &&
+			sed -n "s/^[0-9]*:[^:]*:[^:]*://p" tracked |
+				sort -u >actual &&
+			test_cmp expect actual || return 1
+		done
+	)
+'
+
+test_expect_success 'partial histories break cyclic tree predecessor dependencies' '
+	git init cyclic-versions &&
+	(
+		cd cyclic-versions &&
+		a_blob=$(echo a | git hash-object -w --stdin) &&
+		b_blob=$(echo b | git hash-object -w --stdin) &&
+		a_tree=$(printf "100644 blob %s\tfile\n" "$a_blob" | git mktree) &&
+		b_tree=$(printf "100644 blob %s\tfile\n" "$b_blob" | git mktree) &&
+		a_parent=$(echo a-parent | git commit-tree "$a_tree") &&
+		b_parent=$(echo b-parent | git commit-tree "$b_tree") &&
+		a_tip=$(echo a-tip | git commit-tree "$a_tree" -p "$b_parent") &&
+		b_tip=$(echo b-tip | git commit-tree "$b_tree" -p "$a_parent") &&
+		test-tool path-walk --versions -- --no-walk "$a_tip" "$b_tip" >out &&
+		grep "^version:tree::" out >trees &&
+		test_line_count = 2 trees &&
+		grep ":$ZERO_OID$" trees >roots &&
+		test_line_count = 1 roots &&
+		awk -F: "\$1 == \"version\" && \$4 == \$6 {exit 1}" out
+	)
+'
+
 test_done

@@ -58,6 +58,35 @@ are never silently dropped.
 While it is possible to walk only commits in this way, consumers would be
 better off using the revision walk API instead.
 
+`track_object_versions`::
+	When enabled, commits are visited in reverse topological order, with
+	parents before children. Each commit receives a positive, increasing
+	`order`, and its first parent is recorded as its `previous` version.
+	A root tree inherits the order of the first commit that discovers it,
+	and its previous version is that commit's first parent's root tree.
+	Trees at each path are expanded in increasing order. Before expanding
+	a tree, the walk expands any queued predecessor tree at its original
+	path, even if it belongs to another path batch. Each tree's children
+	are expanded only once, except for sparse aliases that need an
+	additional in-cone walk. Newly discovered children inherit their tree's
+	order and use the same-name entry in the previous tree as their
+	previous version, if one exists and has a different object ID.
+	This can cross a file/directory type change; a previous non-tree
+	object has no children to propagate to the new tree.
++
+Call `path_walk_get_object_version(info, oid)` to access this metadata,
+including from `path_fn`. The returned pointer is owned by `info` and
+remains valid until `path_walk_info_clear()`. A null previous object ID
+means no previous version was found; a NULL pointer means no version
+metadata was recorded, as can happen for directly requested objects.
+Repeated object IDs retain their first discovery metadata, even if they
+appear again at another path. A previous version need not be in the
+requested object set or have a smaller order. Consumers must check this
+before using the relationship to build an acyclic delta graph.
+Predecessors outside the requested or unpruned object set are not expanded
+as dependencies. A cyclic tree predecessor chain, possible when earlier
+commits are excluded, is broken by leaving one tree without a predecessor.
+
 `prune_all_uninteresting`::
 	By default, all reachable paths are emitted by the path-walk API.
 	This option allows consumers to declare that they are not

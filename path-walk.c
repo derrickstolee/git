@@ -27,6 +27,22 @@
 
 static const char *root_path = "";
 
+struct object_version {
+	struct path_walk_object_version version;
+	const char *path;
+	unsigned expanding:1;
+	unsigned expanded:1;
+};
+
+const struct path_walk_object_version *path_walk_get_object_version(
+	const struct path_walk_info *info, const struct object_id *oid)
+{
+	const struct object_version *version = oidmap_get(&info->object_versions, oid);
+
+	/* Pending trees can have expansion state without version metadata. */
+	return version && version->version.order ? &version->version : NULL;
+}
+
 struct type_and_oid_list {
 	enum object_type type;
 	struct oid_array oids;
@@ -67,9 +83,74 @@ struct path_walk_context {
 	 */
 	struct prio_queue path_stack;
 	struct strset path_stack_pushed;
+	struct strset version_paths;
 
 	unsigned exact_pathspecs:1;
+	unsigned version_paths_ready:1;
 };
+
+static struct object_version *get_or_create_version(struct path_walk_context *ctx,
+						    const struct object_id *oid)
+{
+	struct object_version *version =
+		oidmap_get(&ctx->info->object_versions, oid);
+
+	if (!version) {
+		CALLOC_ARRAY(version, 1);
+		oidcpy(&version->version.entry.oid, oid);
+		oidmap_put(&ctx->info->object_versions, version);
+	}
+	return version;
+}
+
+static void record_object_version(struct path_walk_context *ctx,
+				  const struct object_id *oid,
+				  const struct object_id *previous,
+				  uint64_t order)
+{
+	struct object_version *version;
+
+	if (!ctx->info->track_object_versions ||
+	    path_walk_get_object_version(ctx->info, oid))
+		return;
+
+	version = get_or_create_version(ctx, oid);
+	if (previous && !oideq(oid, previous))
+		oidcpy(&version->version.previous, previous);
+	else
+		oidclr(&version->version.previous, ctx->repo->hash_algo);
+	version->version.order = order;
+}
+
+static void record_tree_path(struct path_walk_context *ctx,
+			     const char *path, const struct object_id *oid)
+{
+	struct object_version *version;
+
+	if (!ctx->info->track_object_versions)
+		return;
+
+	version = get_or_create_version(ctx, oid);
+	if (!version->path) {
+		strset_add(&ctx->version_paths, path);
+		version->path = strmap_get_entry(&ctx->version_paths.map, path)->key;
+	}
+}
+
+static int compare_by_version(const void *va, const void *vb, void *data)
+{
+	const struct path_walk_info *info = data;
+	const struct path_walk_object_version *a =
+		path_walk_get_object_version(info, va);
+	const struct path_walk_object_version *b =
+		path_walk_get_object_version(info, vb);
+	uint64_t a_order = a ? a->order : 0;
+	uint64_t b_order = b ? b->order : 0;
+
+	if (a_order != b_order)
+		return a_order < b_order ? -1 : 1;
+	return oidcmp(va, vb);
+}
 
 static int compare_by_type(const void *one, const void *two, void *cb_data)
 {
@@ -128,6 +209,8 @@ static void add_path_to_list(struct path_walk_context *ctx,
 
 	list->maybe_interesting |= interesting;
 	oid_array_append(&list->oids, oid);
+	if (type == OBJ_TREE && ctx->version_paths_ready)
+		record_tree_path(ctx, path, oid);
 }
 
 static int add_tree_entries(struct path_walk_context *ctx,
@@ -135,10 +218,17 @@ static int add_tree_entries(struct path_walk_context *ctx,
 			    struct object_id *oid)
 {
 	struct tree_desc desc;
+	struct tree_desc previous_desc = { 0 };
+	struct strmap previous_entries = STRMAP_INIT;
+	int previous_entries_ready = 0;
+	int ret = 0;
 	struct name_entry entry;
 	struct strbuf path = STRBUF_INIT;
 	size_t base_len;
 	struct tree *tree = lookup_tree(ctx->repo, oid);
+	struct tree *previous_tree = NULL;
+	const struct path_walk_object_version *version =
+		path_walk_get_object_version(ctx->info, oid);
 
 	if (!tree) {
 		error(_("failed to walk children of tree %s: not found"),
@@ -149,14 +239,47 @@ static int add_tree_entries(struct path_walk_context *ctx,
 		return -1;
 	}
 
+	if (version && !is_null_oid(&version->previous)) {
+		struct object *previous =
+			lookup_object(ctx->repo, &version->previous);
+		enum object_type previous_type = previous ? previous->type : OBJ_NONE;
+		if (!previous_type)
+			previous_type = odb_read_object_info(ctx->repo->objects,
+							     &version->previous, NULL);
+		if (previous_type == OBJ_TREE)
+			previous_tree = lookup_tree(ctx->repo, &version->previous);
+		if (previous_tree &&
+		    repo_parse_tree_gently(ctx->repo, previous_tree, 1))
+			previous_tree = NULL;
+		if (previous_tree)
+			init_tree_desc(&previous_desc, &previous_tree->object.oid,
+				       previous_tree->buffer, previous_tree->size);
+	}
+
 	strbuf_addstr(&path, base_path);
 	base_len = path.len;
 
 	init_tree_desc(&desc, &tree->object.oid, tree->buffer, tree->size);
 	while (tree_entry(&desc, &entry)) {
 		struct object *o;
+		const struct object_id *previous = NULL;
 		/* Not actually true, but we will ignore submodules later. */
 		enum object_type type = S_ISDIR(entry.mode) ? OBJ_TREE : OBJ_BLOB;
+
+		while (previous_desc.size &&
+		       base_name_compare(previous_desc.entry.path,
+					 previous_desc.entry.pathlen,
+					 previous_desc.entry.mode,
+					 entry.path, entry.pathlen,
+					 entry.mode) < 0)
+			update_tree_entry(&previous_desc);
+
+		if (previous_desc.size &&
+		    !name_compare(previous_desc.entry.path,
+				  previous_desc.entry.pathlen,
+				  entry.path, entry.pathlen) &&
+		    !S_ISGITLINK(previous_desc.entry.mode))
+			previous = &previous_desc.entry.oid;
 
 		/* Skip submodules. */
 		if (S_ISGITLINK(entry.mode))
@@ -179,7 +302,8 @@ static int add_tree_entries(struct path_walk_context *ctx,
 		if (!o) {
 			error(_("failed to find object %s"),
 			      oid_to_hex(&entry.oid));
-			return -1;
+			ret = -1;
+			goto cleanup;
 		}
 
 		strbuf_setlen(&path, base_len);
@@ -272,15 +396,45 @@ static int add_tree_entries(struct path_walk_context *ctx,
 		}
 
 		o->flags |= SEEN;
+		if (version) {
+			/*
+			 * A file/directory change can put the same name at a
+			 * different position in tree order. Index the previous
+			 * tree once if the ordered scan cannot find a match.
+			 */
+			if (!previous && previous_tree) {
+				if (!previous_entries_ready) {
+					struct tree_desc names;
+					struct name_entry old_entry;
+
+					init_tree_desc(&names, &previous_tree->object.oid,
+						       previous_tree->buffer,
+						       previous_tree->size);
+					while (tree_entry(&names, &old_entry))
+						if (!S_ISGITLINK(old_entry.mode))
+							free(strmap_put(&previous_entries,
+									old_entry.path,
+									oiddup(&old_entry.oid)));
+					previous_entries_ready = 1;
+				}
+				previous = strmap_get(&previous_entries, entry.path);
+			}
+			record_object_version(ctx, &entry.oid, previous,
+					      version->order);
+		}
 		add_path_to_list(ctx, path.buf, type, &entry.oid,
 				 !(o->flags & UNINTERESTING));
 
 		push_to_stack(ctx, path.buf);
 	}
 
+cleanup:
+	strmap_clear(&previous_entries, 1);
 	free_tree_buffer(tree);
+	if (previous_tree && previous_tree != tree)
+		free_tree_buffer(previous_tree);
 	strbuf_release(&path);
-	return 0;
+	return ret;
 }
 
 /*
@@ -292,6 +446,117 @@ static int path_is_for_direct_objects(const char *path)
 {
 	ASSERT(path);
 	return path[0] == '/';
+}
+
+static int path_is_uninteresting(struct path_walk_context *ctx,
+				 struct type_and_oid_list *list)
+{
+	if (!ctx->info->prune_all_uninteresting)
+		return 0;
+	if (!list->maybe_interesting)
+		return 1;
+
+	list->maybe_interesting = 0;
+	for (size_t i = 0; !list->maybe_interesting && i < list->oids.nr; i++) {
+		struct object *object;
+
+		if (list->type != OBJ_TREE && list->type != OBJ_BLOB) {
+			list->maybe_interesting = 1;
+			break;
+		}
+		object = lookup_object(ctx->repo, &list->oids.oid[i]);
+		if (object && !(object->flags & UNINTERESTING))
+			list->maybe_interesting = 1;
+	}
+	return !list->maybe_interesting;
+}
+
+static int can_expand_path(struct path_walk_context *ctx, const char *path)
+{
+	struct type_and_oid_list *list = strmap_get(&ctx->paths_to_lists, path);
+
+	return list && !path_is_uninteresting(ctx, list) &&
+	       (!path_is_for_direct_objects(path) || ctx->info->trees);
+}
+
+static const char *tree_base_path(const char *path)
+{
+	return !strcmp(path, "/tagged-trees") ? root_path : path;
+}
+
+static int expand_tree(struct path_walk_context *ctx, const char *path,
+		       struct object_id *oid)
+{
+	struct object_version *tree = oidmap_get(&ctx->info->object_versions, oid);
+	struct object_version **stack = NULL;
+	size_t nr = 0, alloc = 0;
+	int ret = 0;
+
+	if (!tree->expanded) {
+		ALLOC_GROW(stack, nr + 1, alloc);
+		stack[nr++] = tree;
+		tree->expanding = 1;
+	}
+
+	while (nr) {
+		struct object_version *version = stack[nr - 1];
+		struct object_version *previous =
+			oidmap_get(&ctx->info->object_versions, &version->version.previous);
+
+		if (previous && previous->path && !previous->expanded &&
+		    can_expand_path(ctx, previous->path)) {
+			if (previous->expanding) {
+				/* Excluded history can leave cyclic tree predecessors. */
+				oidclr(&version->version.previous, ctx->repo->hash_algo);
+			} else {
+				ALLOC_GROW(stack, nr + 1, alloc);
+				stack[nr++] = previous;
+				previous->expanding = 1;
+				continue;
+			}
+		}
+
+		ret = add_tree_entries(ctx, tree_base_path(version->path),
+				       &version->version.entry.oid);
+		if (ret)
+			break;
+		version->expanded = 1;
+		version->expanding = 0;
+		nr--;
+	}
+
+	while (nr)
+		stack[--nr]->expanding = 0;
+	free(stack);
+
+	/* Sparse walks can also need the same tree at an in-cone alias. */
+	if (!ret && strcmp(path, tree->path))
+		ret = add_tree_entries(ctx, tree_base_path(path), oid);
+	return ret;
+}
+
+static int expand_path_trees(struct path_walk_context *ctx, const char *path,
+			     struct type_and_oid_list *list)
+{
+	int ret = 0;
+
+	if (list->type != OBJ_TREE ||
+	    (path_is_for_direct_objects(path) && !ctx->info->trees))
+		return 0;
+
+	if (ctx->info->track_object_versions) {
+		QSORT_S(list->oids.oid, list->oids.nr, compare_by_version, ctx->info);
+		list->oids.sorted = 0;
+	}
+	for (size_t i = 0; i < list->oids.nr; i++) {
+		struct object_id oid = list->oids.oid[i];
+
+		if (ctx->info->track_object_versions)
+			ret |= expand_tree(ctx, path, &oid);
+		else
+			ret |= add_tree_entries(ctx, tree_base_path(path), &oid);
+	}
+	return ret;
 }
 
 /*
@@ -315,42 +580,8 @@ static int walk_path(struct path_walk_context *ctx,
 	if (!list->oids.nr)
 		return 0;
 
-	if (ctx->info->prune_all_uninteresting) {
-		/*
-		 * This is true if all objects were UNINTERESTING
-		 * when added to the list.
-		 */
-		if (!list->maybe_interesting)
-			return 0;
-
-		/*
-		 * But it's still possible that the objects were set
-		 * as UNINTERESTING after being added. Do a quick check.
-		 */
-		list->maybe_interesting = 0;
-		for (size_t i = 0;
-		     !list->maybe_interesting && i < list->oids.nr;
-		     i++) {
-			if (list->type == OBJ_TREE) {
-				struct tree *t = lookup_tree(ctx->repo,
-							     &list->oids.oid[i]);
-				if (t && !(t->object.flags & UNINTERESTING))
-					list->maybe_interesting = 1;
-			} else if (list->type == OBJ_BLOB) {
-				struct blob *b = lookup_blob(ctx->repo,
-							     &list->oids.oid[i]);
-				if (b && !(b->object.flags & UNINTERESTING))
-					list->maybe_interesting = 1;
-			} else {
-				/* Tags are always interesting if visited. */
-				list->maybe_interesting = 1;
-			}
-		}
-
-		/* We have confirmed that all objects are UNINTERESTING. */
-		if (!list->maybe_interesting)
-			return 0;
-	}
+	if (path_is_uninteresting(ctx, list))
+		return 0;
 
 	if (list->type == OBJ_BLOB &&
 	    ctx->revs->prune_data.nr &&
@@ -359,6 +590,11 @@ static int walk_path(struct path_walk_context *ctx,
 			   path, strlen(path), 0,
 			   NULL, 0))
 		return 0;
+
+	/* Resolve cross-path dependencies before exposing tree metadata. */
+	if (ctx->info->track_object_versions &&
+	    (ret = expand_path_trees(ctx, path, list)))
+		return ret;
 
 	/*
 	 * Evaluate function pointer on this data, if requested.
@@ -393,21 +629,8 @@ static int walk_path(struct path_walk_context *ctx,
 					ctx->info->path_fn_data);
 	}
 
-	/*
-	 * Expand tree children, except when the set is directly requested
-	 * _and_ we are otherwise filtering out trees.
-	 */
-	if (list->type == OBJ_TREE &&
-	    (!path_is_for_direct_objects(path) || ctx->info->trees)) {
-		/* Use root path if expanding from tagged/direct trees. */
-		const char *expand_path = !strcmp(path, "/tagged-trees")
-					  ? root_path : path;
-		for (size_t i = 0; i < list->oids.nr; i++) {
-			ret |= add_tree_entries(ctx,
-					    expand_path,
-					    &list->oids.oid[i]);
-		}
-	}
+	if (!ctx->info->track_object_versions)
+		ret |= expand_path_trees(ctx, path, list);
 
 	oid_array_clear(&list->oids);
 	strmap_remove(&ctx->paths_to_lists, path, 1);
@@ -711,9 +934,9 @@ int walk_objects_by_path(struct path_walk_info *info)
 		.info = info,
 		.path_stack = {
 			.compare = compare_by_type,
-			.cb_data = &ctx
-		},
+			.cb_data = &ctx },
 		.path_stack_pushed = STRSET_INIT,
+		.version_paths = STRSET_INIT,
 		.paths_to_lists = STRMAP_INIT
 	};
 
@@ -747,6 +970,12 @@ int walk_objects_by_path(struct path_walk_info *info)
 	 */
 	info->revs->blob_objects = info->revs->tree_objects = 1;
 
+	if (info->track_object_versions) {
+		info->revs->topo_order = 1;
+		info->revs->sort_order = REV_SORT_IN_GRAPH_ORDER;
+		info->revs->reverse = 1;
+	}
+
 	if (prepare_revision_walk(info->revs))
 		die(_("failed to setup revision walk"));
 
@@ -777,7 +1006,12 @@ int walk_objects_by_path(struct path_walk_info *info)
 	while ((c = get_revision(info->revs))) {
 		struct object_id *oid;
 		struct tree *t;
+		struct commit *previous = c->parents ? c->parents->item : NULL;
 		commits_nr++;
+
+		record_object_version(&ctx, &c->object.oid,
+				      previous ? &previous->object.oid : NULL,
+				      commits_nr);
 
 		if (info->commits)
 			oid_array_append(&commit_list->oids,
@@ -795,6 +1029,12 @@ int walk_objects_by_path(struct path_walk_info *info)
 			return -1;
 		}
 
+		if (info->track_object_versions) {
+			struct object_id *previous_oid = NULL;
+			if (previous && !repo_parse_commit(ctx.repo, previous))
+				previous_oid = get_commit_tree_oid(previous);
+			record_object_version(&ctx, oid, previous_oid, commits_nr);
+		}
 		if (t->object.flags & SEEN)
 			continue;
 		t->object.flags |= SEEN;
@@ -803,6 +1043,20 @@ int walk_objects_by_path(struct path_walk_info *info)
 
 	trace2_data_intmax("path-walk", ctx.repo, "commits", commits_nr);
 	trace2_region_leave("path-walk", "commit-walk", info->revs->repo);
+
+	if (info->track_object_versions) {
+		struct hashmap_iter iter;
+		struct strmap_entry *entry;
+
+		strmap_for_each_entry(&ctx.paths_to_lists, &iter, entry) {
+			struct type_and_oid_list *list = entry->value;
+
+			if (list->type == OBJ_TREE)
+				for (size_t i = 0; i < list->oids.nr; i++)
+					record_tree_path(&ctx, entry->key, &list->oids.oid[i]);
+		}
+		ctx.version_paths_ready = 1;
+	}
 
 	/* Track all commits. */
 	if (info->commits && commit_list->oids.nr)
@@ -843,6 +1097,7 @@ int walk_objects_by_path(struct path_walk_info *info)
 
 	clear_paths_to_lists(&ctx.paths_to_lists);
 	strset_clear(&ctx.path_stack_pushed);
+	strset_clear(&ctx.version_paths);
 	clear_prio_queue(&ctx.path_stack);
 	return ret;
 }
@@ -855,6 +1110,7 @@ void path_walk_info_init(struct path_walk_info *info)
 
 void path_walk_info_clear(struct path_walk_info *info)
 {
+	oidmap_clear(&info->object_versions, 1);
 	if (info->pl) {
 		clear_pattern_list(info->pl);
 		free(info->pl);
