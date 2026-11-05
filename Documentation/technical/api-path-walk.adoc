@@ -86,6 +86,10 @@ before using the relationship to build an acyclic delta graph.
 Predecessors outside the requested or unpruned object set are not expanded
 as dependencies. A cyclic tree predecessor chain, possible when earlier
 commits are excluded, is broken by leaving one tree without a predecessor.
++
+The experimental `pack-objects` consumer uses this order for trees and
+blobs when `GIT_TEST_PACK_PATH_WALK_VERSIONS=1`. Their delta bases must have
+smaller, positive IDs. Commits and tags retain size-based delta selection.
 
 `prune_all_uninteresting`::
 	By default, all reachable paths are emitted by the path-walk API.
