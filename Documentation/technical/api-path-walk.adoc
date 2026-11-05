@@ -97,6 +97,11 @@ tries the predecessor only if it has already been processed in the same
 packing region. Shared topology metadata is collected whenever either
 control is enabled.
 +
+The path pass sorts chronologically within each path batch. The global
+fallback pass groups the remaining objects by type and filename hash,
+then sorts chronologically within each hash group for ordered types.
+Both passes retain the smaller-positive-ID restriction on delta bases.
++
 `GIT_TEST_PACK_PATH_WALK_SKIP` enables delta-base skipping for a
 comma-separated subset of `commit,tree,blob`, or disables it with `none`.
 It defaults to the predecessor-search types. When a predecessor or window

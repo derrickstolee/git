@@ -1107,4 +1107,34 @@ test_expect_success 'path-walk can skip size-ordered window bases without predec
 	)
 '
 
+test_expect_success 'path-walk fallback groups by name hash before chronological order' '
+	git init hash-fallback &&
+	(
+		cd hash-fallback &&
+		mkdir one middle three &&
+		test-tool genrandom fallback-shared 8192 >one/long-common-fallback-file.txt &&
+		git add one &&
+		git commit -m first &&
+		test-tool genrandom fallback-unrelated 8192 >middle/unrelated.dat &&
+		git add middle &&
+		git commit -m middle &&
+		cp one/long-common-fallback-file.txt three/long-common-fallback-file.txt &&
+		echo appended >>three/long-common-fallback-file.txt &&
+		git add three &&
+		git commit -m last &&
+		base=$(git rev-parse HEAD:one/long-common-fallback-file.txt) &&
+		target=$(git rev-parse HEAD:three/long-common-fallback-file.txt) &&
+		GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+		GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			git pack-objects --all --path-walk --name-hash-version=1 \
+			--window=1 --depth=3 --threads=1 --no-reuse-delta \
+			--no-reuse-object pack >hash &&
+		hash=$(cat hash) &&
+		git verify-pack -v pack-$hash.idx >pack &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack >actual &&
+		echo "1 $base" >expect &&
+		test_cmp expect actual
+	)
+'
+
 test_done
