@@ -2741,6 +2741,16 @@ static int version_size_sort(const void *va, const void *vb)
 	return type_size_sort(va, vb);
 }
 
+static int name_version_size_sort(const void *va, const void *vb)
+{
+	const struct object_entry *a = *(struct object_entry **)va;
+	const struct object_entry *b = *(struct object_entry **)vb;
+
+	if (oe_type(a) != oe_type(b) || a->hash != b->hash)
+		return type_size_sort(va, vb);
+	return version_size_sort(va, vb);
+}
+
 static int delta_cacheable(size_t src_size, size_t trg_size,
 			   size_t delta_size)
 {
@@ -3830,7 +3840,7 @@ static void prepare_pack(int window, int depth)
 			progress_state = start_progress(the_repository,
 							_("Compressing objects"),
 							nr_deltas);
-		QSORT(delta_list, n, path_walk_order_types ? version_size_sort : type_size_sort);
+		QSORT(delta_list, n, path_walk_order_types ? name_version_size_sort : type_size_sort);
 		ll_find_deltas(delta_list, n, window+1, depth, &nr_done);
 		stop_progress(&progress_state);
 		if (nr_done != nr_deltas)
