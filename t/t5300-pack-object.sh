@@ -790,7 +790,7 @@ test_expect_success '--path-walk thin pack' '
 	git -C server index-pack --fix-thin --stdin <out.pack
 '
 
-test_expect_success 'path-walk ordering uses older tree and blob bases' '
+test_expect_success 'path-walk tries an older predecessor outside the delta window' '
 	git init version-pack &&
 	(
 		cd version-pack &&
@@ -811,15 +811,23 @@ test_expect_success 'path-walk ordering uses older tree and blob bases' '
 		echo more >>another &&
 		git add another &&
 		git commit -am last &&
+		base=$(git rev-parse first:file) &&
 		target=$(git rev-parse HEAD:file) &&
-		GIT_TEST_PACK_PATH_WALK_VERSIONS=1 \
-			git pack-objects --all --path-walk --window=2 \
-			--depth=3 --threads=2 --no-reuse-delta \
-			--no-reuse-object mode-1 >hash &&
-		hash=$(cat hash) &&
-		git verify-pack -v mode-1-$hash.idx >pack-1 &&
+		for mode in 1 2
+		do
+			GIT_TEST_PACK_PATH_WALK_VERSIONS=$mode \
+				git pack-objects --all --path-walk --window=2 \
+				--depth=3 --threads=2 --no-reuse-delta \
+				--no-reuse-object mode-$mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v mode-$mode-$hash.idx >pack-$mode ||
+				return 1
+		done &&
 		awk -v oid="$target" "\$1 == oid {print NF}" pack-1 >actual &&
 		echo 5 >expect &&
+		test_cmp expect actual &&
+		awk -v oid="$target" "\$1 == oid {print \$7}" pack-2 >actual &&
+		echo "$base" >expect &&
 		test_cmp expect actual &&
 		test-tool path-walk --versions -- --all >versions &&
 		awk -F: "
@@ -832,11 +840,11 @@ test_expect_success 'path-walk ordering uses older tree and blob bases' '
 			NF == 7 && order[\$1] &&
 				order[\$7] >= order[\$1] {exit 1}
 			NF == 7 && \$6 > 3 {exit 1}
-		" orders pack-1
+		" orders pack-2
 	)
 '
 
-test_expect_success 'path-walk ordering rejects bases with the same discovery ID' '
+test_expect_success 'path-walk rejects a same-ID predecessor first seen at another path' '
 	git init shared-versions &&
 	(
 		cd shared-versions &&
@@ -855,7 +863,7 @@ test_expect_success 'path-walk ordering rejects bases with the same discovery ID
 		test-tool path-walk --versions -- HEAD >versions &&
 		test_grep "version:blob:a/file:$base:2:$ZERO_OID" versions &&
 		test_grep "version:blob:z/file:$target:2:$base" versions &&
-		GIT_TEST_PACK_PATH_WALK_VERSIONS=1 \
+		GIT_TEST_PACK_PATH_WALK_VERSIONS=2 \
 			git pack-objects --all --path-walk --threads=1 \
 			--no-reuse-delta --no-reuse-object pack >hash &&
 		hash=$(cat hash) &&
@@ -863,6 +871,40 @@ test_expect_success 'path-walk ordering rejects bases with the same discovery ID
 		awk -v base="$base" -v target="$target" "
 			(\$1 == base || \$1 == target) && NF == 7 {exit 1}
 		" actual
+	)
+'
+
+test_expect_success 'path-walk fallback respects depths of predecessor deltas' '
+	git init version-depth &&
+	(
+		cd version-depth &&
+		mkdir a z &&
+		test-tool genrandom shared-base 4096 >a/file &&
+		git add . &&
+		git commit -m first &&
+		cp a/file z/file &&
+		echo appended >>z/file &&
+		git add . &&
+		git commit -m second &&
+		echo tiny >z/file &&
+		git commit -am tiny &&
+		cp a/file z/file &&
+		echo appended >>z/file &&
+		for i in 1 2 3
+		do
+			test-tool genrandom append-$i 1024 >>z/file &&
+			git commit -am append-$i || return 1
+		done &&
+		GIT_TEST_PACK_PATH_WALK_VERSIONS=2 \
+			git pack-objects --all --path-walk --window=2 \
+			--depth=2 --threads=2 --no-reuse-delta \
+			--no-reuse-object pack >hash &&
+		hash=$(cat hash) &&
+		git verify-pack -v pack-$hash.idx >pack &&
+		awk "NF == 7 && \$6 > max {max = \$6} END {print max + 0}" pack >actual &&
+		echo 2 >expect &&
+		test_cmp expect actual &&
+		awk "NF == 7 && \$6 > 2 {exit 1}" pack
 	)
 '
 
@@ -876,7 +918,7 @@ test_expect_success 'path-walk version ordering preserves size-based commit delt
 		echo appended >>message &&
 		last=$(git commit-tree "$tree" -p "$first" -F message) &&
 		git update-ref refs/heads/main "$last" &&
-		for mode in 0 1
+		for mode in 0 1 2
 		do
 			GIT_TEST_PACK_PATH_WALK_VERSIONS=$mode \
 				git pack-objects --all --path-walk --threads=1 \
@@ -887,7 +929,8 @@ test_expect_success 'path-walk version ordering preserves size-based commit delt
 				sort >commits-$mode || return 1
 		done &&
 		test_cmp commits-0 commits-1 &&
-		awk -v oid="$first" "\$1 == oid {print \$7}" pack-1 >actual &&
+		test_cmp commits-0 commits-2 &&
+		awk -v oid="$first" "\$1 == oid {print \$7}" pack-2 >actual &&
 		echo "$last" >expect &&
 		test_cmp expect actual
 	)
