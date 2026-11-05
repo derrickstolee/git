@@ -912,4 +912,126 @@ test_expect_success 'path-walk version ordering preserves size-based commit delt
 	)
 '
 
+test_expect_success 'path-walk predecessor-only search retains size ordering' '
+	git init previous-only &&
+	(
+		cd previous-only &&
+		test-tool genrandom previous 8192 >file &&
+		git add file &&
+		git commit -m first &&
+		git tag first &&
+		git checkout -b side &&
+		for i in 1 2 3 4
+		do
+			test-tool genrandom side-$i 6144 >file &&
+			git commit -am side-$i || return 1
+		done &&
+		git checkout -b main first &&
+		git merge -s ours --no-ff side -m merge &&
+		test-tool genrandom previous 4096 >file &&
+		git commit -am shorter &&
+		base=$(git rev-parse first:file) &&
+		target=$(git rev-parse HEAD:file) &&
+		for previous in none blob
+		do
+			GIT_TEST_PACK_PATH_WALK_ORDER=none \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=$previous \
+				git pack-objects --all --path-walk --window=2 \
+				--threads=1 --no-reuse-delta --no-reuse-object \
+				$previous >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $previous-$hash.idx >pack-$previous ||
+				return 1
+		done &&
+		awk -v oid="$target" "\$1 == oid {print NF}" pack-none >actual &&
+		echo 5 >expect &&
+		test_cmp expect actual &&
+		awk -v oid="$target" "\$1 == oid {print \$7}" pack-blob >actual &&
+		echo "$base" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk can enable chronological ordering for commits' '
+	(
+		cd commit-versions &&
+		GIT_TEST_PACK_PATH_WALK_ORDER=commit \
+		GIT_TEST_PACK_PATH_WALK_PREVIOUS=none \
+			git pack-objects --all --path-walk --threads=1 \
+			--no-reuse-delta --no-reuse-object ordered >hash &&
+		hash=$(cat hash) &&
+		git verify-pack -v ordered-$hash.idx >pack &&
+		first=$(git rev-parse main^) &&
+		last=$(git rev-parse main) &&
+		awk -v oid="$last" "\$1 == oid {print \$7}" pack >actual &&
+		echo "$first" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk supports all per-type order and predecessor combinations' '
+	(
+		cd version-pack &&
+		test-tool path-walk --versions -- --all >versions &&
+		awk -F: "\$1 == \"version\" {print \$4, \$5}" versions >orders &&
+		for order in none commit tree blob commit,tree commit,blob tree,blob commit,tree,blob
+		do
+			for previous in none commit tree blob commit,tree commit,blob tree,blob commit,tree,blob
+			do
+				GIT_TEST_PACK_PATH_WALK_ORDER=$order \
+				GIT_TEST_PACK_PATH_WALK_PREVIOUS=$previous \
+					git pack-objects --all --path-walk --window=2 \
+					--depth=3 --threads=2 --no-reuse-delta \
+					--no-reuse-object combination >hash &&
+				hash=$(cat hash) &&
+				git verify-pack -v combination-$hash.idx >pack &&
+				awk -v types="$order" "
+					NR == FNR {order[\$1] = \$2; next}
+					NF == 7 && order[\$1] &&
+						index(\",\" types \",\", \",\" \$2 \",\") &&
+						(!order[\$7] || order[\$7] >= order[\$1]) {
+						exit 1
+					}
+				" orders pack || return 1
+			done
+		done
+	)
+'
+
+test_expect_success 'path-walk rejects unsupported experimental object types' '
+	test_env GIT_TEST_PACK_PATH_WALK_ORDER=tag \
+		test_must_fail git pack-objects --all --path-walk invalid 2>err &&
+	test_grep "invalid object type.*tag.*GIT_TEST_PACK_PATH_WALK_ORDER" err
+'
+
+test_expect_success 'path-walk predecessor-only search handles reused trees' '
+	git init self-previous &&
+	(
+		cd self-previous &&
+		mkdir z &&
+		test-tool genrandom self-base 4096 >z/file &&
+		git add z &&
+		git commit -m first &&
+		cp -R z a &&
+		git add a &&
+		git commit -m copied &&
+		echo extra >a/extra &&
+		git add a/extra &&
+		git commit -m changed &&
+		blob=$(git rev-parse HEAD:a/file) &&
+		test-tool path-walk --versions -- HEAD >versions &&
+		test_grep "version:blob:z/file:$blob:1:$ZERO_OID" versions &&
+		GIT_TEST_PACK_PATH_WALK_ORDER=none \
+		GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			git pack-objects --all --path-walk --threads=1 \
+			--no-reuse-delta --no-reuse-object pack >hash 2>err &&
+		test_must_be_empty err &&
+		hash=$(cat hash) &&
+		git verify-pack -v pack-$hash.idx >pack &&
+		awk -v oid="$blob" "\$1 == oid {print NF}" pack >actual &&
+		echo 5 >expect &&
+		test_cmp expect actual
+	)
+'
+
 test_done
