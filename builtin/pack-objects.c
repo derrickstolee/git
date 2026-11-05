@@ -234,9 +234,12 @@ static int sparse;
 static int thin;
 static int path_walk = -1;
 static unsigned path_walk_order_types, path_walk_previous_types, path_walk_skip_types;
+static unsigned path_walk_recompress_types;
+static unsigned *recompress_depths;
 static struct path_walk_info path_versions = PATH_WALK_INFO_INIT;
 static uintmax_t version_base_attempts, version_base_matches;
 static uintmax_t version_skip_attempts, version_skip_matches;
+static uintmax_t recompress_candidates, recompress_objects, recompress_saved;
 static int num_preferred_base;
 static struct progress *progress_state;
 
@@ -414,6 +417,25 @@ static unsigned long do_compress(void **pptr, unsigned long size)
 
 	free(in);
 	return stream.total_out;
+}
+
+static unsigned long get_compressed_delta_size(struct object_entry *entry)
+{
+	void *buf;
+	unsigned long size;
+
+	if (entry->delta_data && entry->z_delta_size)
+		return entry->z_delta_size;
+	if (entry->delta_data) {
+		buf = xmemdupz(entry->delta_data, DELTA_SIZE(entry));
+	} else {
+		packing_data_lock(&to_pack);
+		buf = get_delta(entry);
+		packing_data_unlock(&to_pack);
+	}
+	size = do_compress(&buf, DELTA_SIZE(entry));
+	free(buf);
+	return size;
 }
 
 static unsigned long write_large_blob_data(struct odb_stream *st, struct hashfile *f,
@@ -2693,6 +2715,7 @@ struct unpacked {
 	void *data;
 	struct delta_index *index;
 	unsigned depth;
+	unsigned long compressed_delta_size;
 };
 
 struct path_delta_search {
@@ -2888,15 +2911,26 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 
 	/* Now some size filtering heuristics. */
 	trg_size = SIZE(trg_entry);
-	if (!DELTA(trg_entry)) {
+	if (recompress_depths) {
+		/*
+		 * Every replacement must descend in the immutable depth
+		 * snapshot, even if its base has since become shallower.
+		 */
+		if (DELTA(trg_entry) == src_entry ||
+		    recompress_depths[src_entry - to_pack.objects] >= max_depth ||
+		    src->depth + 1 > trg->depth)
+			return 0;
+		max_size = trg_size;
+	} else if (!DELTA(trg_entry)) {
 		max_size = trg_size/2 - the_hash_algo->rawsz;
 		ref_depth = 1;
 	} else {
 		max_size = DELTA_SIZE(trg_entry);
 		ref_depth = trg->depth;
 	}
-	max_size = (uint64_t)max_size * (max_depth - src->depth) /
-						(max_depth - ref_depth + 1);
+	if (!recompress_depths)
+		max_size = (uint64_t)max_size * (max_depth - src->depth) /
+			   (max_depth - ref_depth + 1);
 	if (max_size == 0)
 		return 0;
 	src_size = SIZE(src_entry);
@@ -2973,7 +3007,17 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 	if (!delta_buf)
 		return 0;
 
-	if (DELTA(trg_entry)) {
+	if (recompress_depths) {
+		void *compressed = xmemdupz(delta_buf, delta_size);
+		unsigned long compressed_size = do_compress(&compressed, delta_size);
+
+		free(compressed);
+		if (compressed_size >= trg->compressed_delta_size) {
+			free(delta_buf);
+			return 0;
+		}
+		trg->compressed_delta_size = compressed_size;
+	} else if (DELTA(trg_entry)) {
 		/* Prefer only shallower same-sized deltas. */
 		if (delta_size == DELTA_SIZE(trg_entry) &&
 		    src->depth + 1 >= trg->depth) {
@@ -2990,9 +3034,12 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 	free(trg_entry->delta_data);
 	cache_lock();
 	if (trg_entry->delta_data) {
-		delta_cache_size -= DELTA_SIZE(trg_entry);
+		delta_cache_size -= trg_entry->z_delta_size ?
+					    trg_entry->z_delta_size :
+					    DELTA_SIZE(trg_entry);
 		trg_entry->delta_data = NULL;
 	}
+	trg_entry->z_delta_size = 0;
 	if (delta_cacheable(src_size, trg_size, delta_size)) {
 		delta_cache_size += delta_size;
 		cache_unlock();
@@ -3033,6 +3080,7 @@ static size_t free_unpacked(struct unpacked *n)
 	}
 	n->entry = NULL;
 	n->depth = 0;
+	n->compressed_delta_size = 0;
 	return freed_mem;
 }
 
@@ -3108,6 +3156,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 	uint32_t i, idx = 0, count = 0;
 	struct unpacked *array;
 	size_t mem_usage = 0;
+	uintmax_t candidates = 0, improved = 0, saved = 0;
 
 	CALLOC_ARRAY(array, window);
 
@@ -3116,6 +3165,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		struct unpacked *n = array + idx;
 		int j, max_depth, best_base = -1;
 		uint64_t order;
+		unsigned long old_compressed_size = 0;
 
 		progress_lock();
 		if (!*list_size) {
@@ -3133,6 +3183,8 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		order = object_version_order(entry);
 		mem_usage -= free_unpacked(n);
 		n->entry = entry;
+		if (recompress_depths)
+			n->depth = recompress_depths[entry - to_pack.objects];
 		if (search)
 			search->depths[entry - to_pack.objects -
 				       search->region->start] = 0;
@@ -3150,6 +3202,8 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 */
 		if (entry->preferred_base)
 			goto next;
+		if (recompress_depths && !DELTA(entry))
+			goto next;
 
 		/*
 		 * If the current object is at pack edge, take the depth the
@@ -3157,7 +3211,11 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 * otherwise they would become too deep.
 		 */
 		max_depth = depth;
-		if (DELTA_CHILD(entry)) {
+		if (recompress_depths) {
+			max_depth = n->depth;
+			old_compressed_size = n->compressed_delta_size =
+				get_compressed_delta_size(entry);
+		} else if (DELTA_CHILD(entry)) {
 			max_depth -= check_delta_limit(entry, 0);
 			if (max_depth <= 0)
 				goto next;
@@ -3212,12 +3270,18 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 				if (!base_order || base_order >= order)
 					continue;
 			}
+			if (recompress_depths)
+				candidates++;
 			ret = try_delta_with_ancestors(n, m, max_depth,
 						       &mem_usage, search, order);
 			if (ret < 0)
 				break;
 			else if (ret > 0)
 				best_base = other_idx;
+		}
+		if (recompress_depths && best_base >= 0) {
+			improved++;
+			saved += old_compressed_size - n->compressed_delta_size;
 		}
 
 		/*
@@ -3234,7 +3298,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 * instead, as we can afford spending more time compressing
 		 * between writes at that moment.
 		 */
-		if (entry->delta_data && !pack_to_stdout) {
+		if (entry->delta_data && !entry->z_delta_size && !pack_to_stdout) {
 			unsigned long size;
 
 			size = do_compress(&entry->delta_data, DELTA_SIZE(entry));
@@ -3258,7 +3322,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		if (search)
 			search->depths[entry - to_pack.objects -
 				       search->region->start] = n->depth;
-		if (DELTA(entry) && max_depth <= n->depth &&
+		if (!recompress_depths && DELTA(entry) && max_depth <= n->depth &&
 		    !(search && (path_walk_skip_types & (1U << oe_type(entry)))))
 			continue;
 
@@ -3292,6 +3356,13 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		free(array[i].data);
 	}
 	free(array);
+	if (recompress_depths) {
+		progress_lock();
+		recompress_candidates += candidates;
+		recompress_objects += improved;
+		recompress_saved += saved;
+		progress_unlock();
+	}
 }
 
 /*
@@ -3556,14 +3627,8 @@ static int add_ref_tag(const struct reference *ref, void *cb_data UNUSED)
 	return 0;
 }
 
-static int should_attempt_deltas(struct object_entry *entry)
+static int can_attempt_deltas(struct object_entry *entry)
 {
-	if (DELTA(entry))
-		/* This happens if we decided to reuse existing
-		 * delta from a pack. "reuse_delta &&" is implied.
-		 */
-		return 0;
-
 	if (!entry->type_valid ||
 	    oe_size_less_than(&to_pack, entry, 50))
 		return 0;
@@ -3584,6 +3649,11 @@ static int should_attempt_deltas(struct object_entry *entry)
 	}
 
 	return 1;
+}
+
+static int should_attempt_deltas(struct object_entry *entry)
+{
+	return !DELTA(entry) && can_attempt_deltas(entry);
 }
 
 static void find_deltas_for_region(struct object_entry *list,
@@ -3815,6 +3885,94 @@ static void ll_find_deltas_by_region(struct object_entry *list,
 	stop_progress(&progress_state);
 }
 
+static unsigned *snapshot_delta_depths(void)
+{
+	unsigned *depths;
+	struct object_entry **chain = NULL;
+	size_t chain_nr, chain_alloc = 0;
+
+	ALLOC_ARRAY(depths, to_pack.nr_objects);
+	for (uint32_t i = 0; i < to_pack.nr_objects; i++)
+		depths[i] = UINT_MAX;
+
+	for (uint32_t i = 0; i < to_pack.nr_objects; i++) {
+		struct object_entry *entry = to_pack.objects + i;
+		unsigned base_depth = 0;
+
+		chain_nr = 0;
+		while (entry && depths[entry - to_pack.objects] == UINT_MAX) {
+			depths[entry - to_pack.objects] = UINT_MAX - 1;
+			ALLOC_GROW(chain, chain_nr + 1, chain_alloc);
+			chain[chain_nr++] = entry;
+			if (!DELTA(entry) || entry->ext_base) {
+				base_depth = !!DELTA(entry);
+				entry = NULL;
+			} else {
+				entry = DELTA(entry);
+			}
+		}
+		if (entry) {
+			base_depth = depths[entry - to_pack.objects];
+			if (base_depth == UINT_MAX - 1) {
+				warning(_("cannot recompress a cyclic delta chain"));
+				free(chain);
+				free(depths);
+				return NULL;
+			}
+			base_depth++;
+		}
+		while (chain_nr)
+			depths[chain[--chain_nr] - to_pack.objects] = base_depth++;
+	}
+	free(chain);
+	return depths;
+}
+
+static void improve_path_deltas(int window, int depth)
+{
+	struct object_entry **list;
+	unsigned *final_depths;
+	unsigned n = 0, nr_deltas = 0, nr_done = 0;
+
+	if (!path_walk_recompress_types)
+		return;
+	recompress_depths = snapshot_delta_depths();
+	if (!recompress_depths)
+		return;
+
+	ALLOC_ARRAY(list, to_pack.nr_objects);
+	for (uint32_t i = 0; i < to_pack.nr_objects; i++) {
+		struct object_entry *entry = to_pack.objects + i;
+
+		if (!can_attempt_deltas(entry) ||
+		    !(path_walk_recompress_types & (1U << oe_type(entry))))
+			continue;
+		list[n++] = entry;
+		if (!entry->preferred_base)
+			nr_deltas++;
+	}
+	if (nr_deltas && n > 1) {
+		if (progress)
+			progress_state = start_progress(the_repository,
+							_("Improving deltas"),
+							nr_deltas);
+		QSORT(list, n, path_walk_order_types ? name_version_size_sort : type_size_sort);
+		ll_find_deltas(list, n, window + 1, depth, &nr_done);
+		stop_progress(&progress_state);
+		if (nr_done != nr_deltas)
+			die(_("inconsistency with delta count"));
+	}
+	free(list);
+	final_depths = snapshot_delta_depths();
+	if (!final_depths)
+		BUG("recompression created a delta cycle");
+	for (uint32_t i = 0; i < to_pack.nr_objects; i++)
+		if (final_depths[i] > recompress_depths[i])
+			BUG("recompression increased delta depth");
+	free(final_depths);
+	FREE_AND_NULL(recompress_depths);
+}
+
 static void prepare_pack(int window, int depth)
 {
 	struct object_entry **delta_list;
@@ -3844,7 +4002,7 @@ static void prepare_pack(int window, int depth)
 					 0, to_pack.nr_regions);
 
 	if (path_walk_order_types || path_walk_previous_types ||
-	    path_walk_skip_types) {
+	    path_walk_skip_types || path_walk_recompress_types) {
 		/*
 		 * The fallback search can deltify bases used by the path
 		 * search. Account for their newly created descendants when
@@ -3893,6 +4051,7 @@ static void prepare_pack(int window, int depth)
 			die(_("inconsistency with delta count"));
 	}
 	free(delta_list);
+	improve_path_deltas(window, depth);
 }
 
 static int git_pack_config(const char *k, const char *v,
@@ -5120,6 +5279,10 @@ static int get_object_list_path_walk(struct rev_info *revs)
 		"GIT_TEST_PACK_PATH_WALK_PREVIOUS", mode > 1 ? trees_and_blobs : 0);
 	path_walk_skip_types = path_walk_version_types(
 		"GIT_TEST_PACK_PATH_WALK_SKIP", path_walk_previous_types);
+	path_walk_recompress_types = path_walk_version_types(
+		"GIT_TEST_PACK_PATH_WALK_RECOMPRESS", 0);
+	if (reuse_delta)
+		path_walk_recompress_types = 0;
 	info.track_object_versions =
 		!!(path_walk_order_types || path_walk_previous_types);
 
@@ -5764,6 +5927,14 @@ int cmd_pack_objects(int argc,
 					   "version-base/skip-attempts", version_skip_attempts);
 			trace2_data_intmax("pack-objects", the_repository,
 					   "version-base/skip-matches", version_skip_matches);
+		}
+		if (path_walk_recompress_types) {
+			trace2_data_intmax("pack-objects", the_repository,
+					   "recompress/candidates", recompress_candidates);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "recompress/objects", recompress_objects);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "recompress/saved-bytes", recompress_saved);
 		}
 		trace2_region_leave("pack-objects", "prepare-pack",
 				    the_repository);

@@ -117,6 +117,25 @@ Skipping can also be enabled without predecessor search or chronological
 ordering, using only the preliminary delta graph from the size-ordered
 path search. This does not require topology metadata.
 +
+`GIT_TEST_PACK_PATH_WALK_RECOMPRESS` enables an additional improvement sweep
+for a comma-separated subset of `commit,tree,blob`; its default is `none`.
+It only applies with `--no-reuse-delta` (including `repack -f`). After the
+ordinary fallback, it searches the name-hash-ordered window again, admitting
+existing deltas as both targets and bases. Full objects remain unchanged.
+An existing delta is replaced only by a strictly smaller compressed delta
+payload with no increase in depth. Equal compressed sizes retain the
+incumbent, even if a candidate would make the chain shallower.
++
+The sweep snapshots every object's depth first. A new base must have a
+strictly smaller snapshot depth than its target, and its window depth
+must not increase the target's current depth. Thus new edges cannot form
+cycles or deepen descendants, without maintaining a mutable child graph
+between worker threads. This conservatively excludes some bases that
+become shallow enough during the sweep. Chronological types still require
+smaller positive IDs. Candidate deltas are compressed for comparison even
+when their raw size exceeds the incumbent's, adding computation; this
+objective does not account for pack reference headers or write-order changes.
++
 The earlier `GIT_TEST_PACK_PATH_WALK_VERSIONS` modes remain defaults for
 controls not explicitly set: mode 0 changes nothing, mode 1 orders trees
 and blobs, and mode 2 also searches their predecessors. Tags always retain

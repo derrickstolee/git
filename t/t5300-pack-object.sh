@@ -1137,4 +1137,178 @@ test_expect_success 'path-walk fallback groups by name hash before chronological
 	)
 '
 
+test_expect_success 'path-walk recompression improves payloads without deepening chains' '
+	git init recompress &&
+	(
+		cd recompress &&
+		mkdir a b z &&
+		test-tool genrandom recompress-base 8192 >base &&
+		test-tool genrandom recompress-good 512 >good &&
+		test-tool genrandom recompress-other 512 >other &&
+		cat base good >a/long-common-recompression-file.txt &&
+		cat base other >b/long-common-recompression-file.txt &&
+		git add a b &&
+		git commit -m roots &&
+		cp base z/long-common-recompression-file.txt &&
+		git add z &&
+		git commit -m predecessor &&
+		cp a/long-common-recompression-file.txt z/long-common-recompression-file.txt &&
+		echo appended >>z/long-common-recompression-file.txt &&
+		git commit -am target &&
+		predecessor=$(git rev-parse HEAD~1:z/long-common-recompression-file.txt) &&
+		target=$(git rev-parse HEAD:z/long-common-recompression-file.txt) &&
+		better=$(git rev-parse HEAD:a/long-common-recompression-file.txt) &&
+		for mode in none blob uncached
+		do
+			recompress=$mode &&
+			cache=256m &&
+			if test "$mode" = uncached
+			then
+				recompress=blob &&
+				cache=1
+			fi &&
+			GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			GIT_TEST_PACK_PATH_WALK_SKIP=none \
+			GIT_TEST_PACK_PATH_WALK_RECOMPRESS=$recompress \
+			GIT_TRACE2_EVENT="$PWD/$mode.trace" \
+				git -c pack.deltaCacheSize=$cache pack-objects \
+				--all --path-walk --name-hash-version=1 \
+				--window=10 --depth=3 --threads=1 \
+				--no-reuse-delta --no-reuse-object $mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $mode-$hash.idx >pack-$mode ||
+				return 1
+		done &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-none >actual &&
+		echo "2 $predecessor" >expect &&
+		test_cmp expect actual &&
+		for mode in blob uncached
+		do
+			awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-$mode >actual &&
+			echo "1 $better" >expect &&
+			test_cmp expect actual &&
+			before=$(awk -v oid="$target" "\$1 == oid {print \$4}" pack-none) &&
+			after=$(awk -v oid="$target" "\$1 == oid {print \$4}" pack-$mode) &&
+			test "$after" -lt "$before" &&
+			awk -v oid="$predecessor" "\$1 == oid {print \$6, \$7}" pack-none >expect &&
+			awk -v oid="$predecessor" "\$1 == oid {print \$6, \$7}" pack-$mode >actual &&
+			test_cmp expect actual &&
+			awk "
+				NR == FNR {
+					if (NF == 5 || NF == 7)
+						depth[\$1] = NF == 7 ? \$6 : 0
+					next
+				}
+				NF == 5 || NF == 7 {
+					if ((NF == 7 ? \$6 : 0) > depth[\$1])
+						exit 1
+				}
+			" pack-none pack-$mode &&
+			test_grep "\"key\":\"recompress/objects\",\"value\":\"1\"" $mode.trace ||
+				return 1
+		done
+	)
+'
+
+test_expect_success 'path-walk recompression respects selected types and delta reuse' '
+	(
+		cd recompress &&
+		target=$(git rev-parse HEAD:z/long-common-recompression-file.txt) &&
+		for mode in tree reuse
+		do
+			recompress=$mode &&
+			set -- --no-reuse-delta &&
+			if test "$mode" = reuse
+			then
+				recompress=blob &&
+				set --
+			fi &&
+			GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			GIT_TEST_PACK_PATH_WALK_SKIP=none \
+			GIT_TEST_PACK_PATH_WALK_RECOMPRESS=$recompress \
+				git pack-objects --all --path-walk --name-hash-version=1 \
+				--window=10 --depth=3 --threads=1 "$@" $mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $mode-$hash.idx >pack-$mode &&
+			awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-none >expect &&
+			awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-$mode >actual &&
+			test_cmp expect actual ||
+				return 1
+		done
+	)
+'
+
+test_expect_success 'path-walk recompression handles uncompressed cached deltas on stdout' '
+	(
+		cd recompress &&
+		target=$(git rev-parse HEAD:z/long-common-recompression-file.txt) &&
+		GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+		GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+		GIT_TEST_PACK_PATH_WALK_SKIP=none \
+		GIT_TEST_PACK_PATH_WALK_RECOMPRESS=blob \
+			git pack-objects --all --path-walk --name-hash-version=1 \
+			--window=10 --depth=3 --threads=1 --no-reuse-delta \
+			--no-reuse-object --stdout >stdout.pack &&
+		git index-pack stdout.pack &&
+		git verify-pack -v stdout.idx >pack-stdout &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-blob >expect &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-stdout >actual &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk recompression can prefer larger raw deltas' '
+	git init recompress-raw &&
+	(
+		cd recompress-raw &&
+		mkdir one two &&
+		test-tool genrandom recompress-prefix 8192 >prefix &&
+		test-tool genrandom recompress-noise 2048 >noise &&
+		cp prefix one/long-common-recompression-file.txt &&
+		git add one &&
+		git commit -m root &&
+		cp prefix two/long-common-recompression-file.txt &&
+		pos=16 &&
+		for char in P O N M L K J I H G F E D C B A
+		do
+			pos=$((pos - 1)) &&
+			printf "%032d" 0 | tr 0 "$char" >>two/long-common-recompression-file.txt &&
+			dd if=noise bs=32 skip=$pos count=1 \
+				>>two/long-common-recompression-file.txt 2>/dev/null ||
+				return 1
+		done &&
+		git add two &&
+		git commit -m predecessor &&
+		cp prefix two/long-common-recompression-file.txt &&
+		for char in A B C D E F G H I J K L M N O P
+		do
+			printf "%032d" 0 | tr 0 "$char" >>two/long-common-recompression-file.txt ||
+				return 1
+		done &&
+		git commit -am target &&
+		target=$(git rev-parse HEAD:two/long-common-recompression-file.txt) &&
+		for mode in none blob
+		do
+			GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			GIT_TEST_PACK_PATH_WALK_SKIP=none \
+			GIT_TEST_PACK_PATH_WALK_RECOMPRESS=$mode \
+				git pack-objects --all --path-walk --name-hash-version=1 \
+				--window=10 --depth=3 --threads=1 --no-reuse-delta \
+				--no-reuse-object $mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $mode-$hash.idx >pack-$mode ||
+				return 1
+		done &&
+		before_raw=$(awk -v oid="$target" "\$1 == oid {print \$3}" pack-none) &&
+		after_raw=$(awk -v oid="$target" "\$1 == oid {print \$3}" pack-blob) &&
+		before_disk=$(awk -v oid="$target" "\$1 == oid {print \$4}" pack-none) &&
+		after_disk=$(awk -v oid="$target" "\$1 == oid {print \$4}" pack-blob) &&
+		test "$after_raw" -gt "$before_raw" &&
+		test "$after_disk" -lt "$before_disk"
+	)
+'
+
 test_done
