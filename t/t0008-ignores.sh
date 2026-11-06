@@ -1364,4 +1364,88 @@ test_expect_success 'appending and clearing invalidate built ignore indexes' '
 	test-tool -C advanced-ignore ignore-patterns
 '
 
+test_expect_success 'indexed provenance survives deep exclude-group growth' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	echo "!needle" >>advanced-ignore/.gitignore &&
+	deep=deep &&
+	for i in $(test_seq 1 30)
+	do
+		deep="$deep/d$i" || return 1
+	done &&
+	mkdir -p "advanced-ignore/$deep" &&
+	test_write_lines "$deep/needle" needle "$deep/needle" >advanced-paths &&
+	{
+		printf ".gitignore:65:!needle\t%s/needle\n" "$deep" &&
+		printf ".gitignore:65:!needle\tneedle\n" &&
+		printf ".gitignore:65:!needle\t%s/needle\n" "$deep"
+	} >advanced-expect &&
+	check_advanced_ignore fast-only
+'
+
+test_expect_success 'nested family precedence and a later general override' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	test_write_lines "/build/**" "!/build/keep/" >>advanced-ignore/.gitignore &&
+	{
+		ignore_padding &&
+		echo "!*.keep"
+	} >advanced-ignore/build/.gitignore &&
+	{
+		ignore_padding &&
+		echo /leaf.keep
+	} >advanced-ignore/build/keep/.gitignore &&
+	test_write_lines build/keep/leaf.keep build/keep/other.keep \
+		build/keep/object.tmp >advanced-paths &&
+	cat >advanced-expect <<-\EOF &&
+	build/keep/.gitignore:65:/leaf.keep	build/keep/leaf.keep
+	build/.gitignore:65:!*.keep	build/keep/other.keep
+	.gitignore:65:/build/**	build/keep/object.tmp
+	EOF
+	check_advanced_ignore fast-only &&
+	echo "!l[ea]*.keep" >>advanced-ignore/build/keep/.gitignore &&
+	cat >advanced-expect <<-\EOF &&
+	build/keep/.gitignore:66:!l[ea]*.keep	build/keep/leaf.keep
+	build/.gitignore:65:!*.keep	build/keep/other.keep
+	.gitignore:65:/build/**	build/keep/object.tmp
+	EOF
+	check_advanced_ignore hybrid
+'
+
+for decision in ignore keep
+do
+	test_expect_success "indexed command-line precedence: $decision" '
+		nr=64 &&
+		reset_advanced_ignore &&
+		echo "!*.keep" >>advanced-ignore/.gitignore &&
+		{
+			ignore_padding &&
+			echo "!item.keep"
+		} >advanced-ignore/sub/.gitignore &&
+		>advanced-ignore/sub/item.keep &&
+		rm -f cli-trace &&
+		if test "$decision" = ignore
+		then
+			final=/sub/item.keep &&
+			echo sub/item.keep >cli-expect
+		else
+			final="!/sub/item.keep" &&
+			: >cli-expect
+		fi &&
+		(
+			set -- &&
+			for i in $(test_seq 1 64)
+			do
+				set -- "$@" "--exclude=/unused-$i" || exit 1
+			done &&
+			GIT_TRACE2_EVENT="$(pwd)/cli-trace" \
+				git -C advanced-ignore ls-files -o -i --exclude-standard \
+				"$@" --exclude=/sub/item.keep --exclude="$final" \
+				-- sub/item.keep >cli-actual
+		) &&
+		test_cmp cli-expect cli-actual &&
+		test_ignore_trace fast-only cli-trace
+	'
+done
+
 test_done

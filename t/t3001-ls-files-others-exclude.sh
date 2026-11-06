@@ -393,4 +393,41 @@ test_expect_success SYMLINKS 'directory-only subtree prefixes retain files and s
 	test_ignore_trace fast-only prefix-trace
 '
 
+test_expect_success 'setup indexed ignores with an untracked cache' '
+	test_create_repo cached-ignores &&
+	{
+		test_seq 1 64 | sed "s|^|/unused-|" &&
+		echo /target
+	} >cached-ignores/.gitignore &&
+	>cached-ignores/keep &&
+	>cached-ignores/target &&
+	git -C cached-ignores add .gitignore &&
+	git -C cached-ignores commit -m "track ignore policy" &&
+	git -C cached-ignores config core.excludesFile /dev/null &&
+	git -C cached-ignores config core.ignoreCase false &&
+	git -C cached-ignores config core.fsmonitor false &&
+	git -C cached-ignores config core.untrackedCache true
+'
+
+test_lazy_prereq IGNORE_UNTRACKED_CACHE '
+	git -C cached-ignores update-index --test-untracked-cache
+'
+
+test_expect_success IGNORE_UNTRACKED_CACHE 'ignore edits invalidate cached indexed decisions' '
+	git -C cached-ignores update-index --untracked-cache &&
+	GIT_TRACE2_EVENT="$(pwd)/cache-first-trace" \
+		git -C cached-ignores status --porcelain -uall >cache-actual &&
+	echo "?? keep" >cache-expect &&
+	test_cmp cache-expect cache-actual &&
+	test_ignore_trace fast-only cache-first-trace &&
+	git -C cached-ignores status --porcelain -uall >cache-actual &&
+	test_cmp cache-expect cache-actual &&
+	echo "!/target" >>cached-ignores/.gitignore &&
+	GIT_TRACE2_EVENT="$(pwd)/cache-edit-trace" \
+		git -C cached-ignores status --porcelain -uall >cache-actual &&
+	test_write_lines " M .gitignore" "?? keep" "?? target" >cache-expect &&
+	test_cmp cache-expect cache-actual &&
+	test_ignore_trace fast-only cache-edit-trace
+'
+
 test_done

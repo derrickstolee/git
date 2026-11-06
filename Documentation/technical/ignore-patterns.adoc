@@ -47,6 +47,10 @@ The index belongs to its pattern list. It owns normalized keys and fallback
 ordinals, but not patterns or their bases. Append invalidates the index;
 clear frees it before freeing patterns. No index entry retains the address
 of its containing list, which can move when an exclude group grows.
+An indexed winner refreshes its original pattern's source-list pointer
+before returning it: that back-reference may predate a group-array move.
+The deep-stack regression checks verbose provenance across growth and
+subsequent stack pop/reload.
 
 Construction is lazy and requires at least 64 supported rules. A conservative
 preflight estimate includes entries, keys, fallback ordinals, and hashmap

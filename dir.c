@@ -1803,6 +1803,8 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 			break;
 		}
 	}
+	if (index && res)
+		res->pl = pl;
 	return res;
 }
 
