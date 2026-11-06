@@ -14,6 +14,7 @@
 #include "hex.h"
 #include "object-name.h"
 #include "path.h"
+#include "parse.h"
 #include "revision.h"
 #include "diffcore.h"
 #include "quote.h"
@@ -38,6 +39,7 @@
 
 #define AB_DELAY_WARNING_IN_MS (2 * 1000)
 #define UF_DELAY_WARNING_IN_MS (2 * 1000)
+#define IGNORE_DELAY_WARNING_IN_MS (2 * 1000)
 
 static const char cut_line[] =
 "------------------------ >8 ------------------------\n";
@@ -813,6 +815,12 @@ static void wt_status_collect_untracked(struct wt_status *s)
 	if (!s->show_untracked_files)
 		return;
 
+	dir.internal.ignore_stats.collect_time =
+		!s->commit_template &&
+		(s->status_format == STATUS_FORMAT_NONE ||
+		 s->status_format == STATUS_FORMAT_LONG) &&
+		advice_enabled(ADVICE_STATUS_IGNORE_MATCHING_WARNING);
+
 	if (s->show_untracked_files != SHOW_ALL_UNTRACKED_FILES)
 		dir.flags |=
 			DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
@@ -843,6 +851,11 @@ static void wt_status_collect_untracked(struct wt_status *s)
 	}
 	string_list_sort_u(&s->ignored, 0);
 
+	s->unsupported_ignore_patterns = dir.internal.ignore_stats.unsupported_patterns_tested;
+	s->ignore_matching_in_ms = dir.internal.ignore_stats.unsupported_ns / 1000000;
+	if (dir.internal.ignore_stats.collect_time && s->unsupported_ignore_patterns)
+		s->ignore_matching_in_ms = git_env_ulong("GIT_TEST_IGNORE_MATCHING_MS",
+						       s->ignore_matching_in_ms);
 	dir_clear(&dir);
 
 	if (advice_enabled(ADVICE_STATUS_U_OPTION))
@@ -2064,6 +2077,18 @@ static void wt_longstatus_print(struct wt_status *s)
 			}
 			status_printf_ln(s, GIT_COLOR_NORMAL,
 					_("See 'git help status' for information on how to improve this."));
+			status_printf_ln(s, GIT_COLOR_NORMAL, "%s", "");
+		}
+		if (!s->commit_template &&
+		    advice_enabled(ADVICE_STATUS_IGNORE_MATCHING_WARNING) &&
+		    s->unsupported_ignore_patterns &&
+		    s->ignore_matching_in_ms > IGNORE_DELAY_WARNING_IN_MS) {
+			status_printf_ln(s, GIT_COLOR_NORMAL, "%s", "");
+			status_printf_ln(s, GIT_COLOR_NORMAL,
+					_("Ignore pattern matching took %.2f seconds using general patterns."),
+					s->ignore_matching_in_ms / 1000.0);
+			status_printf_ln(s, GIT_COLOR_NORMAL,
+					_("See 'git help gitignore' for optimization suggestions."));
 			status_printf_ln(s, GIT_COLOR_NORMAL, "%s", "");
 		}
 	} else if (s->committable)

@@ -85,6 +85,7 @@ static struct {
 	[ADVICE_SPARSE_INDEX_EXPANDED]			= { "sparseIndexExpanded" },
 	[ADVICE_STATUS_AHEAD_BEHIND_WARNING]		= { "statusAheadBehindWarning" },
 	[ADVICE_STATUS_HINTS]				= { "statusHints" },
+	[ADVICE_STATUS_IGNORE_MATCHING_WARNING]		= { "statusIgnoreMatchingWarning" },
 	[ADVICE_STATUS_U_OPTION]			= { "statusUoption" },
 	[ADVICE_SUBMODULES_NOT_UPDATED] 		= { "submodulesNotUpdated" },
 	[ADVICE_SUBMODULE_ALTERNATE_ERROR_STRATEGY_DIE] = { "submoduleAlternateErrorStrategyDie" },

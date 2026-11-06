@@ -6,6 +6,7 @@
 test_description='git status'
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY/lib-ignore.sh"
 . "$TEST_DIRECTORY"/lib-terminal.sh
 
 test_expect_success 'status -h in broken repository' '
@@ -1787,6 +1788,100 @@ test_expect_success EXPENSIVE,SIZE_T_IS_64BIT 'status does not re-read unchanged
 		git diff-index HEAD file-a file-b file-c >actual &&
 		test_must_be_empty actual
 	)
+'
+
+check_ignore_matching_advice () {
+	local elapsed="$1" expected="$2"
+	shift 2 &&
+	GIT_TEST_IGNORE_MATCHING_MS="$elapsed" git -C ignorestatus "$@" \
+		>ignore-status-out 2>ignore-status-err &&
+	test_must_be_empty ignore-status-err &&
+	if test "$expected" = yes
+	then
+		test_grep "Ignore pattern matching took" ignore-status-out &&
+		test_grep "git help gitignore" ignore-status-out
+	else
+		test_grep ! "Ignore pattern matching took" ignore-status-out &&
+		test_grep ! "git help gitignore" ignore-status-out
+	fi
+}
+
+test_expect_success 'setup general ignore-matching advice' '
+	test_create_repo ignorestatus &&
+	git -C ignorestatus config core.excludesFile /dev/null &&
+	git -C ignorestatus config core.ignoreCase false &&
+	git -C ignorestatus config core.untrackedCache false &&
+	git -C ignorestatus config core.fsmonitor false &&
+	test_seq 1 64 | sed "s|^|/absent-|; s|$|[ab]*|" >ignorestatus/.gitignore &&
+	>ignorestatus/file &&
+	cp ignorestatus/.gitignore ignore-status-policy
+'
+
+for elapsed in 0 1999 2000 2001
+do
+	test_expect_success "ignore advice threshold: $elapsed ms" '
+		if test "$elapsed" -gt 2000
+		then
+			expected=yes
+		else
+			expected=no
+		fi &&
+		check_ignore_matching_advice "$elapsed" "$expected" status
+	'
+done
+
+test_expect_success 'ignore advice is independently configurable without tracing' '
+	check_ignore_matching_advice 2001 yes -c advice.statusIgnoreMatchingWarning=true status &&
+	check_ignore_matching_advice 2001 no -c advice.statusIgnoreMatchingWarning=false status &&
+	check_ignore_matching_advice 2001 yes -c advice.statusUoption=false status
+'
+
+test_expect_success 'ignore advice retains actual fallback telemetry' '
+	test_env GIT_TRACE2_EVENT="$(pwd)/ignore-status-trace" \
+		check_ignore_matching_advice 2001 yes status &&
+	test_ignore_trace slow-only ignore-status-trace
+'
+
+for format in "--porcelain" "--porcelain=v2" "--short" "-uno"
+do
+	test_expect_success "ignore advice does not affect $format" '
+		check_ignore_matching_advice 2001 no status "$format"
+	'
+done
+
+test_expect_success 'elapsed override cannot invent unsupported ignore work' '
+	test_when_finished "cp ignore-status-policy ignorestatus/.gitignore" &&
+	test_write_lines /unused /other >ignorestatus/.gitignore &&
+	check_ignore_matching_advice 2001 no status &&
+	test_seq 1 64 | sed "s|^|/unused-|" >ignorestatus/.gitignore &&
+	check_ignore_matching_advice 2001 no status &&
+	{
+		echo "[ab]*" &&
+		test_seq 1 64 | sed "s|^|/unused-|" &&
+		test_write_lines /.gitignore /file
+	} >ignorestatus/.gitignore &&
+	check_ignore_matching_advice 2001 no status
+'
+
+test_lazy_prereq IGNORE_STATUS_CACHE '
+	git -C ignorestatus update-index --test-untracked-cache
+'
+
+test_expect_success IGNORE_STATUS_CACHE 'cached ignore decisions do not warn' '
+	test_when_finished "git -C ignorestatus config core.untrackedCache false" &&
+	git -C ignorestatus config core.untrackedCache true &&
+	git -C ignorestatus update-index --untracked-cache &&
+	test-tool chmtime -10 ignorestatus &&
+	git -C ignorestatus status >ignore-status-out &&
+	git -C ignorestatus status >ignore-status-out &&
+	check_ignore_matching_advice 2001 no status
+'
+
+test_expect_success 'ignore advice is absent from generated commit templates' '
+	test_env GIT_TEST_IGNORE_MATCHING_MS=2001 GIT_EDITOR=false \
+		test_must_fail git -C ignorestatus commit --allow-empty &&
+	test_grep ! "Ignore pattern matching took" ignorestatus/.git/COMMIT_EDITMSG &&
+	test_grep ! "git help gitignore" ignorestatus/.git/COMMIT_EDITMSG
 '
 
 test_done

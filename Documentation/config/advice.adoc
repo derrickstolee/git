@@ -152,6 +152,12 @@ all advice messages.
 		linkgit:git-commit[1], and in the help message shown
 		by linkgit:git-switch[1] or
 		linkgit:git-checkout[1] when switching branches.
+	statusIgnoreMatchingWarning::
+		Shown in human-readable linkgit:git-status[1] output when
+		measured general ignore-pattern matching takes more than
+		2 seconds. It points to linkgit:gitignore[5] for optimization
+		suggestions. Unsupported patterns alone, or simple patterns
+		using the small-list fallback, do not trigger this advice.
 	statusUoption::
 		Shown when linkgit:git-status[1] takes more than 2
 		seconds to enumerate untracked files, to tell the user that

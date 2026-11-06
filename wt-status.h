@@ -145,6 +145,8 @@ struct wt_status {
 	struct string_list untracked;
 	struct string_list ignored;
 	uint32_t untracked_in_ms;
+	uint64_t ignore_matching_in_ms;
+	uint64_t unsupported_ignore_patterns;
 };
 
 size_t wt_status_locate_end(const char *s, size_t len);

@@ -1,11 +1,11 @@
 Indexed Ignore Matching
-======================
+=======================
 
 Author-facing scope and optimization guidance belongs in
 linkgit:gitignore[5]. This document describes the internal index.
 
 Ranked matching
---------------
+---------------
 
 Each pattern list retains its original ordered array. A private index
 maps unescaped literal basenames and base-normalized literal pathnames to
@@ -92,3 +92,28 @@ contribute to neither fallback counter. Tests in `t/lib-ignore.sh` require
 singular decimal values, explicit zeros for unused algorithms, and positive
 work for algorithms claimed to have run. Missing or duplicate summaries,
 cache hits and pruned paths cannot demonstrate fast-path execution.
+
+Slow-matching advice
+--------------------
+
+Human long status enables a minimal measurement context independently of
+Trace2, unless its advice is disabled or a commit template is being built.
+Patterns cache their verified kind and lists record their general-pattern
+count while parsing, avoiding classification during timed comparisons. Entirely supported
+lists need no measurement, even when admission or case gates retain the
+legacy algorithm. Indexed fallback vectors contain only general rules.
+
+Only actual unsupported comparisons contribute work. Consecutive runs
+start a clock after eight comparisons and stop at a supported rule,
+unknown-type resolution, a winning match or the end of the scan. This
+underestimates short runs deliberately, avoids per-comparison clock calls,
+and excludes filesystem type resolution, index construction, ignore-file
+loading, traversal and unrelated status work. Ambiguous or unmeasured
+cost cannot cause the advice.
+
+Status copies work and nanoseconds before clearing the directory context
+and emits one message only above two seconds of measured unsupported work.
+`GIT_TEST_IGNORE_MATCHING_MS` can override elapsed milliseconds, including
+zero, but cannot create unsupported work. Trace2 additionally reports
+`unsupported-patterns-tested` and `unsupported-matching-ns`; ordinary
+trace query counters are not collected solely for advice.

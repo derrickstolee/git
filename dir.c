@@ -33,6 +33,7 @@
 #include "strbuf.h"
 #include "submodule-config.h"
 #include "symlinks.h"
+#include "trace.h"
 #include "trace2.h"
 #include "tree.h"
 #include "hex.h"
@@ -1137,7 +1138,7 @@ static void build_ignore_index(struct pattern_list *pl)
 	pl->ignore_index_checked = 1;
 	for (i = 0; i < pl->nr; i++) {
 		struct path_pattern *p = pl->patterns[i];
-		enum ignore_pattern_kind kind = ignore_pattern_kind(p);
+		enum ignore_pattern_kind kind = p->ignore_index_kind;
 		size_t cost;
 
 		if (kind == IGNORE_LITERAL) {
@@ -1171,7 +1172,7 @@ static void build_ignore_index(struct pattern_list *pl)
 	ALLOC_ARRAY(index->fallback, fallback_nr);
 	for (i = 0; i < pl->nr; i++) {
 		struct path_pattern *p = pl->patterns[i];
-		enum ignore_pattern_kind kind = ignore_pattern_kind(p);
+		enum ignore_pattern_kind kind = p->ignore_index_kind;
 		struct ignore_literal_entry *entry, *old;
 		struct hashmap *map;
 		struct strbuf name = STRBUF_INIT;
@@ -1272,6 +1273,8 @@ void add_pattern(const char *string, const char *base,
 	pattern->baselen = baselen;
 	pattern->flags = flags;
 	pattern->srcpos = srcpos;
+	pattern->ignore_index_kind = ignore_pattern_kind(pattern);
+	pl->ignore_general_nr += pattern->ignore_index_kind == IGNORE_GENERAL;
 	ALLOC_GROW(pl->patterns, pl->nr + 1, pl->alloc);
 	pl->patterns[pl->nr++] = pattern;
 	pattern->pl = pl;
@@ -1702,6 +1705,18 @@ int match_pathname(const char *pathname, int pathlen,
 				 WM_PATHNAME) == 0;
 }
 
+static void finish_ignore_fallback_batch(struct ignore_matching_stats *stats,
+					uint64_t *start, unsigned *run)
+{
+	if (!*run)
+		return;
+	stats->unsupported_patterns_tested += *run;
+	if (*start)
+		stats->unsupported_ns += getnanotime() - *start;
+	*start = 0;
+	*run = 0;
+}
+
 /*
  * Find the greatest matching list ordinal. Indexed candidates allow the
  * reverse scan to skip general rules which cannot change the winner.
@@ -1719,6 +1734,9 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 	struct ignore_pattern_index *index = NULL;
 	int i, best_rank = -1;
 	static int index_enabled = -1;
+	unsigned unsupported_run = 0;
+	uint64_t fallback_start = 0;
+	int measure = stats && stats->collect_time && pl->ignore_general_nr;
 
 	if (!pl->nr)
 		return NULL;	/* undefined */
@@ -1731,12 +1749,12 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 
 		if (!pl->ignore_index_checked) {
 			build_ignore_index(pl);
-			if (pl->ignore_index && stats)
+			if (pl->ignore_index && stats && stats->trace_enabled)
 				stats->index_bytes += ignore_index_bytes(pl->ignore_index);
 		}
 		index = pl->ignore_index;
 		if (index) {
-			if (stats)
+			if (stats && stats->trace_enabled)
 				stats->fast_path++;
 			for (mustbedir = 0; mustbedir <= 1; mustbedir++) {
 				struct ignore_literal_entry *entry;
@@ -1781,17 +1799,26 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 		exclude = pattern->pattern;
 		prefix = pattern->nowildcardlen;
 
-		if (stats) {
+		if (stats && stats->trace_enabled) {
 			if (i == (index ? index->fallback_nr : pl->nr) - 1)
 				stats->slow_fallback++;
 			stats->fallback_patterns_tested++;
 		}
 
+		if (measure && !index && pattern->ignore_index_kind != IGNORE_GENERAL)
+			finish_ignore_fallback_batch(stats, &fallback_start, &unsupported_run);
+
 		if (pattern->flags & PATTERN_FLAG_MUSTBEDIR) {
+			if (measure && *dtype == DT_UNKNOWN)
+				finish_ignore_fallback_batch(stats, &fallback_start, &unsupported_run);
 			*dtype = resolve_dtype(*dtype, istate, pathname, pathlen);
 			if (*dtype != DT_DIR)
 				continue;
 		}
+
+		if (measure && (index || pattern->ignore_index_kind == IGNORE_GENERAL) &&
+		    unsupported_run++ == 8)
+			fallback_start = getnanotime();
 
 		if (pattern->flags & PATTERN_FLAG_NODIR) {
 			if (match_basename(basename,
@@ -1814,6 +1841,8 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 			break;
 		}
 	}
+	if (measure)
+		finish_ignore_fallback_batch(stats, &fallback_start, &unsupported_run);
 	if (index && res)
 		res->pl = pl;
 	return res;
@@ -1981,9 +2010,11 @@ static struct path_pattern *last_matching_pattern_from_lists(
 	struct exclude_list_group *group;
 	struct path_pattern *pattern;
 	struct ignore_matching_stats *stats = NULL;
+	int trace_enabled = trace2_is_enabled();
 
-	if (trace2_is_enabled()) {
+	if (trace_enabled || dir->internal.ignore_stats.collect_time) {
 		stats = &dir->internal.ignore_stats;
+		stats->trace_enabled = trace_enabled;
 		dir->internal.ignore_repo = istate ? istate->repo : NULL;
 	}
 	for (i = EXC_CMDL; i <= EXC_FILE; i++) {
@@ -3934,6 +3965,10 @@ void dir_clear(struct dir_struct *dir)
 				  "fallback-patterns-tested", stats->fallback_patterns_tested);
 		trace2_data_intmax("ignore", dir->internal.ignore_repo,
 				  "index-bytes", stats->index_bytes);
+		trace2_data_intmax("ignore", dir->internal.ignore_repo,
+				  "unsupported-patterns-tested", stats->unsupported_patterns_tested);
+		trace2_data_intmax("ignore", dir->internal.ignore_repo,
+				  "unsupported-matching-ns", stats->unsupported_ns);
 	}
 
 	for (i = EXC_CMDL; i <= EXC_FILE; i++) {

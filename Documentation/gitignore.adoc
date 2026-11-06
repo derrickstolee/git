@@ -142,7 +142,7 @@ full pathname may have special meaning:
    will match according to the previous rules.
 
 OPTIMIZING IGNORE MATCHING
--------------------------
+--------------------------
 
 Git preserves the pattern format, ordering and source precedence described
 above. For sufficiently large pattern lists, it can verify restricted
@@ -155,7 +155,7 @@ cost, even in a mixed list. Preferred forms therefore need not activate
 an index on every invocation. These heuristics do not change the policy.
 
 Exact names and directories
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 For an exact-name policy, prefer a literal to an unnecessary glob only
 when their intended matching sets are identical. In a root `.gitignore`,
@@ -179,7 +179,7 @@ and exceptions with `git check-ignore --no-index -v -n --stdin` before
 rewriting a policy.
 
 Directory-local suffixes
-~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~
 
 Slash-free patterns consisting of `*` followed by a literal suffix, such
 as `*.o` or `*~`, are also eligible for indexing, including negated and
@@ -206,7 +206,7 @@ file. The parent must remain traversable for local rules to take effect.
 Even exclusion-only rewrites can change verbose source attribution.
 
 Subtree prefixes and exceptions
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A nonempty literal pathname followed by `/**`, such as `/generated/**`,
 is eligible for indexed matching. It matches contents at every depth, not
@@ -229,6 +229,28 @@ Literal prefixes are relative to their ignore file. Similar sibling names
 do not match: `/generated/**` does not match `generated-other/file`.
 Wildcard prefixes such as `/generated/*`, `**/generated`, and
 `generated/**/file` retain general matching.
+
+Investigating slow matching
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Human-readable `git status` can point here when measured work on general
+patterns takes more than two seconds. Complex patterns alone do not cause
+the message, and it does not indicate incorrect matching. Set
+`advice.statusIgnoreMatchingWarning` to `false` to suppress it independently
+of other status advice. Short and porcelain output and commit templates
+do not include it.
+
+Review scope and precedence before changing patterns. Use
+`git check-ignore --no-index -v -n --stdin` with representative paths to
+compare decisions and winning sources, including exceptions and potential
+future paths. Use `git ls-files --others --exclude-standard` to inspect
+traversal results. Preserve intentional general patterns when a simpler
+expression would change the policy.
+
+General patterns near the end of a file are examined first and can
+override earlier exceptions. Grouping them can aid review, but moving
+them is not a generally safe optimization. Indexed rules can appear on
+either side of general patterns without giving up their original order.
 
 CONFIGURATION
 -------------

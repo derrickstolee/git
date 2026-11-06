@@ -72,6 +72,7 @@ struct path_pattern {
 	 * and from -1 decrementing for patterns from CLI args.
 	 */
 	int srcpos;
+	unsigned ignore_index_kind;
 
 	char pattern[FLEX_ARRAY];
 };
@@ -100,6 +101,7 @@ struct pattern_list {
 	struct path_pattern **patterns;
 	struct ignore_pattern_index *ignore_index;
 	unsigned ignore_index_checked;
+	int ignore_general_nr;
 
 	/*
 	 * While scanning the excludes, we attempt to match the patterns
@@ -151,6 +153,10 @@ struct ignore_matching_stats {
 	uint64_t slow_fallback;
 	uint64_t fallback_patterns_tested;
 	uint64_t index_bytes;
+	uint64_t unsupported_patterns_tested;
+	uint64_t unsupported_ns;
+	unsigned collect_time;
+	unsigned trace_enabled;
 };
 
 /*

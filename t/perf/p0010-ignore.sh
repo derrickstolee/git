@@ -196,6 +196,29 @@ do
 	done
 done
 
+for kind in pathname suffix prefix general
+do
+	test_expect_success "setup status advice cost: $kind" '
+		make_patterns 4000 "$kind" &&
+		{
+			cat .git/ignore-perf/expect-traversal &&
+			echo work-retained/file.keep
+		} >.git/ignore-perf/status-paths &&
+		sort .git/ignore-perf/status-paths |
+			sed "s|^|?? |" >.git/ignore-perf/expect-status &&
+		git status --porcelain -uall >.git/ignore-perf/actual &&
+		test_filter_gitconfig .git/ignore-perf/actual &&
+		test_cmp .git/ignore-perf/expect-status .git/ignore-perf/actual
+	'
+
+	for enabled in false true
+	do
+		test_perf "status $kind: ignore advice=$enabled, 4000 rules, 16000 files" '
+			git -c advice.statusIgnoreMatchingWarning="$enabled" status -uall >/dev/null
+		'
+	done
+done
+
 if test_bool_env GIT_PERF_EXTRA false
 then
 	for nr in 1000 2000 4000 8000
