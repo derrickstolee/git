@@ -150,6 +150,9 @@ pattern forms and use an index instead of scanning every rule for every
 path. Other patterns remain valid and use the general matcher; mixed lists
 can use both algorithms. Small lists, case-insensitive matching, and lists
 whose indexes exceed an internal allocation budget use general matching.
+Construction also needs enough eligible rules to plausibly repay its
+cost, even in a mixed list. Preferred forms therefore need not activate
+an index on every invocation. These heuristics do not change the policy.
 
 Exact names and directories
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

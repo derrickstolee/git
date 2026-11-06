@@ -1012,7 +1012,7 @@ struct ignore_pattern_index {
 };
 
 #define IGNORE_INDEX_MIN_PATTERNS 64
-#define IGNORE_INDEX_MAX_BYTES (4 * 1024 * 1024)
+#define IGNORE_INDEX_MAX_BYTES (8 * 1024 * 1024)
 
 static enum ignore_pattern_kind ignore_pattern_kind(const struct path_pattern *p)
 {
@@ -1116,8 +1116,9 @@ static void clear_ignore_index(struct pattern_list *pl)
 		struct hashmap_iter iter;
 		struct ignore_literal_entry *entry;
 
-		hashmap_for_each_entry(maps[i], &iter, entry, ent)
-			free(entry->name);
+		if (i)
+			hashmap_for_each_entry(maps[i], &iter, entry, ent)
+				free(entry->name);
 		hashmap_clear_and_free(maps[i], struct ignore_literal_entry, ent);
 	}
 	free(index->fallback);
@@ -1142,7 +1143,8 @@ static void build_ignore_index(struct pattern_list *pl)
 		if (kind == IGNORE_LITERAL) {
 			indexed++;
 			cost = sizeof(struct ignore_literal_entry) +
-				(size_t)p->patternlen + p->baselen + 1 +
+				(p->flags & PATTERN_FLAG_NODIR ? 0 :
+				 (size_t)p->patternlen + p->baselen + 1) +
 				4 * sizeof(void *);
 		} else if (kind == IGNORE_SUFFIX) {
 			indexed++;
@@ -1191,9 +1193,9 @@ static void build_ignore_index(struct pattern_list *pl)
 			map = &index->pathnames;
 			strbuf_add(&name, p->base, p->baselen);
 			offset = p->pattern[0] == '/';
+			strbuf_add(&name, p->pattern + offset,
+				   p->patternlen - offset - (kind == IGNORE_PREFIX ? 2 : 0));
 		}
-		strbuf_add(&name, p->pattern + offset,
-			   p->patternlen - offset - (kind == IGNORE_PREFIX ? 2 : 0));
 		if (kind == IGNORE_PREFIX) {
 			ignore_trie_insert(&index->prefixes, name.buf, name.len,
 				0, i, !!(p->flags & PATTERN_FLAG_MUSTBEDIR));
@@ -1201,14 +1203,20 @@ static void build_ignore_index(struct pattern_list *pl)
 			continue;
 		}
 		CALLOC_ARRAY(entry, 1);
-		entry->name = strbuf_detach(&name, &entry->len);
+		if (map == &index->basenames) {
+			entry->name = p->pattern;
+			entry->len = p->patternlen;
+		} else {
+			entry->name = strbuf_detach(&name, &entry->len);
+		}
 		entry->mustbedir = !!(p->flags & PATTERN_FLAG_MUSTBEDIR);
 		entry->rank = i;
 		entry->pattern = p;
 		hashmap_entry_init(&entry->ent, memhash(entry->name, entry->len));
 		old = hashmap_put_entry(map, entry, ent);
 		if (old) {
-			free(old->name);
+			if (map == &index->pathnames)
+				free(old->name);
 			free(old);
 		}
 	}
@@ -1242,7 +1250,7 @@ static size_t ignore_index_bytes(struct ignore_pattern_index *index)
 
 		bytes += maps[i]->tablesize * sizeof(void *);
 		hashmap_for_each_entry(maps[i], &iter, entry, ent)
-			bytes += sizeof(*entry) + entry->len + 1;
+			bytes += sizeof(*entry) + (i ? entry->len + 1 : 0);
 	}
 	return bytes;
 }
@@ -1710,11 +1718,14 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 	struct path_pattern *res = NULL; /* undecided */
 	struct ignore_pattern_index *index = NULL;
 	int i, best_rank = -1;
+	static int index_enabled = -1;
 
 	if (!pl->nr)
 		return NULL;	/* undefined */
 
-	if (pl->nr >= IGNORE_INDEX_MIN_PATTERNS &&
+	if (index_enabled < 0)
+		index_enabled = git_env_bool("GIT_TEST_IGNORE_INDEX", 1);
+	if (index_enabled && pl->nr >= IGNORE_INDEX_MIN_PATTERNS &&
 	    !pl->use_cone_patterns && !repo_ignore_case(the_repository)) {
 		unsigned mustbedir;
 

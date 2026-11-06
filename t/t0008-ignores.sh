@@ -1267,11 +1267,11 @@ test_expect_success 'over-budget literal lists retain correct legacy matching' '
 	reset_advanced_ignore &&
 	awk "BEGIN {
 		for (i = 0; i < 600; i++) s = s \"a\";
-		for (i = 0; i < 7000; i++) print \"/\" s i;
+		for (i = 0; i < 14000; i++) print \"/\" s i;
 	}" >advanced-ignore/.gitignore &&
 	echo /target >>advanced-ignore/.gitignore &&
 	test_write_lines target missing >advanced-paths &&
-	test_write_lines ".gitignore:7001:/target	target" "::	missing" >advanced-expect &&
+	test_write_lines ".gitignore:14001:/target	target" "::	missing" >advanced-expect &&
 	check_advanced_ignore slow-only
 '
 
@@ -1447,5 +1447,35 @@ do
 		test_ignore_trace fast-only cli-trace
 	'
 done
+
+test_expect_success 'ignore index admission boundary preserves semantics' '
+	nr=62 &&
+	reset_advanced_ignore &&
+	echo /target >>advanced-ignore/.gitignore &&
+	echo target >advanced-paths &&
+	printf ".gitignore:63:/target\ttarget\n" >advanced-expect &&
+	check_advanced_ignore slow-only &&
+	echo "!/target" >>advanced-ignore/.gitignore &&
+	printf ".gitignore:64:!/target\ttarget\n" >advanced-expect &&
+	check_advanced_ignore fast-only &&
+	rm -f forced-legacy-trace &&
+	GIT_TEST_IGNORE_INDEX=0 GIT_TRACE2_EVENT="$(pwd)/forced-legacy-trace" \
+		git -C advanced-ignore check-ignore --no-index -v -n --stdin \
+		<advanced-paths >advanced-actual &&
+	test_cmp advanced-expect advanced-actual &&
+	test_ignore_trace slow-only forced-legacy-trace
+'
+
+test_expect_success 'a reusable supported subset remains indexed in mixed lists' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	awk "BEGIN {
+		for (i = 0; i < 300; i++) print \"/absent-\" i \"[ab]*\";
+	}" >>advanced-ignore/.gitignore &&
+	echo /target >>advanced-ignore/.gitignore &&
+	test_write_lines target missing >advanced-paths &&
+	test_write_lines ".gitignore:365:/target	target" "::	missing" >advanced-expect &&
+	check_advanced_ignore hybrid
+'
 
 test_done

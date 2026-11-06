@@ -43,8 +43,9 @@ telemetry; sparse-checkout cone hashmaps are unchanged.
 Ownership and admission
 -----------------------
 
-The index belongs to its pattern list. It owns normalized keys and fallback
-ordinals, but not patterns or their bases. Append invalidates the index;
+The index belongs to its pattern list. It owns normalized pathname keys
+and fallback ordinals, but borrows literal basename keys from patterns.
+It owns neither patterns nor their bases. Append invalidates the index;
 clear frees it before freeing patterns. No index entry retains the address
 of its containing list, which can move when an exclude group grows.
 An indexed winner refreshes its original pattern's source-list pointer
@@ -54,17 +55,27 @@ subsequent stack pop/reload.
 
 Construction is lazy and requires at least 64 supported rules. A conservative
 preflight estimate includes entries, keys, fallback ordinals, and hashmap
-bucket overhead; estimates above 4 MiB per list retain the legacy scan.
+bucket overhead; estimates above 8 MiB per list retain the legacy scan.
+Tiny and general-only lists retain the scan. A supported-fraction cutoff
+was rejected because it regressed repeated mixed misses: having many
+general rules does not by itself disable a reusable supported subset.
 Trie estimates charge two nodes per key byte to account for array growth
 and do not assume that keys share prefixes.
 The `index-bytes` Trace2 counter sums constructed index payloads, including
-keys, allocated trie capacity, hashmap buckets, and fallback vectors. It
+owned keys, allocated trie capacity, hashmap buckets, and fallback vectors. It
 excludes borrowed patterns and allocator metadata, and is not peak RSS;
 reloading a list contributes its new construction again.
 Refused construction is remembered until invalidation. These internal
 limits are admission heuristics, not user-visible pattern requirements.
 Case-insensitive matching also retains the legacy scan until its equality
 and normalization semantics are proven for an indexed representation.
+
+One-query and repeated-query measurements retain the 64-rule minimum:
+construction is near process-startup cost at that size, while repeated
+restricted misses already benefit. The original 4 MiB estimate rejected
+8,000 suffix rules whose actual compact payload is much smaller; the
+8 MiB estimate admits that workload while keeping a finite preflight bound.
+`GIT_TEST_IGNORE_INDEX=0` forces the legacy matcher for differential tests.
 
 Tracing
 -------

@@ -29,6 +29,8 @@ make_patterns () {
 					printf "*.suffix-%06d\n", i
 				else if (kind == "prefix")
 					printf "/work/absent-%06d/**\n", i
+				else if (kind == "general")
+					printf "/absent-%06d[ab]*\n", i
 				else
 					printf "/absent-%06d.keep\n", i
 			}
@@ -170,6 +172,29 @@ test_expect_success 'setup directory pruning and retained sibling' '
 test_perf 'ls-files: prune 8000 directories, retain sibling' '
 	git ls-files --others --exclude-standard >/dev/null
 '
+
+for nr in 16 32 64 128
+do
+	for kind in pathname general
+	do
+		test_expect_success "setup $kind construction policy ($nr)" '
+			make_patterns "$nr" "$kind" &&
+			echo ignored-sentinel >.git/ignore-perf/single &&
+			git check-ignore --no-index --stdin <.git/ignore-perf/single >.git/ignore-perf/actual &&
+			test_cmp .git/ignore-perf/expect .git/ignore-perf/actual &&
+			git check-ignore --no-index --stdin <.git/ignore-perf/paths >.git/ignore-perf/actual &&
+			test_cmp .git/ignore-perf/expect .git/ignore-perf/actual
+		'
+
+		test_perf "check-ignore $kind construction: $nr rules, one path" '
+			git check-ignore --no-index --stdin <.git/ignore-perf/single >/dev/null
+		'
+
+		test_perf "check-ignore $kind reuse: $nr rules, 8000 paths" '
+			git check-ignore --no-index --stdin <.git/ignore-perf/paths >/dev/null
+		'
+	done
+done
 
 if test_bool_env GIT_PERF_EXTRA false
 then
