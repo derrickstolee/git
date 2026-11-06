@@ -27,6 +27,8 @@ make_patterns () {
 					printf "/work/absent-%06d/\n", i
 				else if (kind == "suffix")
 					printf "*.suffix-%06d\n", i
+				else if (kind == "prefix")
+					printf "/work/absent-%06d/**\n", i
 				else
 					printf "/absent-%06d.keep\n", i
 			}
@@ -67,7 +69,7 @@ do
 		sort .git/ignore-perf/expect-traversal >.git/ignore-perf/sorted
 	'
 
-	for kind in basename pathname directory suffix glob-head glob-tail
+	for kind in basename pathname directory suffix prefix glob-head glob-tail
 	do
 		test_expect_success "setup $kind patterns ($nr)" '
 			make_patterns "$nr" "$kind" &&

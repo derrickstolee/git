@@ -27,6 +27,13 @@ than suffix length. An empty suffix (`*`) is a root terminal. Compact
 child/sibling indices avoid a full byte-sized fanout array per node and
 remain valid when the node array grows.
 
+A forward trie indexes literal pathname prefixes ending in `/**`.
+Normalized keys include the terminating slash, so the directory itself
+and similarly named siblings do not match. Base prefixes are included.
+Terminal ranks merge with both literal and suffix candidates, preserving
+alternating signs and directory-only variants. Wildcard prefixes and
+intermediate `**` components remain in the general vector.
+
 Lists are not merged. Source precedence remains in
 `last_matching_pattern_from_lists()`, and `prep_exclude()` still prevents
 descendant rules from overriding an excluded parent. Shared non-cone
@@ -41,7 +48,7 @@ ordinals, but not patterns or their bases. Append invalidates the index;
 clear frees it before freeing patterns. No index entry retains the address
 of its containing list, which can move when an exclude group grows.
 
-Construction is lazy and requires at least 64 literal or suffix rules. A conservative
+Construction is lazy and requires at least 64 supported rules. A conservative
 preflight estimate includes entries, keys, fallback ordinals, and hashmap
 bucket overhead; estimates above 4 MiB per list retain the legacy scan.
 Trie estimates charge two nodes per key byte to account for array growth

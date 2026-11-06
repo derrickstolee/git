@@ -202,6 +202,31 @@ or when a build deletes the directory and cannot preserve its local ignore
 file. The parent must remain traversable for local rules to take effect.
 Even exclusion-only rewrites can change verbose source attribution.
 
+Subtree prefixes and exceptions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A nonempty literal pathname followed by `/**`, such as `/generated/**`,
+is eligible for indexed matching. It matches contents at every depth, not
+the directory itself. Unlike `/generated/`, it permits ordered exceptions
+when the required parents are explicitly kept traversable:
+
+----
+/generated/**
+!/generated/keep/
+/generated/keep/**
+!/generated/keep/good.txt
+----
+
+Here `generated/keep/` is reopened before its direct file is exempted.
+Deeper exceptions require reopening any other excluded intermediate
+directories. These positive and negative rules remain ordered even when
+indexed; the longest prefix does not automatically win.
+
+Literal prefixes are relative to their ignore file. Similar sibling names
+do not match: `/generated/**` does not match `generated-other/file`.
+Wildcard prefixes such as `/generated/*`, `**/generated`, and
+`generated/**/file` retain general matching.
+
 CONFIGURATION
 -------------
 

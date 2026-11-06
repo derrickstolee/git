@@ -1119,7 +1119,7 @@ do
 			echo build/keep/leaf.keep >advanced-paths &&
 			printf ".gitignore:%s:%s\tbuild/keep/leaf.keep\n" \
 				"$((nr + 3))" "$pattern" >advanced-expect &&
-			check_advanced_ignore "$(ignore_trace_mode hybrid)"
+			check_advanced_ignore "$(ignore_trace_mode fast-only)"
 		'
 	done
 
@@ -1156,7 +1156,7 @@ do
 			else
 				test_write_lines "::	build/keep/leaf.keep" "::	builder/keep/leaf.keep" >advanced-expect
 			fi &&
-			check_advanced_ignore "$(ignore_trace_mode hybrid "$icase")"
+			check_advanced_ignore "$(ignore_trace_mode fast-only "$icase")"
 		'
 	done
 
@@ -1313,6 +1313,49 @@ test_expect_success 'indexed local suffix lists survive a -> b -> a reload' '
 	b/.gitignore:65:!*.gz	b/item.gz
 	a/.gitignore:65:*.gz	a/item.gz
 	EOF
+	check_advanced_ignore fast-only
+'
+
+test_expect_success 'indexed local prefix lists survive a -> b -> a reload' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	mkdir advanced-ignore/a/keep advanced-ignore/b/keep &&
+	{
+		ignore_padding &&
+		echo "/keep/**"
+	} >advanced-ignore/a/.gitignore &&
+	{
+		ignore_padding &&
+		echo "!/keep/**"
+	} >advanced-ignore/b/.gitignore &&
+	test_write_lines a/keep/item b/keep/item a/keep/item >advanced-paths &&
+	cat >advanced-expect <<-EOF &&
+	a/.gitignore:65:/keep/**	a/keep/item
+	b/.gitignore:65:!/keep/**	b/keep/item
+	a/.gitignore:65:/keep/**	a/keep/item
+	EOF
+	check_advanced_ignore fast-only
+'
+
+for pattern in "/build/*" "**/leaf.keep" "/build/**/leaf.keep"
+do
+	test_expect_success "wildcard prefix retains fallback: $pattern" '
+		nr=64 &&
+		reset_advanced_ignore &&
+		echo "$pattern" >>advanced-ignore/.gitignore &&
+		echo build/keep/leaf.keep >advanced-paths &&
+		printf ".gitignore:65:%s\tbuild/keep/leaf.keep\n" "$pattern" >advanced-expect &&
+		check_advanced_ignore hybrid
+	'
+done
+
+test_expect_success 'excluded parent skips an earlier general descendant rule' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	test_write_lines "!/build/keep/[ab]*" /build/ "/build/**" \
+		>>advanced-ignore/.gitignore &&
+	echo build/keep/leaf.keep >advanced-paths &&
+	printf ".gitignore:66:/build/\tbuild/keep/leaf.keep\n" >advanced-expect &&
 	check_advanced_ignore fast-only
 '
 

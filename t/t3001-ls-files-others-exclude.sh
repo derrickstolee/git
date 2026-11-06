@@ -339,6 +339,19 @@ test_expect_success SYMLINKS 'directory-only exclusion does not match a symlink'
 	test_grep "^link$" advanced-actual
 '
 
+test_expect_success 'large signed subtree fixture uses only indexed matching' '
+	test_seq 1 64 | sed "s|^|/unused-|" >advanced-padding &&
+	cat advanced/.gitignore >>advanced-padding &&
+	mv advanced-padding advanced/.gitignore &&
+	rm -f advanced-trace &&
+	GIT_TRACE2_EVENT="$(pwd)/advanced-trace" \
+		git -C advanced -c core.excludesFile=/dev/null -c core.ignoreCase=false \
+		ls-files -o --exclude-standard >advanced-actual &&
+	test_filter_gitconfig advanced-actual &&
+	test_cmp advanced-expect advanced-actual &&
+	test_ignore_trace fast-only advanced-trace
+'
+
 test_expect_success SYMLINKS 'indexed directory suffixes retain files and symlinks' '
 	test_create_repo suffix-types &&
 	mkdir suffix-types/directory.o &&
@@ -359,6 +372,25 @@ test_expect_success SYMLINKS 'indexed directory suffixes retain files and symlin
 	test_filter_gitconfig suffix-actual &&
 	test_cmp suffix-expect suffix-actual &&
 	test_ignore_trace fast-only suffix-trace
+'
+
+test_expect_success SYMLINKS 'directory-only subtree prefixes retain files and symlinks' '
+	test_create_repo prefix-types &&
+	mkdir -p prefix-types/build/child &&
+	>prefix-types/build/child/file &&
+	>prefix-types/build/plain &&
+	ln -s child prefix-types/build/link &&
+	{
+		test_seq 1 64 | sed "s|^|/unused-|" &&
+		echo "/build/**/"
+	} >prefix-types/.gitignore &&
+	test_write_lines .gitignore build/link build/plain >prefix-expect &&
+	GIT_TRACE2_EVENT="$(pwd)/prefix-trace" \
+		git -C prefix-types -c core.excludesFile=/dev/null -c core.ignoreCase=false \
+		ls-files -o --exclude-standard >prefix-actual &&
+	test_filter_gitconfig prefix-actual &&
+	test_cmp prefix-expect prefix-actual &&
+	test_ignore_trace fast-only prefix-trace
 '
 
 test_done
