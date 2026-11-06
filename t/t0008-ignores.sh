@@ -964,4 +964,209 @@ test_expect_success EXPENSIVE 'large exclude file ignored in tree' '
 	test_cmp expect err
 '
 
+ignore_padding () {
+	for i in $(test_seq 1 "$nr")
+	do
+		echo "/unused-$i"
+	done
+}
+
+reset_advanced_ignore () {
+	git -C advanced-ignore config core.ignoreCase false &&
+	: >advanced-ignore/.git/info/exclude &&
+	rm -f advanced-ignore/sub/.gitignore &&
+	ignore_padding >advanced-ignore/.gitignore
+}
+
+check_advanced_ignore () {
+	if grep -v "^::" advanced-expect >/dev/null
+	then
+		code=0
+	else
+		code=1
+	fi &&
+	test_expect_code "$code" git -C advanced-ignore check-ignore --no-index -v -n --stdin \
+		<advanced-paths >advanced-actual &&
+	test_cmp advanced-expect advanced-actual
+}
+
+test_expect_success 'setup advanced ignore interactions' '
+	test_create_repo advanced-ignore &&
+	git -C advanced-ignore config core.excludesFile /dev/null &&
+	git -C advanced-ignore config core.untrackedCache false &&
+	git -C advanced-ignore config core.fsmonitor false &&
+	mkdir -p advanced-ignore/.git/info advanced-ignore/sub \
+		advanced-ignore/build/keep advanced-ignore/generated/deep \
+		advanced-ignore/bucket advanced-ignore/archive.o &&
+	>advanced-ignore/plain
+'
+
+for nr in 2 64
+do
+	test_expect_success "literal order, anchoring and directory barriers ($nr)" '
+		reset_advanced_ignore &&
+		cat >>advanced-ignore/.gitignore <<-\EOF &&
+		shared
+		!shared
+		/root-only
+		bucket/
+		!bucket/file
+		plain/
+		EOF
+		test_write_lines shared sub/shared root-only sub/root-only \
+			bucket/file plain >advanced-paths &&
+		cat >advanced-expect <<-EOF &&
+		.gitignore:$((nr + 2)):!shared	shared
+		.gitignore:$((nr + 2)):!shared	sub/shared
+		.gitignore:$((nr + 3)):/root-only	root-only
+		::	sub/root-only
+		.gitignore:$((nr + 4)):bucket/	bucket/file
+		::	plain
+		EOF
+		check_advanced_ignore
+	'
+
+	for winner in literal glob
+	do
+		test_expect_success "literal and general-glob precedence: $winner ($nr)" '
+			reset_advanced_ignore &&
+			if test "$winner" = literal
+			then
+				test_write_lines "!l[ea]*.keep" /leaf.keep >>advanced-ignore/.gitignore &&
+				pattern=/leaf.keep
+			else
+				test_write_lines /leaf.keep "!l[ea]*.keep" >>advanced-ignore/.gitignore &&
+				pattern="!l[ea]*.keep"
+			fi &&
+			echo leaf.keep >advanced-paths &&
+			printf ".gitignore:%s:%s\tleaf.keep\n" "$((nr + 2))" "$pattern" >advanced-expect &&
+			check_advanced_ignore
+		'
+	done
+
+	for winner in include exclude
+	do
+		test_expect_success "overlapping signed suffixes: $winner ($nr)" '
+			reset_advanced_ignore &&
+			if test "$winner" = include
+			then
+				test_write_lines "*.gz" "!*.tar.gz" >>advanced-ignore/.gitignore &&
+				pattern="!*.tar.gz" &&
+				other="*.gz"
+			else
+				test_write_lines "!*.gz" "*.tar.gz" >>advanced-ignore/.gitignore &&
+				pattern="*.tar.gz" &&
+				other="!*.gz"
+			fi &&
+			test_write_lines pack.tar.gz other.gz sub/pack.tar.gz >advanced-paths &&
+			cat >advanced-expect <<-EOF &&
+			.gitignore:$((nr + 2)):$pattern	pack.tar.gz
+			.gitignore:$((nr + 1)):$other	other.gz
+			.gitignore:$((nr + 2)):$pattern	sub/pack.tar.gz
+			EOF
+			check_advanced_ignore
+		'
+	done
+
+	for winner in literal suffix prefix
+	do
+		test_expect_success "three-family precedence: $winner ($nr)" '
+			reset_advanced_ignore &&
+			case "$winner" in
+			literal)
+				test_write_lines "/build/**" "!*.keep" /build/keep/leaf.keep &&
+				pattern=/build/keep/leaf.keep
+				;;
+			suffix)
+				test_write_lines "/build/**" /build/keep/leaf.keep "!*.keep" &&
+				pattern="!*.keep"
+				;;
+			prefix)
+				test_write_lines "!*.keep" /build/keep/leaf.keep "/build/**" &&
+				pattern="/build/**"
+				;;
+			esac >advanced-rules &&
+			cat advanced-rules >>advanced-ignore/.gitignore &&
+			echo "!/build/keep/" >>advanced-ignore/.gitignore &&
+			echo build/keep/leaf.keep >advanced-paths &&
+			printf ".gitignore:%s:%s\tbuild/keep/leaf.keep\n" \
+				"$((nr + 3))" "$pattern" >advanced-expect &&
+			check_advanced_ignore
+		'
+	done
+
+	for icase in false true
+	do
+		test_expect_success "mixed-case literals and suffixes: $icase ($nr)" '
+			reset_advanced_ignore &&
+			git -C advanced-ignore config core.ignoreCase "$icase" &&
+			test_write_lines Case "!case" "*.gz" "!*.TAR.GZ" >>advanced-ignore/.gitignore &&
+			test_write_lines cAsE pack.tAr.gZ >advanced-paths &&
+			if test "$icase" = true
+			then
+				cat >advanced-expect <<-EOF
+				.gitignore:$((nr + 2)):!case	cAsE
+				.gitignore:$((nr + 4)):!*.TAR.GZ	pack.tAr.gZ
+				EOF
+			else
+				test_write_lines "::	cAsE" "::	pack.tAr.gZ" >advanced-expect
+			fi &&
+			check_advanced_ignore
+		'
+
+		test_expect_success "mixed-case subtree boundaries: $icase ($nr)" '
+			reset_advanced_ignore &&
+			git -C advanced-ignore config core.ignoreCase "$icase" &&
+			test_write_lines "/Build/**" "!/build/keep/" >>advanced-ignore/.gitignore &&
+			test_write_lines build/keep/leaf.keep builder/keep/leaf.keep >advanced-paths &&
+			if test "$icase" = true
+			then
+				cat >advanced-expect <<-EOF
+				.gitignore:$((nr + 1)):/Build/**	build/keep/leaf.keep
+				::	builder/keep/leaf.keep
+				EOF
+			else
+				test_write_lines "::	build/keep/leaf.keep" "::	builder/keep/leaf.keep" >advanced-expect
+			fi &&
+			check_advanced_ignore
+		'
+	done
+
+	test_expect_success "nested sources override ancestor and external rules ($nr)" '
+		reset_advanced_ignore &&
+		echo "*.keep" >>advanced-ignore/.gitignore &&
+		{
+			ignore_padding &&
+			echo "!item.keep"
+		} >advanced-ignore/sub/.gitignore &&
+		{
+			ignore_padding &&
+			echo "!*.keep"
+		} >advanced-ignore/.git/info/exclude &&
+		test_write_lines sub/item.keep sub/other.keep >advanced-paths &&
+		cat >advanced-expect <<-EOF &&
+		sub/.gitignore:$((nr + 1)):!item.keep	sub/item.keep
+		.gitignore:$((nr + 1)):*.keep	sub/other.keep
+		EOF
+		check_advanced_ignore
+	'
+
+	test_expect_success "direct-child versus recursive pathname suffix ($nr)" '
+		reset_advanced_ignore &&
+		echo "/generated/*.o" >>advanced-ignore/.gitignore &&
+		test_write_lines generated/direct.o generated/deep/nested.o >advanced-paths &&
+		cat >advanced-expect <<-EOF &&
+		.gitignore:$((nr + 1)):/generated/*.o	generated/direct.o
+		::	generated/deep/nested.o
+		EOF
+		check_advanced_ignore &&
+		echo "/generated/**/*.o" >>advanced-ignore/.gitignore &&
+		cat >advanced-expect <<-EOF &&
+		.gitignore:$((nr + 2)):/generated/**/*.o	generated/direct.o
+		.gitignore:$((nr + 2)):/generated/**/*.o	generated/deep/nested.o
+		EOF
+		check_advanced_ignore
+	'
+done
+
 test_done

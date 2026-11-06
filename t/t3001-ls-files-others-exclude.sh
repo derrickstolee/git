@@ -306,4 +306,34 @@ test_expect_success 'ls-files with "**" patterns and no slashes' '
 	test_must_be_empty actual
 '
 
+test_expect_success 'directory-only names and signed subtree exceptions' '
+	test_create_repo advanced &&
+	mkdir -p advanced/build/keep advanced/builder advanced/name.dir &&
+	>advanced/build/keep/good.keep &&
+	>advanced/build/keep/bad.keep &&
+	>advanced/builder/file.keep &&
+	>advanced/plain &&
+	>advanced/name.dir/file &&
+	cat >advanced/.gitignore <<-\EOF &&
+	/build/**
+	!/build/keep/
+	/build/keep/**
+	!/build/keep/good.keep
+	plain/
+	name.dir/
+	EOF
+	test_write_lines .gitignore build/keep/good.keep builder/file.keep plain >advanced-expect &&
+	git -C advanced -c core.excludesFile=/dev/null ls-files -o --exclude-standard >advanced-actual &&
+	test_filter_gitconfig advanced-actual &&
+	test_cmp advanced-expect advanced-actual
+'
+
+test_expect_success SYMLINKS 'directory-only exclusion does not match a symlink' '
+	test_when_finished "rm advanced/link" &&
+	ln -s name.dir advanced/link &&
+	echo link/ >>advanced/.gitignore &&
+	git -C advanced -c core.excludesFile=/dev/null ls-files -o --exclude-standard >advanced-actual &&
+	test_grep "^link$" advanced-actual
+'
+
 test_done
