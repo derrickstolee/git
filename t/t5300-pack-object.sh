@@ -7,6 +7,26 @@ test_description='git pack-object'
 
 . ./test-lib.sh
 
+test_expect_success 'delta hash buckets preserve matching and literal instructions' '
+	test-tool genrandom bucket-base 4096 >bucket-base &&
+	test-tool genrandom bucket-unrelated 4096 >bucket-unrelated &&
+	{
+		cat bucket-unrelated &&
+		dd if=bucket-base bs=1 skip=1024 count=2048 &&
+		printf appended
+	} >bucket-target &&
+	test-tool delta -d bucket-base bucket-target bucket-delta &&
+	test_oid_cache <<-\EOF &&
+	bucket_delta sha1:b6ff404d9db73c8916d6eea3fdc6c69eb7162ca6
+	bucket_delta sha256:d24f0e9f2ddb1cd3d143b93b635e1b0f169af4f99f5522587e509ef89ba910b6
+	EOF
+	git hash-object --no-filters bucket-delta >actual &&
+	test_oid bucket_delta >expect &&
+	test_cmp expect actual &&
+	test-tool delta -p bucket-base bucket-delta bucket-reconstructed &&
+	test_cmp bucket-target bucket-reconstructed
+'
+
 test_expect_success 'setup' '
 	rm -f .git/index* &&
 	test-tool genzeros 4096 | tr "\000" "a" >a &&
@@ -788,6 +808,551 @@ test_expect_success '--path-walk thin pack' '
 		--thin --stdout --revs --path-walk --progress <in >out.pack 2>err &&
 	test_grep "Compressing objects by path" err &&
 	git -C server index-pack --fix-thin --stdin <out.pack
+'
+
+test_expect_success 'path-walk tries an older predecessor outside the delta window' '
+	git init version-pack &&
+	(
+		cd version-pack &&
+		test-tool genrandom predecessor 4096 >file &&
+		git add file &&
+		git commit -m first &&
+		git tag first &&
+		git checkout -b side &&
+		for i in 1 2 3 4
+		do
+			test-tool genrandom side-$i 4096 >file &&
+			git commit -am side-$i || return 1
+		done &&
+		git checkout -b main first &&
+		git merge -s ours --no-ff side -m merge &&
+		echo appended >>file &&
+		cp file another &&
+		echo more >>another &&
+		git add another &&
+		git commit -am last &&
+		base=$(git rev-parse first:file) &&
+		target=$(git rev-parse HEAD:file) &&
+		for mode in 1 2
+		do
+			GIT_TEST_PACK_PATH_WALK_VERSIONS=$mode \
+				git pack-objects --all --path-walk --window=2 \
+				--depth=3 --threads=2 --no-reuse-delta \
+				--no-reuse-object mode-$mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v mode-$mode-$hash.idx >pack-$mode ||
+				return 1
+		done &&
+		awk -v oid="$target" "\$1 == oid {print NF}" pack-1 >actual &&
+		echo 5 >expect &&
+		test_cmp expect actual &&
+		awk -v oid="$target" "\$1 == oid {print \$7}" pack-2 >actual &&
+		echo "$base" >expect &&
+		test_cmp expect actual &&
+		test-tool path-walk --versions -- --all >versions &&
+		awk -F: "
+			\$1 == \"version\" && (\$2 == \"tree\" || \$2 == \"blob\") {
+				print \$4, \$5
+			}
+		" versions >orders &&
+		awk "
+			NR == FNR {order[\$1] = \$2; next}
+			NF == 7 && order[\$1] &&
+				order[\$7] >= order[\$1] {exit 1}
+			NF == 7 && \$6 > 3 {exit 1}
+		" orders pack-2
+	)
+'
+
+test_expect_success 'path-walk rejects a same-ID predecessor first seen at another path' '
+	git init shared-versions &&
+	(
+		cd shared-versions &&
+		mkdir z &&
+		test-tool genrandom shared 4096 >z/file &&
+		git add . &&
+		git commit -m first &&
+		base=$(git rev-parse HEAD:z/file) &&
+		mkdir a &&
+		cp z/file a/file &&
+		echo extra >a/extra &&
+		echo appended >>z/file &&
+		git add . &&
+		git commit -m second &&
+		target=$(git rev-parse HEAD:z/file) &&
+		test-tool path-walk --versions -- HEAD >versions &&
+		test_grep "version:blob:a/file:$base:2:$ZERO_OID" versions &&
+		test_grep "version:blob:z/file:$target:2:$base" versions &&
+		GIT_TEST_PACK_PATH_WALK_VERSIONS=2 \
+			git pack-objects --all --path-walk --threads=1 \
+			--no-reuse-delta --no-reuse-object pack >hash &&
+		hash=$(cat hash) &&
+		git verify-pack -v pack-$hash.idx >actual &&
+		awk -v base="$base" -v target="$target" "
+			(\$1 == base || \$1 == target) && NF == 7 {exit 1}
+		" actual
+	)
+'
+
+test_expect_success 'path-walk fallback respects depths of predecessor deltas' '
+	git init version-depth &&
+	(
+		cd version-depth &&
+		mkdir a z &&
+		test-tool genrandom shared-base 4096 >a/file &&
+		git add . &&
+		git commit -m first &&
+		cp a/file z/file &&
+		echo appended >>z/file &&
+		git add . &&
+		git commit -m second &&
+		echo tiny >z/file &&
+		git commit -am tiny &&
+		cp a/file z/file &&
+		echo appended >>z/file &&
+		for i in 1 2 3
+		do
+			test-tool genrandom append-$i 1024 >>z/file &&
+			git commit -am append-$i || return 1
+		done &&
+		GIT_TEST_PACK_PATH_WALK_VERSIONS=2 \
+			git pack-objects --all --path-walk --window=2 \
+			--depth=2 --threads=2 --no-reuse-delta \
+			--no-reuse-object pack >hash &&
+		hash=$(cat hash) &&
+		git verify-pack -v pack-$hash.idx >pack &&
+		awk "NF == 7 && \$6 > max {max = \$6} END {print max + 0}" pack >actual &&
+		echo 2 >expect &&
+		test_cmp expect actual &&
+		awk "NF == 7 && \$6 > 2 {exit 1}" pack
+	)
+'
+
+test_expect_success 'path-walk version ordering preserves size-based commit deltas' '
+	git init commit-versions &&
+	(
+		cd commit-versions &&
+		tree=$(git mktree </dev/null) &&
+		test_seq 1 2048 >message &&
+		first=$(git commit-tree "$tree" -F message) &&
+		echo appended >>message &&
+		last=$(git commit-tree "$tree" -p "$first" -F message) &&
+		git update-ref refs/heads/main "$last" &&
+		for mode in 0 1 2
+		do
+			GIT_TEST_PACK_PATH_WALK_VERSIONS=$mode \
+				git pack-objects --all --path-walk --threads=1 \
+				--no-reuse-delta --no-reuse-object mode-$mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v mode-$mode-$hash.idx >pack-$mode &&
+			awk "\$2 == \"commit\" {print \$1, \$7}" pack-$mode |
+				sort >commits-$mode || return 1
+		done &&
+		test_cmp commits-0 commits-1 &&
+		test_cmp commits-0 commits-2 &&
+		awk -v oid="$first" "\$1 == oid {print \$7}" pack-2 >actual &&
+		echo "$last" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk predecessor-only search retains size ordering' '
+	git init previous-only &&
+	(
+		cd previous-only &&
+		test-tool genrandom previous 8192 >file &&
+		git add file &&
+		git commit -m first &&
+		git tag first &&
+		git checkout -b side &&
+		for i in 1 2 3 4
+		do
+			test-tool genrandom side-$i 6144 >file &&
+			git commit -am side-$i || return 1
+		done &&
+		git checkout -b main first &&
+		git merge -s ours --no-ff side -m merge &&
+		test-tool genrandom previous 4096 >file &&
+		git commit -am shorter &&
+		base=$(git rev-parse first:file) &&
+		target=$(git rev-parse HEAD:file) &&
+		for previous in none blob
+		do
+			GIT_TEST_PACK_PATH_WALK_ORDER=none \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=$previous \
+				git pack-objects --all --path-walk --window=2 \
+				--threads=1 --no-reuse-delta --no-reuse-object \
+				$previous >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $previous-$hash.idx >pack-$previous ||
+				return 1
+		done &&
+		awk -v oid="$target" "\$1 == oid {print NF}" pack-none >actual &&
+		echo 5 >expect &&
+		test_cmp expect actual &&
+		awk -v oid="$target" "\$1 == oid {print \$7}" pack-blob >actual &&
+		echo "$base" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk can enable chronological ordering for commits' '
+	(
+		cd commit-versions &&
+		GIT_TEST_PACK_PATH_WALK_ORDER=commit \
+		GIT_TEST_PACK_PATH_WALK_PREVIOUS=none \
+			git pack-objects --all --path-walk --threads=1 \
+			--no-reuse-delta --no-reuse-object ordered >hash &&
+		hash=$(cat hash) &&
+		git verify-pack -v ordered-$hash.idx >pack &&
+		first=$(git rev-parse main^) &&
+		last=$(git rev-parse main) &&
+		awk -v oid="$last" "\$1 == oid {print \$7}" pack >actual &&
+		echo "$first" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk supports all per-type order and predecessor combinations' '
+	(
+		cd version-pack &&
+		test-tool path-walk --versions -- --all >versions &&
+		awk -F: "\$1 == \"version\" {print \$4, \$5}" versions >orders &&
+		for order in none commit tree blob commit,tree commit,blob tree,blob commit,tree,blob
+		do
+			for previous in none commit tree blob commit,tree commit,blob tree,blob commit,tree,blob
+			do
+				GIT_TEST_PACK_PATH_WALK_ORDER=$order \
+				GIT_TEST_PACK_PATH_WALK_PREVIOUS=$previous \
+					git pack-objects --all --path-walk --window=2 \
+					--depth=3 --threads=2 --no-reuse-delta \
+					--no-reuse-object combination >hash &&
+				hash=$(cat hash) &&
+				git verify-pack -v combination-$hash.idx >pack &&
+				awk -v types="$order" "
+					NR == FNR {order[\$1] = \$2; next}
+					NF == 7 && order[\$1] &&
+						index(\",\" types \",\", \",\" \$2 \",\") &&
+						(!order[\$7] || order[\$7] >= order[\$1]) {
+						exit 1
+					}
+				" orders pack || return 1
+			done
+		done
+	)
+'
+
+test_expect_success 'path-walk rejects unsupported experimental object types' '
+	test_env GIT_TEST_PACK_PATH_WALK_ORDER=tag \
+		test_must_fail git pack-objects --all --path-walk invalid 2>err &&
+	test_grep "invalid object type.*tag.*GIT_TEST_PACK_PATH_WALK_ORDER" err
+'
+
+test_expect_success 'path-walk predecessor-only search handles reused trees' '
+	git init self-previous &&
+	(
+		cd self-previous &&
+		mkdir z &&
+		test-tool genrandom self-base 4096 >z/file &&
+		git add z &&
+		git commit -m first &&
+		cp -R z a &&
+		git add a &&
+		git commit -m copied &&
+		echo extra >a/extra &&
+		git add a/extra &&
+		git commit -m changed &&
+		blob=$(git rev-parse HEAD:a/file) &&
+		test-tool path-walk --versions -- HEAD >versions &&
+		test_grep "version:blob:z/file:$blob:1:$ZERO_OID" versions &&
+		GIT_TEST_PACK_PATH_WALK_ORDER=none \
+		GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			git pack-objects --all --path-walk --threads=1 \
+			--no-reuse-delta --no-reuse-object pack >hash 2>err &&
+		test_must_be_empty err &&
+		hash=$(cat hash) &&
+		git verify-pack -v pack-$hash.idx >pack &&
+		awk -v oid="$blob" "\$1 == oid {print NF}" pack >actual &&
+		echo 5 >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk skips saturated predecessor delta bases' '
+	git init skip-deltas &&
+	(
+		cd skip-deltas &&
+		test-tool genrandom skip-base 4096 >file &&
+		git add file &&
+		git commit -m first &&
+		for i in 1 2 3
+		do
+			test-tool genrandom skip-$i 256 >>file &&
+			git commit -am append-$i || return 1
+		done &&
+		first=$(git rev-parse HEAD~3:file) &&
+		second=$(git rev-parse HEAD~2:file) &&
+		target=$(git rev-parse HEAD:file) &&
+		for skip in none blob
+		do
+			GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			GIT_TEST_PACK_PATH_WALK_SKIP=$skip \
+				git pack-objects --all --path-walk --window=1 \
+				--depth=2 --threads=1 --no-reuse-delta \
+				--no-reuse-object $skip >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $skip-$hash.idx >pack-$skip &&
+			awk "NF == 7 && \$6 > 2 {exit 1}" pack-$skip ||
+				return 1
+		done &&
+		awk -v oid="$target" "\$1 == oid {print \$7}" pack-none >actual &&
+		echo "$first" >expect &&
+		test_cmp expect actual &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-blob >actual &&
+		echo "2 $second" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk can skip size-ordered window bases without predecessors' '
+	git init skip-window &&
+	(
+		cd skip-window &&
+		test-tool genrandom window-base 16384 >file &&
+		git add file &&
+		git commit -m first &&
+		for i in 1 2 3 4 5 6 7 8 9 10
+		do
+			test-tool genrandom window-$i 512 >chunk &&
+			dd if=chunk of=file bs=512 seek=$i conv=notrunc &&
+			test-tool genrandom append-$i 32 >>file &&
+			git commit -am version-$i || return 1
+		done &&
+		for skip in none blob
+		do
+			GIT_TEST_PACK_PATH_WALK_ORDER=none \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=none \
+			GIT_TEST_PACK_PATH_WALK_SKIP=$skip \
+			GIT_TRACE2_EVENT="$PWD/$skip.trace" \
+				git pack-objects --all --path-walk --window=3 \
+				--depth=2 --threads=1 --no-reuse-delta \
+				--no-reuse-object $skip >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $skip-$hash.idx >pack-$skip &&
+			awk "NF == 7 && \$6 > 2 {exit 1}" pack-$skip ||
+				return 1
+		done &&
+		target=$(git rev-parse HEAD~8:file) &&
+		without=$(awk -v oid="$target" "\$1 == oid {print \$3}" pack-none) &&
+		with=$(awk -v oid="$target" "\$1 == oid {print \$3}" pack-blob) &&
+		test "$with" -lt "$without" &&
+		test_grep "\"key\":\"version-base/skip-matches\",\"value\":\"[1-9][0-9]*\"" blob.trace
+	)
+'
+
+test_expect_success 'path-walk fallback groups by name hash before chronological order' '
+	git init hash-fallback &&
+	(
+		cd hash-fallback &&
+		mkdir one middle three &&
+		test-tool genrandom fallback-shared 8192 >one/long-common-fallback-file.txt &&
+		git add one &&
+		git commit -m first &&
+		test-tool genrandom fallback-unrelated 8192 >middle/unrelated.dat &&
+		git add middle &&
+		git commit -m middle &&
+		cp one/long-common-fallback-file.txt three/long-common-fallback-file.txt &&
+		echo appended >>three/long-common-fallback-file.txt &&
+		git add three &&
+		git commit -m last &&
+		base=$(git rev-parse HEAD:one/long-common-fallback-file.txt) &&
+		target=$(git rev-parse HEAD:three/long-common-fallback-file.txt) &&
+		GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+		GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			git pack-objects --all --path-walk --name-hash-version=1 \
+			--window=1 --depth=3 --threads=1 --no-reuse-delta \
+			--no-reuse-object pack >hash &&
+		hash=$(cat hash) &&
+		git verify-pack -v pack-$hash.idx >pack &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack >actual &&
+		echo "1 $base" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk recompression improves payloads without deepening chains' '
+	git init recompress &&
+	(
+		cd recompress &&
+		mkdir a b z &&
+		test-tool genrandom recompress-base 8192 >base &&
+		test-tool genrandom recompress-good 512 >good &&
+		test-tool genrandom recompress-other 512 >other &&
+		cat base good >a/long-common-recompression-file.txt &&
+		cat base other >b/long-common-recompression-file.txt &&
+		git add a b &&
+		git commit -m roots &&
+		cp base z/long-common-recompression-file.txt &&
+		git add z &&
+		git commit -m predecessor &&
+		cp a/long-common-recompression-file.txt z/long-common-recompression-file.txt &&
+		echo appended >>z/long-common-recompression-file.txt &&
+		git commit -am target &&
+		predecessor=$(git rev-parse HEAD~1:z/long-common-recompression-file.txt) &&
+		target=$(git rev-parse HEAD:z/long-common-recompression-file.txt) &&
+		better=$(git rev-parse HEAD:a/long-common-recompression-file.txt) &&
+		for mode in none blob uncached
+		do
+			recompress=$mode &&
+			cache=256m &&
+			if test "$mode" = uncached
+			then
+				recompress=blob &&
+				cache=1
+			fi &&
+			GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			GIT_TEST_PACK_PATH_WALK_SKIP=none \
+			GIT_TEST_PACK_PATH_WALK_RECOMPRESS=$recompress \
+			GIT_TRACE2_EVENT="$PWD/$mode.trace" \
+				git -c pack.deltaCacheSize=$cache pack-objects \
+				--all --path-walk --name-hash-version=1 \
+				--window=10 --depth=3 --threads=1 \
+				--no-reuse-delta --no-reuse-object $mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $mode-$hash.idx >pack-$mode ||
+				return 1
+		done &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-none >actual &&
+		echo "2 $predecessor" >expect &&
+		test_cmp expect actual &&
+		for mode in blob uncached
+		do
+			awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-$mode >actual &&
+			echo "1 $better" >expect &&
+			test_cmp expect actual &&
+			before=$(awk -v oid="$target" "\$1 == oid {print \$4}" pack-none) &&
+			after=$(awk -v oid="$target" "\$1 == oid {print \$4}" pack-$mode) &&
+			test "$after" -lt "$before" &&
+			awk -v oid="$predecessor" "\$1 == oid {print \$6, \$7}" pack-none >expect &&
+			awk -v oid="$predecessor" "\$1 == oid {print \$6, \$7}" pack-$mode >actual &&
+			test_cmp expect actual &&
+			awk "
+				NR == FNR {
+					if (NF == 5 || NF == 7)
+						depth[\$1] = NF == 7 ? \$6 : 0
+					next
+				}
+				NF == 5 || NF == 7 {
+					if ((NF == 7 ? \$6 : 0) > depth[\$1])
+						exit 1
+				}
+			" pack-none pack-$mode &&
+			test_grep "\"key\":\"recompress/objects\",\"value\":\"1\"" $mode.trace ||
+				return 1
+		done
+	)
+'
+
+test_expect_success 'path-walk recompression respects selected types and delta reuse' '
+	(
+		cd recompress &&
+		target=$(git rev-parse HEAD:z/long-common-recompression-file.txt) &&
+		for mode in tree reuse
+		do
+			recompress=$mode &&
+			set -- --no-reuse-delta &&
+			if test "$mode" = reuse
+			then
+				recompress=blob &&
+				set --
+			fi &&
+			GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			GIT_TEST_PACK_PATH_WALK_SKIP=none \
+			GIT_TEST_PACK_PATH_WALK_RECOMPRESS=$recompress \
+				git pack-objects --all --path-walk --name-hash-version=1 \
+				--window=10 --depth=3 --threads=1 "$@" $mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $mode-$hash.idx >pack-$mode &&
+			awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-none >expect &&
+			awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-$mode >actual &&
+			test_cmp expect actual ||
+				return 1
+		done
+	)
+'
+
+test_expect_success 'path-walk recompression handles uncompressed cached deltas on stdout' '
+	(
+		cd recompress &&
+		target=$(git rev-parse HEAD:z/long-common-recompression-file.txt) &&
+		GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+		GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+		GIT_TEST_PACK_PATH_WALK_SKIP=none \
+		GIT_TEST_PACK_PATH_WALK_RECOMPRESS=blob \
+			git pack-objects --all --path-walk --name-hash-version=1 \
+			--window=10 --depth=3 --threads=1 --no-reuse-delta \
+			--no-reuse-object --stdout >stdout.pack &&
+		git index-pack stdout.pack &&
+		git verify-pack -v stdout.idx >pack-stdout &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-blob >expect &&
+		awk -v oid="$target" "\$1 == oid {print \$6, \$7}" pack-stdout >actual &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'path-walk recompression can prefer larger raw deltas' '
+	git init recompress-raw &&
+	(
+		cd recompress-raw &&
+		mkdir one two &&
+		test-tool genrandom recompress-prefix 8192 >prefix &&
+		test-tool genrandom recompress-noise 2048 >noise &&
+		cp prefix one/long-common-recompression-file.txt &&
+		git add one &&
+		git commit -m root &&
+		cp prefix two/long-common-recompression-file.txt &&
+		pos=16 &&
+		for char in P O N M L K J I H G F E D C B A
+		do
+			pos=$((pos - 1)) &&
+			printf "%032d" 0 | tr 0 "$char" >>two/long-common-recompression-file.txt &&
+			dd if=noise bs=32 skip=$pos count=1 \
+				>>two/long-common-recompression-file.txt 2>/dev/null ||
+				return 1
+		done &&
+		git add two &&
+		git commit -m predecessor &&
+		cp prefix two/long-common-recompression-file.txt &&
+		for char in A B C D E F G H I J K L M N O P
+		do
+			printf "%032d" 0 | tr 0 "$char" >>two/long-common-recompression-file.txt ||
+				return 1
+		done &&
+		git commit -am target &&
+		target=$(git rev-parse HEAD:two/long-common-recompression-file.txt) &&
+		for mode in none blob
+		do
+			GIT_TEST_PACK_PATH_WALK_ORDER=blob \
+			GIT_TEST_PACK_PATH_WALK_PREVIOUS=blob \
+			GIT_TEST_PACK_PATH_WALK_SKIP=none \
+			GIT_TEST_PACK_PATH_WALK_RECOMPRESS=$mode \
+				git pack-objects --all --path-walk --name-hash-version=1 \
+				--window=10 --depth=3 --threads=1 --no-reuse-delta \
+				--no-reuse-object $mode >hash &&
+			hash=$(cat hash) &&
+			git verify-pack -v $mode-$hash.idx >pack-$mode ||
+				return 1
+		done &&
+		before_raw=$(awk -v oid="$target" "\$1 == oid {print \$3}" pack-none) &&
+		after_raw=$(awk -v oid="$target" "\$1 == oid {print \$3}" pack-blob) &&
+		before_disk=$(awk -v oid="$target" "\$1 == oid {print \$4}" pack-none) &&
+		after_disk=$(awk -v oid="$target" "\$1 == oid {print \$4}" pack-blob) &&
+		test "$after_raw" -gt "$before_raw" &&
+		test "$after_disk" -lt "$before_disk"
+	)
 '
 
 test_done

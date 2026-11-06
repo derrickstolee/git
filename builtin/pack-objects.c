@@ -235,6 +235,13 @@ static int pack_to_stdout;
 static int sparse;
 static int thin;
 static int path_walk = -1;
+static unsigned path_walk_order_types, path_walk_previous_types, path_walk_skip_types;
+static unsigned path_walk_recompress_types;
+static unsigned *recompress_depths;
+static struct path_walk_info path_versions = PATH_WALK_INFO_INIT;
+static uintmax_t version_base_attempts, version_base_matches;
+static uintmax_t version_skip_attempts, version_skip_matches;
+static uintmax_t recompress_candidates, recompress_objects, recompress_saved;
 static int num_preferred_base;
 static struct progress *progress_state;
 
@@ -408,6 +415,25 @@ static size_t do_compress(void **pptr, size_t size)
 
 	free(in);
 	return stream.total_out;
+}
+
+static unsigned long get_compressed_delta_size(struct object_entry *entry)
+{
+	void *buf;
+	unsigned long size;
+
+	if (entry->delta_data && entry->z_delta_size)
+		return entry->z_delta_size;
+	if (entry->delta_data) {
+		buf = xmemdupz(entry->delta_data, DELTA_SIZE(entry));
+	} else {
+		packing_data_lock(&to_pack);
+		buf = get_delta(entry);
+		packing_data_unlock(&to_pack);
+	}
+	size = do_compress(&buf, DELTA_SIZE(entry));
+	free(buf);
+	return size;
 }
 
 static unsigned long write_large_blob_data(struct odb_stream *st, struct hashfile *f,
@@ -2704,7 +2730,51 @@ struct unpacked {
 	void *data;
 	struct delta_index *index;
 	unsigned depth;
+	unsigned long compressed_delta_size;
 };
+
+struct path_delta_search {
+	struct packing_region *region;
+	unsigned *depths;
+	uintmax_t attempts, matches;
+	uintmax_t skip_attempts, skip_matches;
+};
+
+static uint64_t object_version_order(const struct object_entry *entry)
+{
+	const struct path_walk_object_version *version;
+
+	if (!(path_walk_order_types & (1U << oe_type(entry))))
+		return 0;
+	version = path_walk_get_object_version(&path_versions, &entry->idx.oid);
+	return version ? version->order : 0;
+}
+
+static int version_size_sort(const void *va, const void *vb)
+{
+	const struct object_entry *a = *(struct object_entry **)va;
+	const struct object_entry *b = *(struct object_entry **)vb;
+	uint64_t a_order, b_order;
+
+	if (oe_type(a) != oe_type(b))
+		return type_size_sort(va, vb);
+	a_order = object_version_order(a);
+	b_order = object_version_order(b);
+
+	if (a_order != b_order)
+		return a_order < b_order ? -1 : 1;
+	return type_size_sort(va, vb);
+}
+
+static int name_version_size_sort(const void *va, const void *vb)
+{
+	const struct object_entry *a = *(struct object_entry **)va;
+	const struct object_entry *b = *(struct object_entry **)vb;
+
+	if (oe_type(a) != oe_type(b) || a->hash != b->hash)
+		return type_size_sort(va, vb);
+	return version_size_sort(va, vb);
+}
 
 static int delta_cacheable(size_t src_size, size_t trg_size,
 			   size_t delta_size)
@@ -2863,15 +2933,26 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 
 	/* Now some size filtering heuristics. */
 	trg_size = SIZE(trg_entry);
-	if (!DELTA(trg_entry)) {
+	if (recompress_depths) {
+		/*
+		 * Every replacement must descend in the immutable depth
+		 * snapshot, even if its base has since become shallower.
+		 */
+		if (DELTA(trg_entry) == src_entry ||
+		    recompress_depths[src_entry - to_pack.objects] >= max_depth ||
+		    src->depth + 1 > trg->depth)
+			return 0;
+		max_size = trg_size;
+	} else if (!DELTA(trg_entry)) {
 		max_size = trg_size/2 - the_hash_algo->rawsz;
 		ref_depth = 1;
 	} else {
 		max_size = DELTA_SIZE(trg_entry);
 		ref_depth = trg->depth;
 	}
-	max_size = (uint64_t)max_size * (max_depth - src->depth) /
-						(max_depth - ref_depth + 1);
+	if (!recompress_depths)
+		max_size = (uint64_t)max_size * (max_depth - src->depth) /
+			   (max_depth - ref_depth + 1);
 	if (trg_entry->reused_delta &&
 	    max_size > DELTA_SIZE(trg_entry))
 		max_size = DELTA_SIZE(trg_entry);
@@ -2947,7 +3028,17 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 	if (!delta_buf)
 		return 0;
 
-	if (DELTA(trg_entry)) {
+	if (recompress_depths) {
+		void *compressed = xmemdupz(delta_buf, delta_size);
+		unsigned long compressed_size = do_compress(&compressed, delta_size);
+
+		free(compressed);
+		if (compressed_size >= trg->compressed_delta_size) {
+			free(delta_buf);
+			return 0;
+		}
+		trg->compressed_delta_size = compressed_size;
+	} else if (DELTA(trg_entry)) {
 		if (delta_size > DELTA_SIZE(trg_entry)) {
 			free(delta_buf);
 			return 0;
@@ -2968,9 +3059,12 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 	free(trg_entry->delta_data);
 	cache_lock();
 	if (trg_entry->delta_data) {
-		delta_cache_size -= DELTA_SIZE(trg_entry);
+		delta_cache_size -= trg_entry->z_delta_size ?
+					    trg_entry->z_delta_size :
+					    DELTA_SIZE(trg_entry);
 		trg_entry->delta_data = NULL;
 	}
+	trg_entry->z_delta_size = 0;
 	if (delta_cacheable(src_size, trg_size, delta_size)) {
 		delta_cache_size += delta_size;
 		cache_unlock();
@@ -3012,15 +3106,83 @@ static size_t free_unpacked(struct unpacked *n)
 	}
 	n->entry = NULL;
 	n->depth = 0;
+	n->compressed_delta_size = 0;
 	return freed_mem;
 }
 
+static int try_delta_with_ancestors(struct unpacked *trg, struct unpacked *src,
+				    unsigned max_depth, size_t *mem_usage,
+				    struct path_delta_search *search,
+				    uint64_t order)
+{
+	struct object_entry *base = src->entry;
+	unsigned base_depth = src->depth;
+	size_t budget = SIZE(trg->entry) / 8;
+	int ret = try_delta(trg, src, max_depth, mem_usage);
+
+	if (ret || base_depth < max_depth || !search ||
+	    !(path_walk_skip_types & (1U << oe_type(trg->entry))))
+		return ret;
+
+	/*
+	 * A saturated base can still lead to a shallow, similar ancestor.
+	 * Bound the walk by both its length and the accumulated raw deltas.
+	 */
+	for (unsigned hops = 0; hops < 64; hops++) {
+		struct unpacked ancestor = { 0 };
+		unsigned ancestor_depth;
+		size_t delta_size;
+
+		if (!DELTA(base) || base->ext_base)
+			break;
+		delta_size = DELTA_SIZE(base);
+		if (delta_size > budget)
+			break;
+		budget -= delta_size;
+		base = DELTA(base);
+		if (base == trg->entry ||
+		    base < to_pack.objects + search->region->start ||
+		    base >= to_pack.objects + search->region->start +
+				    search->region->nr)
+			break;
+		ancestor_depth = search->depths[base - to_pack.objects -
+						search->region->start];
+		if (ancestor_depth == UINT_MAX || ancestor_depth >= base_depth)
+			break;
+		base_depth = ancestor_depth;
+		if (base_depth >= max_depth)
+			continue;
+		if (order) {
+			uint64_t base_order = object_version_order(base);
+			if (!base_order || base_order >= order)
+				continue;
+		}
+		if (DELTA(trg->entry) == base)
+			continue;
+
+		ancestor.entry = base;
+		ancestor.depth = base_depth;
+		search->skip_attempts++;
+		ret = try_delta(trg, &ancestor, max_depth, mem_usage);
+		*mem_usage -= free_unpacked(&ancestor);
+		if (ret > 0) {
+			search->skip_matches++;
+			return ret;
+		}
+		if (ret < 0)
+			break;
+	}
+	return 0;
+}
+
 static void find_deltas(struct object_entry **list, unsigned *list_size,
-			int window, int depth, unsigned *processed)
+			int window, int depth, unsigned *processed,
+			struct path_delta_search *search)
 {
 	uint32_t i, idx = 0, count = 0;
 	struct unpacked *array;
 	size_t mem_usage = 0;
+	uintmax_t candidates = 0, improved = 0, saved = 0;
 
 	CALLOC_ARRAY(array, window);
 
@@ -3028,6 +3190,8 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		struct object_entry *entry;
 		struct unpacked *n = array + idx;
 		int j, max_depth, best_base = -1;
+		uint64_t order;
+		unsigned long old_compressed_size = 0;
 
 		progress_lock();
 		if (!*list_size) {
@@ -3042,9 +3206,16 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		}
 		progress_unlock();
 
+		order = object_version_order(entry);
 		mem_usage -= free_unpacked(n);
 		n->entry = entry;
 		n->depth = entry->depth;
+
+		if (recompress_depths)
+			n->depth = recompress_depths[entry - to_pack.objects];
+		if (search)
+			search->depths[entry - to_pack.objects -
+				       search->region->start] = 0;
 
 		while (window_memory_limit &&
 		       mem_usage > window_memory_limit &&
@@ -3059,6 +3230,8 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 */
 		if (entry->preferred_base)
 			goto next;
+		if (recompress_depths && !DELTA(entry))
+			goto next;
 
 		/*
 		 * If the current object is at pack edge, take the depth the
@@ -3066,10 +3239,48 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 * otherwise they would become too deep.
 		 */
 		max_depth = depth;
-		if (DELTA_CHILD(entry)) {
+		if (recompress_depths) {
+			max_depth = n->depth;
+			old_compressed_size = n->compressed_delta_size =
+				get_compressed_delta_size(entry);
+		} else if (DELTA_CHILD(entry)) {
 			max_depth -= check_delta_limit(entry, 0);
 			if (max_depth <= 0)
 				goto next;
+		}
+
+		if (search &&
+		    (path_walk_previous_types & (1U << oe_type(entry)))) {
+			const struct path_walk_object_version *version =
+				path_walk_get_object_version(&path_versions,
+							     &entry->idx.oid);
+			struct object_entry *base = NULL;
+
+			if (version && !is_null_oid(&version->previous))
+				base = packlist_find(&to_pack, &version->previous);
+			if (base && base != entry &&
+			    base >= to_pack.objects + search->region->start &&
+			    base < to_pack.objects + search->region->start +
+					    search->region->nr &&
+			    (!order ||
+			     (object_version_order(base) &&
+			      object_version_order(base) < order))) {
+				unsigned base_depth =
+					search->depths[base - to_pack.objects -
+						       search->region->start];
+				if (base_depth != UINT_MAX) {
+					struct unpacked previous = {
+						.entry = base,
+						.depth = base_depth,
+					};
+					search->attempts++;
+					if (try_delta_with_ancestors(n, &previous,
+								     max_depth, &mem_usage,
+								     search, order) > 0)
+						search->matches++;
+					mem_usage -= free_unpacked(&previous);
+				}
+			}
 		}
 
 		j = window;
@@ -3082,11 +3293,23 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 			m = array + other_idx;
 			if (!m->entry)
 				break;
-			ret = try_delta(n, m, max_depth, &mem_usage);
+			if (order) {
+				uint64_t base_order = object_version_order(m->entry);
+				if (!base_order || base_order >= order)
+					continue;
+			}
+			if (recompress_depths)
+				candidates++;
+			ret = try_delta_with_ancestors(n, m, max_depth,
+						       &mem_usage, search, order);
 			if (ret < 0)
 				break;
 			else if (ret > 0)
 				best_base = other_idx;
+		}
+		if (recompress_depths && best_base >= 0) {
+			improved++;
+			saved += old_compressed_size - n->compressed_delta_size;
 		}
 
 		/*
@@ -3103,7 +3326,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 * instead, as we can afford spending more time compressing
 		 * between writes at that moment.
 		 */
-		if (entry->delta_data && !pack_to_stdout) {
+		if (entry->delta_data && !entry->z_delta_size && !pack_to_stdout) {
 			unsigned long size;
 
 			size = do_compress(&entry->delta_data, DELTA_SIZE(entry));
@@ -3119,11 +3342,16 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 			}
 		}
 
-		/* if we made n a delta, and if n is already at max
-		 * depth, leaving it in the window is pointless.  we
-		 * should evict it first.
+		/*
+		 * Evict saturated deltas unless their ancestors can still
+		 * supply usable bases.
 		 */
-		if (DELTA(entry) && max_depth <= n->depth)
+		/* Window rotation below can move the current object out of 'n'. */
+		if (search)
+			search->depths[entry - to_pack.objects -
+				       search->region->start] = n->depth;
+		if (!recompress_depths && DELTA(entry) && max_depth <= n->depth &&
+		    !(search && (path_walk_skip_types & (1U << oe_type(entry)))))
 			continue;
 
 		/*
@@ -3131,7 +3359,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		 * currently deltified object, to keep it longer.  It will
 		 * be the first base object to be attempted next.
 		 */
-		if (best_base >= 0) {
+		if (DELTA(entry) && best_base >= 0) {
 			struct unpacked swap = array[best_base];
 			int dist = (window + idx - best_base) % window;
 			int dst = best_base;
@@ -3143,7 +3371,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 			array[dst] = swap;
 		}
 
-		next:
+	next:
 		idx++;
 		if (count + 1 < window)
 			count++;
@@ -3156,6 +3384,13 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 		free(array[i].data);
 	}
 	free(array);
+	if (recompress_depths) {
+		progress_lock();
+		recompress_candidates += candidates;
+		recompress_objects += improved;
+		recompress_saved += saved;
+		progress_unlock();
+	}
 }
 
 /*
@@ -3217,7 +3452,7 @@ static void *threaded_find_deltas(void *arg)
 		progress_unlock();
 
 		find_deltas(me->list, &me->remaining,
-			    me->window, me->depth, me->processed);
+			    me->window, me->depth, me->processed, NULL);
 
 		progress_lock();
 		me->working = 0;
@@ -3254,7 +3489,7 @@ static void ll_find_deltas(struct object_entry **list, unsigned list_size,
 	init_threaded_search();
 
 	if (delta_search_threads <= 1) {
-		find_deltas(list, &list_size, window, depth, processed);
+		find_deltas(list, &list_size, window, depth, processed, NULL);
 		cleanup_threaded_search();
 		return;
 	}
@@ -3420,7 +3655,7 @@ static int add_ref_tag(const struct reference *ref, void *cb_data UNUSED)
 	return 0;
 }
 
-static int should_attempt_deltas(struct object_entry *entry)
+static int can_attempt_deltas(struct object_entry *entry)
 {
 	if (DELTA(entry) && !entry->reused_delta)
 		/*
@@ -3451,12 +3686,21 @@ static int should_attempt_deltas(struct object_entry *entry)
 	return 1;
 }
 
+static int should_attempt_deltas(struct object_entry *entry)
+{
+	return !DELTA(entry) && can_attempt_deltas(entry);
+}
+
 static void find_deltas_for_region(struct object_entry *list,
 				   struct packing_region *region,
 				   unsigned int *processed)
 {
 	struct object_entry **delta_list;
 	unsigned int delta_list_nr = 0;
+	int versioned;
+	struct path_delta_search search = {
+		.region = region,
+	};
 
 	ALLOC_ARRAY(delta_list, region->nr);
 	for (size_t i = 0; i < region->nr; i++) {
@@ -3465,8 +3709,27 @@ static void find_deltas_for_region(struct object_entry *list,
 			delta_list[delta_list_nr++] = entry;
 	}
 
-	QSORT(delta_list, delta_list_nr, type_size_sort);
-	find_deltas(delta_list, &delta_list_nr, window, depth, processed);
+	versioned = delta_list_nr &&
+		    ((path_walk_order_types | path_walk_previous_types |
+		      path_walk_skip_types) &
+		     (1U << oe_type(*delta_list)));
+	if (versioned) {
+		ALLOC_ARRAY(search.depths, region->nr);
+		for (size_t i = 0; i < region->nr; i++)
+			search.depths[i] = UINT_MAX;
+		QSORT(delta_list, delta_list_nr, version_size_sort);
+	} else {
+		QSORT(delta_list, delta_list_nr, type_size_sort);
+	}
+	find_deltas(delta_list, &delta_list_nr, window, depth, processed,
+		    versioned ? &search : NULL);
+	progress_lock();
+	version_base_attempts += search.attempts;
+	version_base_matches += search.matches;
+	version_skip_attempts += search.skip_attempts;
+	version_skip_matches += search.skip_matches;
+	progress_unlock();
+	free(search.depths);
 	free(delta_list);
 }
 
@@ -3657,6 +3920,94 @@ static void ll_find_deltas_by_region(struct object_entry *list,
 	stop_progress(&progress_state);
 }
 
+static unsigned *snapshot_delta_depths(void)
+{
+	unsigned *depths;
+	struct object_entry **chain = NULL;
+	size_t chain_nr, chain_alloc = 0;
+
+	ALLOC_ARRAY(depths, to_pack.nr_objects);
+	for (uint32_t i = 0; i < to_pack.nr_objects; i++)
+		depths[i] = UINT_MAX;
+
+	for (uint32_t i = 0; i < to_pack.nr_objects; i++) {
+		struct object_entry *entry = to_pack.objects + i;
+		unsigned base_depth = 0;
+
+		chain_nr = 0;
+		while (entry && depths[entry - to_pack.objects] == UINT_MAX) {
+			depths[entry - to_pack.objects] = UINT_MAX - 1;
+			ALLOC_GROW(chain, chain_nr + 1, chain_alloc);
+			chain[chain_nr++] = entry;
+			if (!DELTA(entry) || entry->ext_base) {
+				base_depth = !!DELTA(entry);
+				entry = NULL;
+			} else {
+				entry = DELTA(entry);
+			}
+		}
+		if (entry) {
+			base_depth = depths[entry - to_pack.objects];
+			if (base_depth == UINT_MAX - 1) {
+				warning(_("cannot recompress a cyclic delta chain"));
+				free(chain);
+				free(depths);
+				return NULL;
+			}
+			base_depth++;
+		}
+		while (chain_nr)
+			depths[chain[--chain_nr] - to_pack.objects] = base_depth++;
+	}
+	free(chain);
+	return depths;
+}
+
+static void improve_path_deltas(int window, int depth)
+{
+	struct object_entry **list;
+	unsigned *final_depths;
+	unsigned n = 0, nr_deltas = 0, nr_done = 0;
+
+	if (!path_walk_recompress_types)
+		return;
+	recompress_depths = snapshot_delta_depths();
+	if (!recompress_depths)
+		return;
+
+	ALLOC_ARRAY(list, to_pack.nr_objects);
+	for (uint32_t i = 0; i < to_pack.nr_objects; i++) {
+		struct object_entry *entry = to_pack.objects + i;
+
+		if (!can_attempt_deltas(entry) ||
+		    !(path_walk_recompress_types & (1U << oe_type(entry))))
+			continue;
+		list[n++] = entry;
+		if (!entry->preferred_base)
+			nr_deltas++;
+	}
+	if (nr_deltas && n > 1) {
+		if (progress)
+			progress_state = start_progress(the_repository,
+							_("Improving deltas"),
+							nr_deltas);
+		QSORT(list, n, path_walk_order_types ? name_version_size_sort : type_size_sort);
+		ll_find_deltas(list, n, window + 1, depth, &nr_done);
+		stop_progress(&progress_state);
+		if (nr_done != nr_deltas)
+			die(_("inconsistency with delta count"));
+	}
+	free(list);
+	final_depths = snapshot_delta_depths();
+	if (!final_depths)
+		BUG("recompression created a delta cycle");
+	for (uint32_t i = 0; i < to_pack.nr_objects; i++)
+		if (final_depths[i] > recompress_depths[i])
+			BUG("recompression increased delta depth");
+	free(final_depths);
+	FREE_AND_NULL(recompress_depths);
+}
+
 static void prepare_pack(int window, int depth)
 {
 	struct object_entry **delta_list;
@@ -3685,6 +4036,27 @@ static void prepare_pack(int window, int depth)
 		ll_find_deltas_by_region(to_pack.objects, to_pack.regions,
 					 0, to_pack.nr_regions);
 
+	if (path_walk_order_types || path_walk_previous_types ||
+	    path_walk_skip_types || path_walk_recompress_types) {
+		/*
+		 * The fallback search can deltify bases used by the path
+		 * search. Account for their newly created descendants when
+		 * limiting the depth of these additional deltas.
+		 */
+		for (i = 0; i < to_pack.nr_objects; i++) {
+			SET_DELTA_CHILD(&to_pack.objects[i], NULL);
+			SET_DELTA_SIBLING(&to_pack.objects[i], NULL);
+		}
+		for (i = to_pack.nr_objects; i > 0;) {
+			struct object_entry *entry = &to_pack.objects[--i];
+			struct object_entry *base = DELTA(entry);
+			if (!base || entry->ext_base)
+				continue;
+			entry->delta_sibling_idx = base->delta_child_idx;
+			SET_DELTA_CHILD(base, entry);
+		}
+	}
+
 	ALLOC_ARRAY(delta_list, to_pack.nr_objects);
 	nr_deltas = n = 0;
 
@@ -3707,13 +4079,14 @@ static void prepare_pack(int window, int depth)
 			progress_state = start_progress(the_repository,
 							_("Compressing objects"),
 							nr_deltas);
-		QSORT(delta_list, n, type_size_sort);
+		QSORT(delta_list, n, path_walk_order_types ? name_version_size_sort : type_size_sort);
 		ll_find_deltas(delta_list, n, window+1, depth, &nr_done);
 		stop_progress(&progress_state);
 		if (nr_done != nr_deltas)
 			die(_("inconsistency with delta count"));
 	}
 	free(delta_list);
+	improve_path_deltas(window, depth);
 }
 
 static int git_pack_config(const char *k, const char *v,
@@ -4836,6 +5209,11 @@ static int add_objects_by_path(const char *path,
 		struct object_info oi = OBJECT_INFO_INIT;
 		struct object_id *oid = &oids->oid[i];
 
+		/* Keep commit packing and island propagation newest-first. */
+		if ((path_walk_order_types || path_walk_previous_types) &&
+		    type == OBJ_COMMIT)
+			oid = &oids->oid[oids->nr - i - 1];
+
 		/* Skip objects that do not exist locally. */
 		if ((exclude_promisor_objects || arg_missing_action != MA_ERROR) &&
 		    odb_read_object_info_extended(the_repository->objects, oid, &oi,
@@ -4895,15 +5273,53 @@ static int add_objects_by_path(const char *path,
 	return 0;
 }
 
+static unsigned path_walk_version_types(const char *name, unsigned fallback)
+{
+	const char *value = getenv(name);
+	struct string_list types = STRING_LIST_INIT_DUP;
+	struct string_list_item *item;
+	unsigned result = 0;
+
+	if (!value)
+		return fallback;
+	if (!*value || !strcmp(value, "none"))
+		return 0;
+
+	string_list_split(&types, value, ",", -1);
+	for_each_string_list_item(item, &types) {
+		int type = type_from_string_gently(item->string, -1, 1);
+		if (type != OBJ_COMMIT && type != OBJ_TREE && type != OBJ_BLOB)
+			die("invalid object type '%s' in %s", item->string, name);
+		result |= 1U << type;
+	}
+	string_list_clear(&types, 0);
+	return result;
+}
+
 static int get_object_list_path_walk(struct rev_info *revs)
 {
 	struct path_walk_info info = PATH_WALK_INFO_INIT;
 	unsigned int processed = 0;
+	unsigned long mode =
+		git_env_ulong("GIT_TEST_PACK_PATH_WALK_VERSIONS", 0);
+	unsigned trees_and_blobs = (1U << OBJ_TREE) | (1U << OBJ_BLOB);
 	int result;
 
 	info.revs = revs;
 	info.path_fn = add_objects_by_path;
 	info.path_fn_data = &processed;
+	path_walk_order_types = path_walk_version_types(
+		"GIT_TEST_PACK_PATH_WALK_ORDER", mode ? trees_and_blobs : 0);
+	path_walk_previous_types = path_walk_version_types(
+		"GIT_TEST_PACK_PATH_WALK_PREVIOUS", mode > 1 ? trees_and_blobs : 0);
+	path_walk_skip_types = path_walk_version_types(
+		"GIT_TEST_PACK_PATH_WALK_SKIP", path_walk_previous_types);
+	path_walk_recompress_types = path_walk_version_types(
+		"GIT_TEST_PACK_PATH_WALK_RECOMPRESS", 0);
+	if (reuse_delta)
+		path_walk_recompress_types = 0;
+	info.track_object_versions =
+		!!(path_walk_order_types || path_walk_previous_types);
 
 	/*
 	 * Path-walk needs boundary commits to discover thin-pack bases, but
@@ -4925,6 +5341,7 @@ static int get_object_list_path_walk(struct rev_info *revs)
 	result = walk_objects_by_path(&info);
 	trace2_region_leave("pack-objects", "path-walk", revs->repo);
 
+	SWAP(info.object_versions, path_versions.object_versions);
 	path_walk_info_clear(&info);
 
 	return result;
@@ -5541,6 +5958,24 @@ int cmd_pack_objects(int argc,
 		trace2_region_enter("pack-objects", "prepare-pack",
 				    the_repository);
 		prepare_pack(window, depth);
+		if (path_walk_order_types || path_walk_previous_types || path_walk_skip_types) {
+			trace2_data_intmax("pack-objects", the_repository,
+					   "version-base/attempts", version_base_attempts);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "version-base/matches", version_base_matches);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "version-base/skip-attempts", version_skip_attempts);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "version-base/skip-matches", version_skip_matches);
+		}
+		if (path_walk_recompress_types) {
+			trace2_data_intmax("pack-objects", the_repository,
+					   "recompress/candidates", recompress_candidates);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "recompress/objects", recompress_objects);
+			trace2_data_intmax("pack-objects", the_repository,
+					   "recompress/saved-bytes", recompress_saved);
+		}
 		trace2_region_leave("pack-objects", "prepare-pack",
 				    the_repository);
 	}
@@ -5567,6 +6002,7 @@ int cmd_pack_objects(int argc,
 	trace2_data_intmax("pack-objects", the_repository, "packs-reused", reuse_packfiles_used_nr);
 
 cleanup:
+	path_walk_info_clear(&path_versions);
 	clear_packing_data(&to_pack);
 	list_objects_filter_release(&filter_options);
 	string_list_clear(&keep_pack_list, 0);

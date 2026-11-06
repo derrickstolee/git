@@ -21,6 +21,7 @@ static const char * const path_walk_usage[] = {
 };
 
 struct path_walk_test_data {
+	struct path_walk_info *info;
 	uintmax_t batch_nr;
 
 	uintmax_t commit_nr;
@@ -60,6 +61,15 @@ static int emit_block(const char *path, struct oid_array *oids,
 		       tdata->batch_nr, typestr, path,
 		       oid_to_hex(&oids->oid[i]),
 		       o->flags & UNINTERESTING ? ":UNINTERESTING" : "");
+		if (tdata->info->track_object_versions) {
+			const struct path_walk_object_version *version =
+				path_walk_get_object_version(tdata->info, &oids->oid[i]);
+			if (version)
+				printf("version:%s:%s:%s:%" PRIu64 ":%s\n",
+				       typestr, path, oid_to_hex(&oids->oid[i]),
+				       version->order,
+				       oid_to_hex(&version->previous));
+		}
 	}
 
 	tdata->batch_nr++;
@@ -83,6 +93,8 @@ int cmd__path_walk(int argc, const char **argv)
 			 N_("toggle inclusion of tag objects")),
 		OPT_BOOL(0, "trees", &info.trees,
 			 N_("toggle inclusion of tree objects")),
+		OPT_BOOL(0, "versions", &info.track_object_versions,
+			 N_("track object discovery order and previous versions")),
 		OPT_BOOL(0, "prune", &info.prune_all_uninteresting,
 			 N_("toggle pruning of uninteresting paths")),
 		OPT_BOOL(0, "edge-aggressive", &info.edge_aggressive,
@@ -114,6 +126,7 @@ int cmd__path_walk(int argc, const char **argv)
 	info.revs = &revs;
 	info.path_fn = emit_block;
 	info.path_fn_data = &data;
+	data.info = &info;
 
 	if (stdin_pl) {
 		struct strbuf in = STRBUF_INIT;
@@ -136,10 +149,7 @@ int cmd__path_walk(int argc, const char **argv)
 	       "tags:%" PRIuMAX "\n",
 	       data.commit_nr, data.tree_nr, data.blob_nr, data.tag_nr);
 
-	if (info.pl) {
-		clear_pattern_list(info.pl);
-		free(info.pl);
-	}
+	path_walk_info_clear(&info);
 
 	list_objects_filter_release(&filter_options);
 	release_revisions(&revs);

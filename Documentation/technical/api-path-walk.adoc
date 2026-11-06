@@ -58,6 +58,89 @@ are never silently dropped.
 While it is possible to walk only commits in this way, consumers would be
 better off using the revision walk API instead.
 
+`track_object_versions`::
+	When enabled, commits are visited in reverse topological order, with
+	parents before children. Each commit receives a positive, increasing
+	`order`, and its first parent is recorded as its `previous` version.
+	A root tree inherits the order of the first commit that discovers it,
+	and its previous version is that commit's first parent's root tree.
+	Trees at each path are expanded in increasing order. Before expanding
+	a tree, the walk expands any queued predecessor tree at its original
+	path, even if it belongs to another path batch. Each tree's children
+	are expanded only once, except for sparse aliases that need an
+	additional in-cone walk. Newly discovered children inherit their tree's
+	order and use the same-name entry in the previous tree as their
+	previous version, if one exists and has a different object ID.
+	This can cross a file/directory type change; a previous non-tree
+	object has no children to propagate to the new tree.
++
+Call `path_walk_get_object_version(info, oid)` to access this metadata,
+including from `path_fn`. The returned pointer is owned by `info` and
+remains valid until `path_walk_info_clear()`. A null previous object ID
+means no previous version was found; a NULL pointer means no version
+metadata was recorded, as can happen for directly requested objects.
+Repeated object IDs retain their first discovery metadata, even if they
+appear again at another path. A previous version need not be in the
+requested object set or have a smaller order. Consumers must check this
+before using the relationship to build an acyclic delta graph.
+Predecessors outside the requested or unpruned object set are not expanded
+as dependencies. A cyclic tree predecessor chain, possible when earlier
+commits are excluded, is broken by leaving one tree without a predecessor.
++
+The experimental `pack-objects` consumer independently enables chronological
+delta ordering and predecessor-first search per object type through
+`GIT_TEST_PACK_PATH_WALK_ORDER` and `GIT_TEST_PACK_PATH_WALK_PREVIOUS`.
+Each accepts a comma-separated subset of `commit,tree,blob`, or `none`.
+Chronological ordering requires all tracked delta bases to have smaller,
+positive IDs. Predecessor-only search retains size-based ordering and
+tries the predecessor only if it has already been processed in the same
+packing region. Shared topology metadata is collected whenever either
+control is enabled.
++
+The path pass sorts chronologically within each path batch. The global
+fallback pass groups the remaining objects by type and filename hash,
+then sorts chronologically within each hash group for ordered types.
+Both passes retain the smaller-positive-ID restriction on delta bases.
++
+`GIT_TEST_PACK_PATH_WALK_SKIP` enables delta-base skipping for a
+comma-separated subset of `commit,tree,blob`, or disables it with `none`.
+It defaults to the predecessor-search types. When a predecessor or window
+candidate has exhausted the depth budget, the consumer follows its selected
+delta bases to find an eligible, shallower ancestor. It stops at the first
+accepted delta, after 64 links, or when the accumulated raw delta sizes
+exceed one eighth of the target's size. These sizes guide the search; each
+candidate still requires a new direct delta and the usual depth/size checks.
+Depth-limited window entries remain available as hints to their ancestors.
+All candidates must already be processed in the same packing region, and
+chronologically ordered types still require smaller positive IDs.
+Skipping can also be enabled without predecessor search or chronological
+ordering, using only the preliminary delta graph from the size-ordered
+path search. This does not require topology metadata.
++
+`GIT_TEST_PACK_PATH_WALK_RECOMPRESS` enables an additional improvement sweep
+for a comma-separated subset of `commit,tree,blob`; its default is `none`.
+It only applies with `--no-reuse-delta` (including `repack -f`). After the
+ordinary fallback, it searches the name-hash-ordered window again, admitting
+existing deltas as both targets and bases. Full objects remain unchanged.
+An existing delta is replaced only by a strictly smaller compressed delta
+payload with no increase in depth. Equal compressed sizes retain the
+incumbent, even if a candidate would make the chain shallower.
++
+The sweep snapshots every object's depth first. A new base must have a
+strictly smaller snapshot depth than its target, and its window depth
+must not increase the target's current depth. Thus new edges cannot form
+cycles or deepen descendants, without maintaining a mutable child graph
+between worker threads. This conservatively excludes some bases that
+become shallow enough during the sweep. Chronological types still require
+smaller positive IDs. Candidate deltas are compressed for comparison even
+when their raw size exceeds the incumbent's, adding computation; this
+objective does not account for pack reference headers or write-order changes.
++
+The earlier `GIT_TEST_PACK_PATH_WALK_VERSIONS` modes remain defaults for
+controls not explicitly set: mode 0 changes nothing, mode 1 orders trees
+and blobs, and mode 2 also searches their predecessors. Tags always retain
+size-based selection.
+
 `prune_all_uninteresting`::
 	By default, all reachable paths are emitted by the path-walk API.
 	This option allows consumers to declare that they are not
