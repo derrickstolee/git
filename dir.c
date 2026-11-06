@@ -977,6 +977,7 @@ int hashmap_contains_parent(struct hashmap *map,
 enum ignore_pattern_kind {
 	IGNORE_GENERAL,
 	IGNORE_LITERAL,
+	IGNORE_SUFFIX,
 };
 
 struct ignore_literal_entry {
@@ -988,11 +989,24 @@ struct ignore_literal_entry {
 	struct path_pattern *pattern;
 };
 
+struct ignore_trie_node {
+	int child;
+	int next;
+	int ranks[2];
+	unsigned char c;
+};
+
+struct ignore_trie {
+	struct ignore_trie_node *nodes;
+	int nr, alloc;
+};
+
 struct ignore_pattern_index {
 	struct hashmap basenames;
 	struct hashmap pathnames;
 	int *fallback;
 	int fallback_nr;
+	struct ignore_trie suffixes;
 };
 
 #define IGNORE_INDEX_MIN_PATTERNS 64
@@ -1002,7 +1016,67 @@ static enum ignore_pattern_kind ignore_pattern_kind(const struct path_pattern *p
 {
 	if (p->patternlen && p->nowildcardlen == p->patternlen)
 		return IGNORE_LITERAL;
+	if ((p->flags & PATTERN_FLAG_NODIR) &&
+	    (p->flags & PATTERN_FLAG_ENDSWITH))
+		return IGNORE_SUFFIX;
 	return IGNORE_GENERAL;
+}
+
+static int ignore_trie_add_node(struct ignore_trie *trie, unsigned char c)
+{
+	int n = trie->nr++;
+
+	ALLOC_GROW(trie->nodes, trie->nr, trie->alloc);
+	memset(&trie->nodes[n], 0, sizeof(trie->nodes[n]));
+	trie->nodes[n].c = c;
+	trie->nodes[n].ranks[0] = trie->nodes[n].ranks[1] = -1;
+	return n;
+}
+
+static void ignore_trie_insert(struct ignore_trie *trie, const char *key,
+			       int len, int reverse, int rank, unsigned mustbedir)
+{
+	int node = 0, i;
+
+	if (!trie->nr)
+		ignore_trie_add_node(trie, 0);
+	for (i = 0; i < len; i++) {
+		unsigned char c = key[reverse ? len - i - 1 : i];
+		int child = trie->nodes[node].child;
+
+		while (child && trie->nodes[child].c != c)
+			child = trie->nodes[child].next;
+		if (!child) {
+			child = ignore_trie_add_node(trie, c);
+			trie->nodes[child].next = trie->nodes[node].child;
+			trie->nodes[node].child = child;
+		}
+		node = child;
+	}
+	trie->nodes[node].ranks[mustbedir] = rank;
+}
+
+static int ignore_trie_lookup(struct ignore_trie *trie, const char *key,
+			     int len, int reverse, unsigned mustbedir)
+{
+	int node = 0, rank, i;
+
+	if (!trie->nr)
+		return -1;
+	rank = trie->nodes[0].ranks[mustbedir];
+	for (i = 0; i < len; i++) {
+		unsigned char c = key[reverse ? len - i - 1 : i];
+		int child = trie->nodes[node].child;
+
+		while (child && trie->nodes[child].c != c)
+			child = trie->nodes[child].next;
+		if (!child)
+			break;
+		node = child;
+		if (trie->nodes[node].ranks[mustbedir] > rank)
+			rank = trie->nodes[node].ranks[mustbedir];
+	}
+	return rank;
 }
 
 static int ignore_literal_cmp(const void *data UNUSED,
@@ -1039,6 +1113,7 @@ static void clear_ignore_index(struct pattern_list *pl)
 		hashmap_clear_and_free(maps[i], struct ignore_literal_entry, ent);
 	}
 	free(index->fallback);
+	free(index->suffixes.nodes);
 	free(index);
 	pl->ignore_index = NULL;
 }
@@ -1047,18 +1122,23 @@ static void build_ignore_index(struct pattern_list *pl)
 {
 	struct ignore_pattern_index *index;
 	size_t bytes = sizeof(*index) + 2048 * sizeof(void *);
-	int i, literals = 0, fallback_nr = 0;
+	int i, indexed = 0, fallback_nr = 0;
 
 	pl->ignore_index_checked = 1;
 	for (i = 0; i < pl->nr; i++) {
 		struct path_pattern *p = pl->patterns[i];
+		enum ignore_pattern_kind kind = ignore_pattern_kind(p);
 		size_t cost;
 
-		if (ignore_pattern_kind(p) == IGNORE_LITERAL) {
-			literals++;
+		if (kind == IGNORE_LITERAL) {
+			indexed++;
 			cost = sizeof(struct ignore_literal_entry) +
 				(size_t)p->patternlen + p->baselen + 1 +
 				4 * sizeof(void *);
+		} else if (kind == IGNORE_SUFFIX) {
+			indexed++;
+			cost = 2 * sizeof(struct ignore_trie_node) *
+				(size_t)p->patternlen;
 		} else {
 			fallback_nr++;
 			cost = sizeof(int);
@@ -1067,7 +1147,7 @@ static void build_ignore_index(struct pattern_list *pl)
 			return;
 		bytes += cost;
 	}
-	if (literals < IGNORE_INDEX_MIN_PATTERNS)
+	if (indexed < IGNORE_INDEX_MIN_PATTERNS)
 		return;
 
 	CALLOC_ARRAY(index, 1);
@@ -1076,13 +1156,20 @@ static void build_ignore_index(struct pattern_list *pl)
 	ALLOC_ARRAY(index->fallback, fallback_nr);
 	for (i = 0; i < pl->nr; i++) {
 		struct path_pattern *p = pl->patterns[i];
+		enum ignore_pattern_kind kind = ignore_pattern_kind(p);
 		struct ignore_literal_entry *entry, *old;
 		struct hashmap *map;
 		struct strbuf name = STRBUF_INIT;
 		int offset = 0;
 
-		if (ignore_pattern_kind(p) != IGNORE_LITERAL) {
+		if (kind == IGNORE_GENERAL) {
 			index->fallback[index->fallback_nr++] = i;
+			continue;
+		}
+		if (kind == IGNORE_SUFFIX) {
+			ignore_trie_insert(&index->suffixes, p->pattern + 1,
+				p->patternlen - 1, 1, i,
+				!!(p->flags & PATTERN_FLAG_MUSTBEDIR));
 			continue;
 		}
 		if (p->flags & PATTERN_FLAG_NODIR) {
@@ -1119,6 +1206,24 @@ static struct ignore_literal_entry *lookup_ignore_literal(
 
 	hashmap_entry_init(&key.ent, memhash(name, len));
 	return hashmap_get_entry(map, &key, ent, NULL);
+}
+
+static size_t ignore_index_bytes(struct ignore_pattern_index *index)
+{
+	struct hashmap *maps[] = { &index->basenames, &index->pathnames };
+	size_t bytes = sizeof(*index) + index->fallback_nr * sizeof(int) +
+		index->suffixes.alloc * sizeof(struct ignore_trie_node);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(maps); i++) {
+		struct hashmap_iter iter;
+		struct ignore_literal_entry *entry;
+
+		bytes += maps[i]->tablesize * sizeof(void *);
+		hashmap_for_each_entry(maps[i], &iter, entry, ent)
+			bytes += sizeof(*entry) + entry->len + 1;
+	}
+	return bytes;
 }
 
 void add_pattern(const char *string, const char *base,
@@ -1592,32 +1697,39 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 	    !pl->use_cone_patterns && !repo_ignore_case(the_repository)) {
 		unsigned mustbedir;
 
-		if (!pl->ignore_index_checked)
+		if (!pl->ignore_index_checked) {
 			build_ignore_index(pl);
+			if (pl->ignore_index && stats)
+				stats->index_bytes += ignore_index_bytes(pl->ignore_index);
+		}
 		index = pl->ignore_index;
 		if (index) {
 			if (stats)
 				stats->fast_path++;
 			for (mustbedir = 0; mustbedir <= 1; mustbedir++) {
-				struct ignore_literal_entry *entries[2];
+				struct ignore_literal_entry *entry;
+				int ranks[3];
 				int j;
 
-				entries[0] = lookup_ignore_literal(&index->basenames,
+				entry = lookup_ignore_literal(&index->basenames,
 					basename, pathlen - (basename - pathname), mustbedir);
-				entries[1] = lookup_ignore_literal(&index->pathnames,
+				ranks[0] = entry ? entry->rank : -1;
+				entry = lookup_ignore_literal(&index->pathnames,
 					pathname, pathlen, mustbedir);
-				for (j = 0; j < ARRAY_SIZE(entries); j++) {
-					struct ignore_literal_entry *entry = entries[j];
+				ranks[1] = entry ? entry->rank : -1;
+				ranks[2] = ignore_trie_lookup(&index->suffixes, basename,
+					pathlen - (basename - pathname), 1, mustbedir);
 
-					if (!entry || entry->rank <= best_rank)
+				for (j = 0; j < ARRAY_SIZE(ranks); j++) {
+					if (ranks[j] <= best_rank)
 						continue;
 					if (mustbedir) {
 						*dtype = resolve_dtype(*dtype, istate, pathname, pathlen);
 						if (*dtype != DT_DIR)
 							continue;
 					}
-					best_rank = entry->rank;
-					res = entry->pattern;
+					best_rank = ranks[j];
+					res = pl->patterns[best_rank];
 				}
 			}
 		}
@@ -3784,6 +3896,8 @@ void dir_clear(struct dir_struct *dir)
 				  "slow-fallback", stats->slow_fallback);
 		trace2_data_intmax("ignore", dir->internal.ignore_repo,
 				  "fallback-patterns-tested", stats->fallback_patterns_tested);
+		trace2_data_intmax("ignore", dir->internal.ignore_repo,
+				  "index-bytes", stats->index_bytes);
 	}
 
 	for (i = EXC_CMDL; i <= EXC_FILE; i++) {

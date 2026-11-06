@@ -30,26 +30,32 @@ static int check_target(struct pattern_list *pl, enum pattern_match_result expec
 	return 0;
 }
 
-int cmd__ignore_patterns(int argc UNUSED, const char **argv UNUSED)
+static int check_lifetime(const char *positive, const char *negative)
 {
 	struct pattern_list pl = { 0 };
 	int result = 1;
 
-	setup_git_directory(the_repository);
 	add_padding(&pl);
-	add_pattern("/target", "", 0, &pl, 65);
+	add_pattern(positive, "", 0, &pl, 65);
 	if (check_target(&pl, MATCHED))
 		goto out;
-	add_pattern("!/target", "", 0, &pl, 66);
+	add_pattern(negative, "", 0, &pl, 66);
 	if (pl.ignore_index || check_target(&pl, NOT_MATCHED))
 		goto out;
 	clear_pattern_list(&pl);
 	add_padding(&pl);
-	add_pattern("/target", "", 0, &pl, 65);
+	add_pattern(positive, "", 0, &pl, 65);
 	if (check_target(&pl, MATCHED))
 		goto out;
 	result = 0;
 out:
 	clear_pattern_list(&pl);
 	return result;
+}
+
+int cmd__ignore_patterns(int argc UNUSED, const char **argv UNUSED)
+{
+	setup_git_directory(the_repository);
+	return check_lifetime("/target", "!/target") ||
+		check_lifetime("*get", "!*get");
 }

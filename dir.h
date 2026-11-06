@@ -150,6 +150,7 @@ struct ignore_matching_stats {
 	uint64_t fast_path;
 	uint64_t slow_fallback;
 	uint64_t fallback_patterns_tested;
+	uint64_t index_bytes;
 };
 
 /*

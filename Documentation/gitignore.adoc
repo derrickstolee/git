@@ -175,6 +175,33 @@ change. Compare representative direct and deep paths, sibling directories
 and exceptions with `git check-ignore --no-index -v -n --stdin` before
 rewriting a policy.
 
+Directory-local suffixes
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Slash-free patterns consisting of `*` followed by a literal suffix, such
+as `*.o` or `*~`, are also eligible for indexing, including negated and
+directory-only forms. Suffix length does not override rule order.
+Escaped suffixes and pathname globs continue to use general matching.
+
+When recursive suffix matching is intended, `*.o` in
+`generated/.gitignore` expresses that policy below `generated/`.
+`/generated/*.o` in the root ignore file matches only direct children;
+moving it to an unanchored local suffix would broaden its scope.
+`/generated/**/*.o` matches both direct and deep descendants because
+`**/` can match zero directories.
+
+Relocation can change precedence. For example, a root policy containing
+`/generated/**/*.o` followed by `!/generated/keep.o` keeps the direct
+child `keep.o`. Moving only the exclusion to `generated/.gitignore` as
+`*.o` overrides that root exception. Moving both rules locally as `*.o`
+and `!/keep.o` can preserve this particular exception, but requires
+reviewing other ancestor and nested rules.
+
+Keep centralized pathname globs when their ordering expresses the policy,
+or when a build deletes the directory and cannot preserve its local ignore
+file. The parent must remain traversable for local rules to take effect.
+Even exclusion-only rewrites can change verbose source attribution.
+
 CONFIGURATION
 -------------
 

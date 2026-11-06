@@ -122,6 +122,33 @@ do
 	'
 done
 
+for position in early late
+do
+	test_expect_success "setup $position suffix hit" '
+		make_patterns 4000 suffix &&
+		if test "$position" = early
+		then
+			{
+				echo "*.keep" &&
+				cat .gitignore
+			} >.git/ignore-perf/rules &&
+			mv .git/ignore-perf/rules .gitignore
+		else
+			echo "*.keep" >>.gitignore
+		fi &&
+		git check-ignore --no-index --stdin <.git/ignore-perf/hit-paths >.git/ignore-perf/actual &&
+		test_cmp .git/ignore-perf/hit-paths .git/ignore-perf/actual &&
+		test_write_lines .gitignore test_vars >.git/ignore-perf/expect-hit &&
+		git ls-files --others --exclude-standard >.git/ignore-perf/actual &&
+		test_filter_gitconfig .git/ignore-perf/actual &&
+		test_cmp .git/ignore-perf/expect-hit .git/ignore-perf/actual
+	'
+
+	test_perf "check-ignore $position suffix hit: 4000 rules, 8000 paths" '
+		git check-ignore --no-index --stdin <.git/ignore-perf/hit-paths >/dev/null
+	'
+done
+
 test_expect_success 'setup directory pruning and retained sibling' '
 	mkdir work-retained &&
 	>work-retained/file.keep &&

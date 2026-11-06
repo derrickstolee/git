@@ -339,4 +339,26 @@ test_expect_success SYMLINKS 'directory-only exclusion does not match a symlink'
 	test_grep "^link$" advanced-actual
 '
 
+test_expect_success SYMLINKS 'indexed directory suffixes retain files and symlinks' '
+	test_create_repo suffix-types &&
+	mkdir suffix-types/directory.o &&
+	>suffix-types/directory.o/file &&
+	>suffix-types/regular.o &&
+	ln -s directory.o suffix-types/link.o &&
+	{
+		for i in $(test_seq 1 64)
+		do
+			echo "*.unused-$i" || return 1
+		done &&
+		echo "*.o/"
+	} >suffix-types/.gitignore &&
+	test_write_lines .gitignore link.o regular.o >suffix-expect &&
+	GIT_TRACE2_EVENT="$(pwd)/suffix-trace" \
+		git -C suffix-types -c core.excludesFile=/dev/null -c core.ignoreCase=false \
+		ls-files -o --exclude-standard >suffix-actual &&
+	test_filter_gitconfig suffix-actual &&
+	test_cmp suffix-expect suffix-actual &&
+	test_ignore_trace fast-only suffix-trace
+'
+
 test_done

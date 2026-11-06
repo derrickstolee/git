@@ -1092,7 +1092,7 @@ do
 			.gitignore:$((nr + 1)):$other	other.gz
 			.gitignore:$((nr + 2)):$pattern	sub/pack.tar.gz
 			EOF
-			check_advanced_ignore "$(ignore_trace_mode hybrid)"
+			check_advanced_ignore "$(ignore_trace_mode fast-only)"
 		'
 	done
 
@@ -1139,7 +1139,7 @@ do
 			else
 				test_write_lines "::	cAsE" "::	pack.tAr.gZ" >advanced-expect
 			fi &&
-			check_advanced_ignore "$(ignore_trace_mode hybrid "$icase")"
+			check_advanced_ignore "$(ignore_trace_mode fast-only "$icase")"
 		'
 
 		test_expect_success "mixed-case subtree boundaries: $icase ($nr)" '
@@ -1176,7 +1176,7 @@ do
 		sub/.gitignore:$((nr + 1)):!item.keep	sub/item.keep
 		.gitignore:$((nr + 1)):*.keep	sub/other.keep
 		EOF
-		check_advanced_ignore "$(ignore_trace_mode hybrid)"
+		check_advanced_ignore "$(ignore_trace_mode fast-only)"
 	'
 
 	test_expect_success "direct-child versus recursive pathname suffix ($nr)" '
@@ -1196,6 +1196,53 @@ do
 		check_advanced_ignore "$(ignore_trace_mode hybrid)"
 	'
 done
+
+for winner in literal suffix
+do
+	test_expect_success "indexed exact and suffix rank: $winner" '
+		nr=64 &&
+		reset_advanced_ignore &&
+		if test "$winner" = literal
+		then
+			test_write_lines "!*.keep" /leaf.keep >>advanced-ignore/.gitignore &&
+			pattern=/leaf.keep
+		else
+			test_write_lines /leaf.keep "!*.keep" >>advanced-ignore/.gitignore &&
+			pattern="!*.keep"
+		fi &&
+		echo leaf.keep >advanced-paths &&
+		printf ".gitignore:66:%s\tleaf.keep\n" "$pattern" >advanced-expect &&
+		check_advanced_ignore fast-only
+	'
+done
+
+test_expect_success 'indexed empty suffix and literal exception' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	test_write_lines "*" "!keep" >>advanced-ignore/.gitignore &&
+	test_write_lines keep missing >advanced-paths &&
+	test_write_lines ".gitignore:66:!keep	keep" ".gitignore:65:*	missing" >advanced-expect &&
+	check_advanced_ignore fast-only
+'
+
+test_expect_success 'directory-only suffixes preserve entry types' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	>advanced-ignore/object.o &&
+	test_write_lines "!archive.o" "*.o/" >>advanced-ignore/.gitignore &&
+	test_write_lines archive.o object.o >advanced-paths &&
+	test_write_lines ".gitignore:66:*.o/	archive.o" "::	object.o" >advanced-expect &&
+	check_advanced_ignore fast-only
+'
+
+test_expect_success 'escaped suffixes retain general matching' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	echo "*\\.o" >>advanced-ignore/.gitignore &&
+	test_write_lines object.o other.keep >advanced-paths &&
+	test_write_lines ".gitignore:65:*\\.o	object.o" "::	other.keep" >advanced-expect &&
+	check_advanced_ignore hybrid
+'
 
 test_expect_success 'large general-only lists retain the legacy scan' '
 	nr=64 &&
@@ -1249,7 +1296,27 @@ test_expect_success 'indexed local lists survive a -> b -> a reload' '
 	check_advanced_ignore fast-only
 '
 
-test_expect_success 'appending and clearing invalidate a built literal index' '
+test_expect_success 'indexed local suffix lists survive a -> b -> a reload' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	{
+		ignore_padding &&
+		echo "*.gz"
+	} >advanced-ignore/a/.gitignore &&
+	{
+		ignore_padding &&
+		echo "!*.gz"
+	} >advanced-ignore/b/.gitignore &&
+	test_write_lines a/item.gz b/item.gz a/item.gz >advanced-paths &&
+	cat >advanced-expect <<-EOF &&
+	a/.gitignore:65:*.gz	a/item.gz
+	b/.gitignore:65:!*.gz	b/item.gz
+	a/.gitignore:65:*.gz	a/item.gz
+	EOF
+	check_advanced_ignore fast-only
+'
+
+test_expect_success 'appending and clearing invalidate built ignore indexes' '
 	git -C advanced-ignore config core.ignoreCase false &&
 	test-tool -C advanced-ignore ignore-patterns
 '
