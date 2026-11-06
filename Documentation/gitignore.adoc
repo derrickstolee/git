@@ -141,6 +141,40 @@ full pathname may have special meaning:
  - Other consecutive asterisks are considered regular asterisks and
    will match according to the previous rules.
 
+OPTIMIZING IGNORE MATCHING
+-------------------------
+
+Git preserves the pattern format, ordering and source precedence described
+above. For sufficiently large pattern lists, it can verify restricted
+pattern forms and use an index instead of scanning every rule for every
+path. Other patterns remain valid and use the general matcher; mixed lists
+can use both algorithms. Small lists, case-insensitive matching, and lists
+whose indexes exceed an internal allocation budget use general matching.
+
+Exact names and directories
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For an exact-name policy, prefer a literal to an unnecessary glob only
+when their intended matching sets are identical. In a root `.gitignore`,
+`/build.log` matches one root entry, whereas `build.log` matches that
+basename at any depth. Neither form is limited to regular files.
+Unescaped literals, with or without a directory-only trailing slash, are
+eligible for indexed matching. Escaped patterns and general globs retain
+their usual meaning and use general matching.
+
+If an entire directory is disposable, `/generated/` can exclude it and
+avoid visiting its contents. Do not use that form when descendants need
+exceptions: negations cannot re-include paths below an excluded parent,
+and an ignore file in that directory cannot reopen it.
+
+The last matching rule still wins, not the most specific rule. Keep
+ordered exceptions and broader patterns when they express the policy.
+Reordering or relocating patterns can change both decisions and the
+source reported by `git check-ignore -v`; indexing does not require either
+change. Compare representative direct and deep paths, sibling directories
+and exceptions with `git check-ignore --no-index -v -n --stdin` before
+rewriting a policy.
+
 CONFIGURATION
 -------------
 

@@ -98,6 +98,8 @@ struct pattern_list {
 	const char *src;
 
 	struct path_pattern **patterns;
+	struct ignore_pattern_index *ignore_index;
+	unsigned ignore_index_checked;
 
 	/*
 	 * While scanning the excludes, we attempt to match the patterns

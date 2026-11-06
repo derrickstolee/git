@@ -1045,7 +1045,7 @@ do
 		.gitignore:$((nr + 4)):bucket/	bucket/file
 		::	plain
 		EOF
-		check_advanced_ignore
+		check_advanced_ignore "$(ignore_trace_mode fast-only)"
 	'
 
 	for winner in literal glob
@@ -1062,7 +1062,13 @@ do
 			fi &&
 			echo leaf.keep >advanced-paths &&
 			printf ".gitignore:%s:%s\tleaf.keep\n" "$((nr + 2))" "$pattern" >advanced-expect &&
-			check_advanced_ignore
+			if test "$winner" = literal
+			then
+				mode=fast-only
+			else
+				mode=hybrid
+			fi &&
+			check_advanced_ignore "$(ignore_trace_mode "$mode")"
 		'
 	done
 
@@ -1086,7 +1092,7 @@ do
 			.gitignore:$((nr + 1)):$other	other.gz
 			.gitignore:$((nr + 2)):$pattern	sub/pack.tar.gz
 			EOF
-			check_advanced_ignore
+			check_advanced_ignore "$(ignore_trace_mode hybrid)"
 		'
 	done
 
@@ -1113,7 +1119,7 @@ do
 			echo build/keep/leaf.keep >advanced-paths &&
 			printf ".gitignore:%s:%s\tbuild/keep/leaf.keep\n" \
 				"$((nr + 3))" "$pattern" >advanced-expect &&
-			check_advanced_ignore
+			check_advanced_ignore "$(ignore_trace_mode hybrid)"
 		'
 	done
 
@@ -1133,7 +1139,7 @@ do
 			else
 				test_write_lines "::	cAsE" "::	pack.tAr.gZ" >advanced-expect
 			fi &&
-			check_advanced_ignore
+			check_advanced_ignore "$(ignore_trace_mode hybrid "$icase")"
 		'
 
 		test_expect_success "mixed-case subtree boundaries: $icase ($nr)" '
@@ -1150,7 +1156,7 @@ do
 			else
 				test_write_lines "::	build/keep/leaf.keep" "::	builder/keep/leaf.keep" >advanced-expect
 			fi &&
-			check_advanced_ignore
+			check_advanced_ignore "$(ignore_trace_mode hybrid "$icase")"
 		'
 	done
 
@@ -1170,7 +1176,7 @@ do
 		sub/.gitignore:$((nr + 1)):!item.keep	sub/item.keep
 		.gitignore:$((nr + 1)):*.keep	sub/other.keep
 		EOF
-		check_advanced_ignore
+		check_advanced_ignore "$(ignore_trace_mode hybrid)"
 	'
 
 	test_expect_success "direct-child versus recursive pathname suffix ($nr)" '
@@ -1181,14 +1187,71 @@ do
 		.gitignore:$((nr + 1)):/generated/*.o	generated/direct.o
 		::	generated/deep/nested.o
 		EOF
-		check_advanced_ignore &&
+		check_advanced_ignore "$(ignore_trace_mode hybrid)" &&
 		echo "/generated/**/*.o" >>advanced-ignore/.gitignore &&
 		cat >advanced-expect <<-EOF &&
 		.gitignore:$((nr + 2)):/generated/**/*.o	generated/direct.o
 		.gitignore:$((nr + 2)):/generated/**/*.o	generated/deep/nested.o
 		EOF
-		check_advanced_ignore
+		check_advanced_ignore "$(ignore_trace_mode hybrid)"
 	'
 done
+
+test_expect_success 'large general-only lists retain the legacy scan' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	ignore_padding | sed "s|$|/[ab]*|" >advanced-ignore/.gitignore &&
+	echo missing >advanced-paths &&
+	printf "::\tmissing\n" >advanced-expect &&
+	check_advanced_ignore slow-only
+'
+
+test_expect_success 'a later general glob can fail without hiding a literal' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	test_write_lines /leaf.keep "!other[0-9]" >>advanced-ignore/.gitignore &&
+	echo leaf.keep >advanced-paths &&
+	printf ".gitignore:65:/leaf.keep\tleaf.keep\n" >advanced-expect &&
+	check_advanced_ignore hybrid
+'
+
+test_expect_success 'over-budget literal lists retain correct legacy matching' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	awk "BEGIN {
+		for (i = 0; i < 600; i++) s = s \"a\";
+		for (i = 0; i < 7000; i++) print \"/\" s i;
+	}" >advanced-ignore/.gitignore &&
+	echo /target >>advanced-ignore/.gitignore &&
+	test_write_lines target missing >advanced-paths &&
+	test_write_lines ".gitignore:7001:/target	target" "::	missing" >advanced-expect &&
+	check_advanced_ignore slow-only
+'
+
+test_expect_success 'indexed local lists survive a -> b -> a reload' '
+	nr=64 &&
+	reset_advanced_ignore &&
+	mkdir advanced-ignore/a advanced-ignore/b &&
+	{
+		ignore_padding &&
+		echo /item
+	} >advanced-ignore/a/.gitignore &&
+	{
+		ignore_padding &&
+		echo "!/item"
+	} >advanced-ignore/b/.gitignore &&
+	test_write_lines a/item b/item a/item >advanced-paths &&
+	cat >advanced-expect <<-EOF &&
+	a/.gitignore:65:/item	a/item
+	b/.gitignore:65:!/item	b/item
+	a/.gitignore:65:/item	a/item
+	EOF
+	check_advanced_ignore fast-only
+'
+
+test_expect_success 'appending and clearing invalidate a built literal index' '
+	git -C advanced-ignore config core.ignoreCase false &&
+	test-tool -C advanced-ignore ignore-patterns
+'
 
 test_done

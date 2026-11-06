@@ -126,6 +126,7 @@ TECH_DOCS += technical/commit-graph
 TECH_DOCS += technical/connectivity-check
 TECH_DOCS += technical/directory-rename-detection
 TECH_DOCS += technical/hash-function-transition
+TECH_DOCS += technical/ignore-patterns
 TECH_DOCS += technical/large-object-promisors
 TECH_DOCS += technical/long-running-process-protocol
 TECH_DOCS += technical/multi-pack-index

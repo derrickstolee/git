@@ -34,3 +34,12 @@ test_ignore_trace () {
 		esac || return 1
 	done
 }
+
+ignore_trace_mode () {
+	if test "$nr" -lt 64 || test "${2:-false}" = true
+	then
+		echo slow-only
+	else
+		echo "$1"
+	fi
+}

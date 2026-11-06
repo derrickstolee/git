@@ -1,0 +1,59 @@
+Indexed Ignore Matching
+======================
+
+Author-facing scope and optimization guidance belongs in
+linkgit:gitignore[5]. This document describes the internal index.
+
+Ranked matching
+--------------
+
+Each pattern list retains its original ordered array. A private index
+maps unescaped literal basenames and base-normalized literal pathnames to
+the greatest matching array ordinal, separately for directory-only and
+unrestricted rules. Entries retain the original `path_pattern` pointer,
+including sign and source provenance. Ordinals, not source line numbers,
+determine order; command-line patterns can have negative source numbers.
+
+A query combines basename and pathname candidates, resolving the entry
+type only when a competitive directory-only candidate requires it. It
+then examines a compact reverse-ordered vector of general-pattern ordinals
+until one matches or no remaining ordinal can beat the indexed candidate.
+The longest name has no special precedence. Index misses are queries too.
+
+Lists are not merged. Source precedence remains in
+`last_matching_pattern_from_lists()`, and `prep_exclude()` still prevents
+descendant rules from overriding an excluded parent. Shared non-cone
+pattern-list matching can use the index without contributing ignore
+telemetry; sparse-checkout cone hashmaps are unchanged.
+
+Ownership and admission
+-----------------------
+
+The index belongs to its pattern list. It owns normalized keys and fallback
+ordinals, but not patterns or their bases. Append invalidates the index;
+clear frees it before freeing patterns. No index entry retains the address
+of its containing list, which can move when an exclude group grows.
+
+Construction is lazy and requires at least 64 literal rules. A conservative
+preflight estimate includes entries, keys, fallback ordinals, and hashmap
+bucket overhead; estimates above 4 MiB per list retain the legacy scan.
+Refused construction is remembered until invalidation. These internal
+limits are admission heuristics, not user-visible pattern requirements.
+Case-insensitive matching also retains the legacy scan until its equality
+and normalization semantics are proven for an indexed representation.
+
+Tracing
+-------
+
+When Trace2 is enabled, the directory context accumulates three counters
+and emits one repository-attributed `ignore` summary before `dir_clear()`:
+
+* `fast-path`: list queries which actually consult an index, including misses.
+* `slow-fallback`: list queries which examine at least one general or legacy rule.
+* `fallback-patterns-tested`: rules actually examined, including type rejection.
+
+A hybrid query contributes to both query counters. Rank-skipped rules
+contribute to neither fallback counter. Tests in `t/lib-ignore.sh` require
+singular decimal values, explicit zeros for unused algorithms, and positive
+work for algorithms claimed to have run. Missing or duplicate summaries,
+cache hits and pruned paths cannot demonstrate fast-path execution.

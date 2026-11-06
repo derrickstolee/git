@@ -974,6 +974,153 @@ int hashmap_contains_parent(struct hashmap *map,
 	return 0;
 }
 
+enum ignore_pattern_kind {
+	IGNORE_GENERAL,
+	IGNORE_LITERAL,
+};
+
+struct ignore_literal_entry {
+	struct hashmap_entry ent;
+	char *name;
+	size_t len;
+	unsigned mustbedir;
+	int rank;
+	struct path_pattern *pattern;
+};
+
+struct ignore_pattern_index {
+	struct hashmap basenames;
+	struct hashmap pathnames;
+	int *fallback;
+	int fallback_nr;
+};
+
+#define IGNORE_INDEX_MIN_PATTERNS 64
+#define IGNORE_INDEX_MAX_BYTES (4 * 1024 * 1024)
+
+static enum ignore_pattern_kind ignore_pattern_kind(const struct path_pattern *p)
+{
+	if (p->patternlen && p->nowildcardlen == p->patternlen)
+		return IGNORE_LITERAL;
+	return IGNORE_GENERAL;
+}
+
+static int ignore_literal_cmp(const void *data UNUSED,
+			      const struct hashmap_entry *a,
+			      const struct hashmap_entry *b,
+			      const void *key UNUSED)
+{
+	const struct ignore_literal_entry *x =
+		container_of(a, struct ignore_literal_entry, ent);
+	const struct ignore_literal_entry *y =
+		container_of(b, struct ignore_literal_entry, ent);
+
+	return x->len != y->len || x->mustbedir != y->mustbedir ||
+		memcmp(x->name, y->name, x->len);
+}
+
+static void clear_ignore_index(struct pattern_list *pl)
+{
+	struct ignore_pattern_index *index = pl->ignore_index;
+	struct hashmap *maps[2];
+	int i;
+
+	pl->ignore_index_checked = 0;
+	if (!index)
+		return;
+	maps[0] = &index->basenames;
+	maps[1] = &index->pathnames;
+	for (i = 0; i < ARRAY_SIZE(maps); i++) {
+		struct hashmap_iter iter;
+		struct ignore_literal_entry *entry;
+
+		hashmap_for_each_entry(maps[i], &iter, entry, ent)
+			free(entry->name);
+		hashmap_clear_and_free(maps[i], struct ignore_literal_entry, ent);
+	}
+	free(index->fallback);
+	free(index);
+	pl->ignore_index = NULL;
+}
+
+static void build_ignore_index(struct pattern_list *pl)
+{
+	struct ignore_pattern_index *index;
+	size_t bytes = sizeof(*index) + 2048 * sizeof(void *);
+	int i, literals = 0, fallback_nr = 0;
+
+	pl->ignore_index_checked = 1;
+	for (i = 0; i < pl->nr; i++) {
+		struct path_pattern *p = pl->patterns[i];
+		size_t cost;
+
+		if (ignore_pattern_kind(p) == IGNORE_LITERAL) {
+			literals++;
+			cost = sizeof(struct ignore_literal_entry) +
+				(size_t)p->patternlen + p->baselen + 1 +
+				4 * sizeof(void *);
+		} else {
+			fallback_nr++;
+			cost = sizeof(int);
+		}
+		if (cost > IGNORE_INDEX_MAX_BYTES - bytes)
+			return;
+		bytes += cost;
+	}
+	if (literals < IGNORE_INDEX_MIN_PATTERNS)
+		return;
+
+	CALLOC_ARRAY(index, 1);
+	hashmap_init(&index->basenames, ignore_literal_cmp, NULL, 0);
+	hashmap_init(&index->pathnames, ignore_literal_cmp, NULL, 0);
+	ALLOC_ARRAY(index->fallback, fallback_nr);
+	for (i = 0; i < pl->nr; i++) {
+		struct path_pattern *p = pl->patterns[i];
+		struct ignore_literal_entry *entry, *old;
+		struct hashmap *map;
+		struct strbuf name = STRBUF_INIT;
+		int offset = 0;
+
+		if (ignore_pattern_kind(p) != IGNORE_LITERAL) {
+			index->fallback[index->fallback_nr++] = i;
+			continue;
+		}
+		if (p->flags & PATTERN_FLAG_NODIR) {
+			map = &index->basenames;
+		} else {
+			map = &index->pathnames;
+			strbuf_add(&name, p->base, p->baselen);
+			offset = p->pattern[0] == '/';
+		}
+		strbuf_add(&name, p->pattern + offset, p->patternlen - offset);
+		CALLOC_ARRAY(entry, 1);
+		entry->name = strbuf_detach(&name, &entry->len);
+		entry->mustbedir = !!(p->flags & PATTERN_FLAG_MUSTBEDIR);
+		entry->rank = i;
+		entry->pattern = p;
+		hashmap_entry_init(&entry->ent, memhash(entry->name, entry->len));
+		old = hashmap_put_entry(map, entry, ent);
+		if (old) {
+			free(old->name);
+			free(old);
+		}
+	}
+	pl->ignore_index = index;
+}
+
+static struct ignore_literal_entry *lookup_ignore_literal(
+		struct hashmap *map, const char *name, int len, unsigned mustbedir)
+{
+	struct ignore_literal_entry key = {
+		.name = (char *)name,
+		.len = len,
+		.mustbedir = mustbedir,
+	};
+
+	hashmap_entry_init(&key.ent, memhash(name, len));
+	return hashmap_get_entry(map, &key, ent, NULL);
+}
+
 void add_pattern(const char *string, const char *base,
 		 int baselen, struct pattern_list *pl, int srcpos)
 {
@@ -983,6 +1130,7 @@ void add_pattern(const char *string, const char *base,
 	int nowildcardlen;
 
 	parse_path_pattern(&string, &patternlen, &flags, &nowildcardlen);
+	clear_ignore_index(pl);
 	FLEX_ALLOC_MEM(pattern, pattern, string, patternlen);
 	pattern->patternlen = patternlen;
 	pattern->nowildcardlen = nowildcardlen;
@@ -1022,6 +1170,7 @@ void clear_pattern_list(struct pattern_list *pl)
 {
 	int i;
 
+	clear_ignore_index(pl);
 	for (i = 0; i < pl->nr; i++)
 		free(pl->patterns[i]);
 	free(pl->patterns);
@@ -1420,10 +1569,9 @@ int match_pathname(const char *pathname, int pathlen,
 }
 
 /*
- * Scan the given exclude list in reverse to see whether pathname
- * should be ignored.  The first match (i.e. the last on the list), if
- * any, determines the fate.  Returns the exclude_list element which
- * matched, or NULL for undecided.
+ * Find the greatest matching list ordinal. Indexed candidates allow the
+ * reverse scan to skip general rules which cannot change the winner.
+ * Return the original pattern, preserving its sign and provenance.
  */
 static struct path_pattern *last_matching_pattern_from_list(const char *pathname,
 						       int pathlen,
@@ -1434,21 +1582,64 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 						       struct ignore_matching_stats *stats)
 {
 	struct path_pattern *res = NULL; /* undecided */
-	int i;
+	struct ignore_pattern_index *index = NULL;
+	int i, best_rank = -1;
 
 	if (!pl->nr)
 		return NULL;	/* undefined */
 
-	if (stats)
-		stats->slow_fallback++;
+	if (pl->nr >= IGNORE_INDEX_MIN_PATTERNS &&
+	    !pl->use_cone_patterns && !repo_ignore_case(the_repository)) {
+		unsigned mustbedir;
 
-	for (i = pl->nr - 1; 0 <= i; i--) {
-		struct path_pattern *pattern = pl->patterns[i];
-		const char *exclude = pattern->pattern;
-		int prefix = pattern->nowildcardlen;
+		if (!pl->ignore_index_checked)
+			build_ignore_index(pl);
+		index = pl->ignore_index;
+		if (index) {
+			if (stats)
+				stats->fast_path++;
+			for (mustbedir = 0; mustbedir <= 1; mustbedir++) {
+				struct ignore_literal_entry *entries[2];
+				int j;
 
-		if (stats)
+				entries[0] = lookup_ignore_literal(&index->basenames,
+					basename, pathlen - (basename - pathname), mustbedir);
+				entries[1] = lookup_ignore_literal(&index->pathnames,
+					pathname, pathlen, mustbedir);
+				for (j = 0; j < ARRAY_SIZE(entries); j++) {
+					struct ignore_literal_entry *entry = entries[j];
+
+					if (!entry || entry->rank <= best_rank)
+						continue;
+					if (mustbedir) {
+						*dtype = resolve_dtype(*dtype, istate, pathname, pathlen);
+						if (*dtype != DT_DIR)
+							continue;
+					}
+					best_rank = entry->rank;
+					res = entry->pattern;
+				}
+			}
+		}
+	}
+
+	for (i = (index ? index->fallback_nr : pl->nr) - 1; i >= 0; i--) {
+		int rank = index ? index->fallback[i] : i;
+		struct path_pattern *pattern;
+		const char *exclude;
+		int prefix;
+
+		if (rank <= best_rank)
+			break;
+		pattern = pl->patterns[rank];
+		exclude = pattern->pattern;
+		prefix = pattern->nowildcardlen;
+
+		if (stats) {
+			if (i == (index ? index->fallback_nr : pl->nr) - 1)
+				stats->slow_fallback++;
 			stats->fallback_patterns_tested++;
+		}
 
 		if (pattern->flags & PATTERN_FLAG_MUSTBEDIR) {
 			*dtype = resolve_dtype(*dtype, istate, pathname, pathlen);
