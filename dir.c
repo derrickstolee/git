@@ -1430,7 +1430,8 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 						       const char *basename,
 						       int *dtype,
 						       struct pattern_list *pl,
-						       struct index_state *istate)
+						       struct index_state *istate,
+						       struct ignore_matching_stats *stats)
 {
 	struct path_pattern *res = NULL; /* undecided */
 	int i;
@@ -1438,10 +1439,16 @@ static struct path_pattern *last_matching_pattern_from_list(const char *pathname
 	if (!pl->nr)
 		return NULL;	/* undefined */
 
+	if (stats)
+		stats->slow_fallback++;
+
 	for (i = pl->nr - 1; 0 <= i; i--) {
 		struct path_pattern *pattern = pl->patterns[i];
 		const char *exclude = pattern->pattern;
 		int prefix = pattern->nowildcardlen;
+
+		if (stats)
+			stats->fallback_patterns_tested++;
 
 		if (pattern->flags & PATTERN_FLAG_MUSTBEDIR) {
 			*dtype = resolve_dtype(*dtype, istate, pathname, pathlen);
@@ -1492,7 +1499,7 @@ enum pattern_match_result path_matches_pattern_list(
 
 	if (!pl->use_cone_patterns) {
 		pattern = last_matching_pattern_from_list(pathname, pathlen, basename,
-							dtype, pl, istate);
+							dtype, pl, istate, NULL);
 		if (pattern) {
 			if (pattern->flags & PATTERN_FLAG_NEGATIVE)
 				return NOT_MATCHED;
@@ -1634,12 +1641,18 @@ static struct path_pattern *last_matching_pattern_from_lists(
 	int i, j;
 	struct exclude_list_group *group;
 	struct path_pattern *pattern;
+	struct ignore_matching_stats *stats = NULL;
+
+	if (trace2_is_enabled()) {
+		stats = &dir->internal.ignore_stats;
+		dir->internal.ignore_repo = istate ? istate->repo : NULL;
+	}
 	for (i = EXC_CMDL; i <= EXC_FILE; i++) {
 		group = &dir->internal.exclude_list_group[i];
 		for (j = group->nr - 1; j >= 0; j--) {
 			pattern = last_matching_pattern_from_list(
 				pathname, pathlen, basename, dtype_p,
-				&group->pl[j], istate);
+				&group->pl[j], istate, stats);
 			if (pattern)
 				return pattern;
 		}
@@ -3568,6 +3581,19 @@ void dir_clear(struct dir_struct *dir)
 	struct pattern_list *pl;
 	struct exclude_stack *stk;
 	struct dir_struct new = DIR_INIT;
+
+	if (trace2_is_enabled() &&
+	    (dir->internal.ignore_stats.fast_path ||
+	     dir->internal.ignore_stats.slow_fallback)) {
+		struct ignore_matching_stats *stats = &dir->internal.ignore_stats;
+
+		trace2_data_intmax("ignore", dir->internal.ignore_repo,
+				  "fast-path", stats->fast_path);
+		trace2_data_intmax("ignore", dir->internal.ignore_repo,
+				  "slow-fallback", stats->slow_fallback);
+		trace2_data_intmax("ignore", dir->internal.ignore_repo,
+				  "fallback-patterns-tested", stats->fallback_patterns_tested);
+	}
 
 	for (i = EXC_CMDL; i <= EXC_FILE; i++) {
 		group = &dir->internal.exclude_list_group[i];

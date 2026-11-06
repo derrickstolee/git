@@ -144,6 +144,12 @@ struct oid_stat {
 	int valid;
 };
 
+struct ignore_matching_stats {
+	uint64_t fast_path;
+	uint64_t slow_fallback;
+	uint64_t fallback_patterns_tested;
+};
+
 /*
  *  Untracked cache
  *
@@ -353,6 +359,8 @@ struct dir_struct {
 		/* Stats about the traversal */
 		unsigned visited_paths;
 		unsigned visited_directories;
+		struct ignore_matching_stats ignore_stats;
+		struct repository *ignore_repo;
 	} internal;
 };
 

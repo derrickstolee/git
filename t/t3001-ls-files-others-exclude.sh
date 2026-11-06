@@ -9,6 +9,7 @@ This test runs git ls-files --others and tests --exclude patterns.
 '
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY/lib-ignore.sh"
 
 rm -fr one three
 for dir in . one one/two three
@@ -323,9 +324,11 @@ test_expect_success 'directory-only names and signed subtree exceptions' '
 	name.dir/
 	EOF
 	test_write_lines .gitignore build/keep/good.keep builder/file.keep plain >advanced-expect &&
-	git -C advanced -c core.excludesFile=/dev/null ls-files -o --exclude-standard >advanced-actual &&
+	GIT_TRACE2_EVENT="$(pwd)/advanced-trace" \
+		git -C advanced -c core.excludesFile=/dev/null ls-files -o --exclude-standard >advanced-actual &&
 	test_filter_gitconfig advanced-actual &&
-	test_cmp advanced-expect advanced-actual
+	test_cmp advanced-expect advanced-actual &&
+	test_ignore_trace slow-only advanced-trace
 '
 
 test_expect_success SYMLINKS 'directory-only exclusion does not match a symlink' '

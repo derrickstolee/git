@@ -4,6 +4,7 @@ test_description=check-ignore
 
 TEST_CREATE_REPO_NO_TEMPLATE=1
 . ./test-lib.sh
+. "$TEST_DIRECTORY/lib-ignore.sh"
 
 init_vars () {
 	global_excludes="global-excludes"
@@ -985,9 +986,12 @@ check_advanced_ignore () {
 	else
 		code=1
 	fi &&
-	test_expect_code "$code" git -C advanced-ignore check-ignore --no-index -v -n --stdin \
+	rm -f advanced-trace &&
+	test_expect_code "$code" env GIT_TRACE2_EVENT="$(pwd)/advanced-trace" \
+		git -C advanced-ignore check-ignore --no-index -v -n --stdin \
 		<advanced-paths >advanced-actual &&
-	test_cmp advanced-expect advanced-actual
+	test_cmp advanced-expect advanced-actual &&
+	test_ignore_trace "${1:-slow-only}" advanced-trace
 }
 
 test_expect_success 'setup advanced ignore interactions' '
@@ -999,6 +1003,24 @@ test_expect_success 'setup advanced ignore interactions' '
 		advanced-ignore/build/keep advanced-ignore/generated/deep \
 		advanced-ignore/bucket advanced-ignore/archive.o &&
 	>advanced-ignore/plain
+'
+
+test_expect_success 'ignore trace assertions reject missing and duplicate work' '
+	test_write_lines \
+		"{\"category\":\"ignore\",\"key\":\"fast-path\",\"value\":\"0\"}" \
+		"{\"category\":\"ignore\",\"key\":\"slow-fallback\",\"value\":\"1\"}" \
+		"{\"category\":\"ignore\",\"key\":\"fallback-patterns-tested\",\"value\":\"1\"}" >counter-trace &&
+	test_ignore_trace slow-only counter-trace &&
+	! test_ignore_trace fast-only counter-trace &&
+	! test_ignore_trace hybrid counter-trace &&
+	: >empty-trace &&
+	! test_ignore_trace slow-only empty-trace &&
+	test_path_is_missing missing-trace &&
+	! test_ignore_trace slow-only missing-trace &&
+	cat counter-trace counter-trace >duplicate-trace &&
+	! test_ignore_trace slow-only duplicate-trace &&
+	echo "{\"category\":\"ignore\",\"key\":\"fast-path\",\"value\":\"1\"}" >>counter-trace &&
+	! test_ignore_trace slow-only counter-trace
 '
 
 for nr in 2 64
