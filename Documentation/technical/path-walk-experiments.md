@@ -51,12 +51,13 @@ retain ordinary size ordering.
 | Recompression: T/B + P, S=R=T/B | 163.51 | 184.65 | 853.04 | 1499.42 | 2172.91 |
 | Window 50: T + P, S=T/B, R off | 137.80 | 170.20 |  |  |  |
 | Window 50: T/B + P, S=T/B, R off | 159.41 | 177.26 |  |  |  |
-| Size blobs + T/B P: T order, window 10, S=T/B | 144.85 | 186.25 |  |  |  |
+| Size blobs + T/B P: T order, window 10, S=T/B | 144.85 | 186.25 |  |  | 2103.78 |
 | Size blobs + T/B P: T order, window 50, S=T/B | 136.99 | 167.73 | 803.92 | 1495.72 | 1959.35 |
-| Bucket filter: T order, T/B P+S, window 50 |  |  |  |  |  |
-| Bucket filter: T order, T/B P+S, window 50, memory 1 MiB |  |  |  |  |  |
-| Window 50: T order, T/B P, S off |  |  |  |  |  |
-| Window 50: ordinary size-order baseline, S off |  |  |  |  |  |
+| Bucket filter: T order, T/B P+S, window 50 |  |  |  |  | 1959.34 |
+| Bucket filter: T order, T/B P+S, window 50, memory 1 MiB |  |  |  |  | 2242.78 |
+| Window 50: T order, T/B P, S off |  |  |  |  | 1969.68 |
+| Window 50: ordinary size-order baseline, S off |  |  |  |  | 2050.42 |
+| Bucket filter: T order, T/B P, window 50, S off |  |  |  |  | 1969.73 |
 <!-- pack-size-results:end -->
 
 `[A]` predates the tagged-tree correctness fix. Its Linux primary packs omit
@@ -460,23 +461,104 @@ delta cases preserve the instruction streams and reconstruct correctly.
 A 1 MiB window-memory budget is a separate, existing policy knob: it cuts
 work by evicting large candidates sooner, with a 0.73% pack-size cost on
 this slice. It must not be conflated with the lossless fingerprint
-optimization. Full Linux measurements and matched window/skipping
-ablations remain necessary before claiming that the 5x slowdown is solved.
+optimization. The complete-repository measurements below show that these
+slice improvements do not predict the full Linux result.
 
-The full-repository study serializes its repacks to avoid competing Linux
-jobs. Blank cells below are not yet successfully measured. The ordinary
-size baseline can exceed the requested depth through its legacy fallback.
+All six full-repository comparisons completed serially without competing
+Linux jobs, including the bucket filter with skipping disabled. The
+ordinary size baseline can exceed the requested depth through its legacy
+fallback.
 
 <!-- linux-cost-results:start -->
 | Full Linux run | Pack MiB | Total seconds | Delta preparation seconds | Max depth |
 |---|---:|---:|---:|---:|
 | Original hybrid, window 50 | 1959.35 | 3130.1 | 2746.6 | 50 |
-| Bucket filter, hybrid, window 50 |  |  |  |  |
-| Bucket filter, hybrid, window 50, memory 1 MiB |  |  |  |  |
-| Original hybrid, window 10 |  |  |  |  |
-| Original hybrid, window 50, S off |  |  |  |  |
-| Original size baseline, window 50, S off |  |  |  |  |
+| Bucket filter, hybrid, window 50 | 1959.34 | 3078.4 | 2690.5 | 50 |
+| Bucket filter, hybrid, window 50, memory 1 MiB | 2242.78 | 861.3 | 453.5 | 50 |
+| Original hybrid, window 10 | 2103.78 | 1183.6 | 785.9 | 50 |
+| Original hybrid, window 50, S off | 1969.68 | 900.1 | 516.3 | 50 |
+| Original size baseline, window 50, S off | 2050.42 | 849.4 | 511.9 | 88 |
+| Bucket filter, hybrid, window 50, S off | 1969.73 | 783.6 | 399.3 | 50 |
 <!-- linux-cost-results:end -->
+
+With skipping enabled, the bucket filter changes full-Linux wall time
+by only 1.65%, from 52.2 to 51.3 minutes; user CPU falls by 4.77%. This
+is much less than the slice gain, and the 8,568-byte pack difference is
+within threaded variation. The filter alone does not solve the expensive
+skipping mode.
+
+With skipping disabled, the filter reduces delta preparation from 516.3
+to 399.3 seconds (22.67%) and total time from 900.1 to 783.6 seconds
+(12.94%). The pack grows by just 43,703 bytes (0.0021%), again within
+threaded variation.
+
+The strongest completed Linux cost/quality result is the filtered
+hybrid/window-50 policy with `GIT_TEST_PACK_PATH_WALK_SKIP=none`:
+1969.73 MiB in 13.1 minutes, versus 1959.35 MiB in 52.2 minutes for the
+original hybrid with skipping. That is a 0.53% larger pack for 74.97%
+less wall time. It remains 16.04% smaller than the complete window-10
+baseline. Disabling skipping changes the whole mode, including retention
+of saturated window entries; it does not isolate ancestor traversal alone.
+
+Against ordinary size ordering at the same window 50, the original
+no-skipping hybrid is 3.94% smaller and 5.97% slower, while enforcing
+depth 50 instead of the baseline's observed 88. Delta preparation is almost unchanged
+(516.3 versus 511.9 seconds); historical enumeration costs about 58
+additional seconds. History-derived candidates can therefore help without
+the expensive skipping mode. Combining them with the bucket filter gives
+a 3.94% smaller pack in 7.74% less time than that original window-50 size
+baseline, though this combined comparison changes both policy and code.
+
+The 1 MiB memory cap costs 14.47% in full-Linux pack size, not the slice's
+0.73%, so it is not the preferred tradeoff. Reducing the window to 10
+while retaining skipping is also inferior to window 50 without skipping:
+2103.78 MiB in 19.7 minutes. The remaining implementation question is how
+to bound or reuse skipping work while retaining its small compression win.
+These measurements do not change the experimental controls' defaults.
+
+## Rewritten-series benchmark confirmations
+
+These reruns use the same frozen references and isolated object stores as
+the earlier comparisons, with eight threads, depth 50, and unlimited window
+memory. The hybrid policy orders trees chronologically, tries predecessors
+for trees and blobs, and retains size ordering for blobs. Recompression
+checks use window 10 and tree/blob skipping and recompression; their order
+and predecessor types match the earlier experiments.
+
+Each completed row requires independent object-count, chronological-rank,
+depth, and standalone-connectivity validation. All ten reruns completed.
+The previous measurements retain their original binary/source provenance;
+the non-Linux hybrid and recompression references predate the bucket filter,
+so their timing differences do not isolate the predecessor lookup change.
+
+<!-- reviewed-series-results:start -->
+| Scenario | Repository | Previous MiB | Rerun MiB | Previous seconds | Rerun seconds |
+|---|---|---:|---:|---:|---:|
+| Hybrid, window 50, skipping | fluentui | 136.99 | 136.98 | 54.6 | 39.6 |
+| Hybrid, window 50, skipping | git | 167.73 | 167.70 | 259.5 | 198.2 |
+| Hybrid, window 50, skipping | node | 803.92 | 803.92 | 280.3 | 244.4 |
+| Hybrid, window 50, skipping | azure-devops-docs | 1495.72 | 1495.67 | 69.5 | 75.3 |
+| Hybrid, window 50, skipping | linux | 1959.34 | 1959.32 | 3078.4 | 3114.5 |
+| Improvement-only recompression, tree order | fluentui | 146.42 | 146.44 | 103.5 | 93.3 |
+| Improvement-only recompression, tree order | git | 190.99 | 190.95 | 117.1 | 110.6 |
+| Improvement-only recompression, tree/blob order | fluentui | 163.51 | 163.56 | 153.3 | 134.0 |
+| Improvement-only recompression, tree/blob order | git | 184.65 | 184.65 | 121.4 | 116.3 |
+| Hybrid, window 50, no skipping | linux | 1969.73 | 1969.68 | 783.6 | 786.2 |
+<!-- reviewed-series-results:end -->
+
+Fresh chronological metadata is byte-identical to the earlier output for
+all five frozen repositories. Every rerun passes the independent integrity
+checks and observes maximum depth 50. Pack-size differences from the previous
+measurements are at most 0.036%, consistent with threaded selection variation;
+the predecessor lookup change preserves the metadata rather than introducing
+a new compression policy.
+
+The Linux tradeoff is confirmed: skipping produces 1959.32 MiB in 3114.5
+seconds (51.9 minutes), while disabling it produces 1969.68 MiB in 786.2
+seconds (13.1 minutes). The latter costs 0.53% pack size and saves 74.76%
+of wall time in this paired rerun. Linux enumeration remains about 149
+seconds, so eliminating pathological repeated predecessor lookups does not
+produce a material timing improvement on this particular history.
 
 ## Reports and remaining questions
 
@@ -497,14 +579,16 @@ below are relative to the session's `files/path-walk-benchmark/` directory:
 | `size-blob-predecessors-window10/`, `size-blob-predecessors-window50/` | Size-ordered blob predecessor-hint comparisons. |
 | `forest-study/` | Branching, directional probes, small trial forests, and validated mutation simulations. |
 | `linux-cost-profile/` | Userspace sampling, differential delta corpus, and byte-identical Linux-slice timing comparisons. |
-| `linux-cost-ablation/` | Serialized full-Linux cost/quality comparisons; cells remain blank until independently validated. |
+| `linux-cost-ablation/` | Completed six-case full-Linux study, including filtered/no-skipping confirmation and per-phase timings. |
+| `reviewed-series/` | Frozen-reference confirmations of the leading hybrid and recompression configurations after reviewing the series. |
 
 These directories contain JSON/CSV results and pinned source provenance;
 diagnostic directories additionally retain their instrumentation and packs.
 Small size differences between repeated runs can arise from threaded fallback.
 
-Not yet measured: matched window-size baselines for the other three
-repositories, and whether allowing newer bases would outperform
+Not yet measured: matched tree-order/tree-predecessor-only window-50
+baselines for Node, Azure DevOps Docs, and Linux to isolate blob hints,
+and whether allowing newer bases would outperform
 strict chronological direction. No full
 reverse-chronological policy sweep has been run. A separately supplied
 commit/tree-only workload is not locally available and is not included in the
